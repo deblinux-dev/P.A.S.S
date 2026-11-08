@@ -87,8 +87,14 @@ if { [ -z "$DRRUN" ] || [ ! -x "$DRRUN" ]; } && [ "$ALLOW_DL" = 1 ]; then
     mkdir -p "$DEST" || fail "не создать каталог $DEST"
     T="$(mktemp -d)"
     trap 'rm -rf "$T"' EXIT
-    curl -L --fail -o "$T/dr.tar.gz" "$DR_URL" \
-        || fail "не удалось скачать DynamoRIO (нужен интернет или ручная установка: положите drrun рядом с pass)"
+    OK=0
+    for k in 1 2 3 4 5; do
+        if curl -L --fail --retry 2 --retry-all-errors --connect-timeout 30 \
+                -s -o "$T/dr.tar.gz" "$DR_URL"; then OK=1; break; fi
+        msg "pass: попытка $k/5 не удалась (HTTP-сбой), повтор через 15 с..."
+        sleep 15
+    done
+    [ "$OK" = 1 ] || fail "не удалось скачать DynamoRIO (нужен интернет или ручная установка: положите drrun рядом с pass)"
     tar xzf "$T/dr.tar.gz" -C "$T" || fail "не удалось распаковать DynamoRIO"
     rm -rf "$DEST/dynamorio"
     mv "$T/DynamoRIO-Linux-$DR_VERSION" "$DEST/dynamorio" || fail "не установить DynamoRIO в $DEST"
