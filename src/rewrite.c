@@ -108,7 +108,9 @@ static const int generic_opcs[] = {
     OP_pmovzxwq, OP_pmovzxdq,
     OP_ptest, OP_vtestps, OP_vtestpd,
     OP_insertps, OP_extractps, OP_pextrb, OP_pextrw, OP_pextrd,
+    OP_vpextrb, OP_vpextrw, OP_vpextrd,        /* VEX-алиасы (и vpextrq) */
     OP_pinsrb, OP_pinsrd,
+    OP_vpinsrb, OP_vpinsrw, OP_vpinsrd,        /* VEX-алиасы (и vpinsrq) */
     /* AES-NI / PCLMUL */
     OP_aesenc, OP_aesdec, OP_aesenclast, OP_aesdeclast, OP_aesimc,
     OP_aeskeygenassist, OP_pclmulqdq, OP_vpclmulqdq,
@@ -143,6 +145,7 @@ static void build_desc(instr_t *i, emu_desc_t *d)
 {
     memset(d, 0, sizeof(*d));
     d->opc = instr_get_opcode(i);
+    d->is_vex = (uint8_t)instr_bytes_vex(i);
     d->ndst = instr_num_dsts(i); if (d->ndst > 2) d->ndst = 2;
     d->nsrc = instr_num_srcs(i); if (d->nsrc > 4) d->nsrc = 4;
     for (int k = 0; k < d->ndst; k++) d->dsts[k] = instr_get_dst(i, k);
@@ -153,9 +156,10 @@ static void build_desc(instr_t *i, emu_desc_t *d)
         opnd_t o = d->dsts[k];
         if (opnd_is_reg(o)) {
             reg_id_t r = opnd_get_reg(o);
-            if (r >= DR_REG_XMM0 && r <= DR_REG_XMM15) {
+            if ((r >= DR_REG_XMM0 && r <= DR_REG_XMM15) ||
+                (r >= DR_REG_YMM0 && r <= DR_REG_YMM15)) {
                 d->xmm_dst |= 1u << xmm_idx(r);
-                if (r == DR_REG_XMM0) d->uses_xmm0 = 1;
+                if (xmm_idx(r) == 0) d->uses_xmm0 = 1;
             } else if (is_gpr_reg(r)) {
                 d->gpr_dst |= 1u << gpr_idx(r);
             }
@@ -171,9 +175,10 @@ static void build_desc(instr_t *i, emu_desc_t *d)
         opnd_t o = d->srcs[k];
         if (opnd_is_reg(o)) {
             reg_id_t r = opnd_get_reg(o);
-            if (r >= DR_REG_XMM0 && r <= DR_REG_XMM15) {
+            if ((r >= DR_REG_XMM0 && r <= DR_REG_XMM15) ||
+                (r >= DR_REG_YMM0 && r <= DR_REG_YMM15)) {
                 d->xmm_src |= 1u << xmm_idx(r);
-                if (r == DR_REG_XMM0) d->uses_xmm0 = 1;
+                if (xmm_idx(r) == 0) d->uses_xmm0 = 1;
             } else if (is_gpr_reg(r)) {
                 d->gpr_src |= 1u << gpr_idx(r);
             }
@@ -218,6 +223,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
 
     emu_desc_t *d = (emu_desc_t *)dr_global_alloc(sizeof(emu_desc_t));
     build_desc(i, d);
+    d->pc_next = instr_get_app_pc(i) + instr_length(dc, i);
 
     /* операция с r10 в операндах не поддерживается generic-путём */
     if ((d->gpr_src | d->gpr_dst) & (1u << gpr_idx(DR_REG_R10)))
@@ -446,6 +452,29 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
         report_unsupported(dc, i);
         return;
     }
+    /* 256-битные упакованные FMA: inline-путь (try_fma) умеет только
+     * 128-битные — 256-битные ведём в generic (или trap при -generic 0) */
+    if (dsz == OPSZ_32 && g_cfg.enable_generic &&
+        (opc == OP_vfmadd132ps || opc == OP_vfmadd132pd ||
+         opc == OP_vfmadd213ps || opc == OP_vfmadd213pd ||
+         opc == OP_vfmadd231ps || opc == OP_vfmadd231pd ||
+         opc == OP_vfmsub132ps || opc == OP_vfmsub132pd ||
+         opc == OP_vfmsub213ps || opc == OP_vfmsub213pd ||
+         opc == OP_vfmsub231ps || opc == OP_vfmsub231pd ||
+         opc == OP_vfnmadd132ps || opc == OP_vfnmadd132pd ||
+         opc == OP_vfnmadd213ps || opc == OP_vfnmadd213pd ||
+         opc == OP_vfnmadd231ps || opc == OP_vfnmadd231pd ||
+         opc == OP_vfnmsub132ps || opc == OP_vfnmsub132pd ||
+         opc == OP_vfnmsub213ps || opc == OP_vfnmsub213pd ||
+         opc == OP_vfnmsub231ps || opc == OP_vfnmsub231pd ||
+         opc == OP_vfmaddsub132ps || opc == OP_vfmaddsub132pd ||
+         opc == OP_vfmaddsub213ps || opc == OP_vfmaddsub213pd ||
+         opc == OP_vfmaddsub231ps || opc == OP_vfmaddsub231pd ||
+         opc == OP_vfmsubadd132ps || opc == OP_vfmsubadd132pd ||
+         opc == OP_vfmsubadd213ps || opc == OP_vfmsubadd213pd ||
+         opc == OP_vfmsubadd231ps || opc == OP_vfmsubadd231pd) &&
+        run_rewriter(dc, bb, i, rewrite_generic_instr))
+        return;
     if (g_cfg.enable_inline && run_rewriter(dc, bb, i, try_rewrite_vex))
         return;
     if (g_cfg.enable_inline && !g_disable_special &&

@@ -12,6 +12,7 @@
 typedef struct {
     uint8_t *buf;   /* per-thread BUF (спилы GPR/XMM, флаги, CPUID) */
     uint8_t *raw;   /* RAW TLS base (YHI-shadow)                    */
+    app_pc    pc_next;         /* для rip-относительных адресов */
 } estate_t;
 
 static inline uint64_t *EG(estate_t *st, int i) { return (uint64_t *)(st->buf + BUF_GPR(i)); }
@@ -65,6 +66,10 @@ static void flags_arith(estate_t *st, uint64_t res, uint64_t mask, int carry, in
 /* ── доступ к операндам ── */
 static byte *mem_addr(estate_t *st, opnd_t op)
 {
+    /* rip-относительные операнды DR нормализует в rel_addr с уже
+     * вычисленным абсолютным адресом (mc-путь даёт мусор) — §6.17 */
+    if (opnd_is_rel_addr(op))
+        return (byte *)opnd_get_addr(op);
     dr_mcontext_t mc;
     memset(&mc, 0, sizeof(mc));
     mc.size = sizeof(mc);
@@ -75,6 +80,7 @@ static byte *mem_addr(estate_t *st, opnd_t op)
     mc.r8 = *EG(st, 8);  mc.r9 = *EG(st, 9);  mc.r10 = *EG(st, 10);
     mc.r11 = *EG(st, 11); mc.r12 = *EG(st, 12); mc.r13 = *EG(st, 13);
     mc.r14 = *EG(st, 14); mc.r15 = *EG(st, 15);
+    mc.pc = st->pc_next;                 /* rip-относительная база */
     return opnd_compute_address(op, &mc);
 }
 
@@ -84,10 +90,20 @@ static int is_xmm_reg(opnd_t o)
            opnd_get_reg(o) <= DR_REG_XMM15;
 }
 
+/* векторный регистр (xmm ИЛИ ymm): до багфикса §6.15 YMM-операнды
+ * здесь не распознавались — generic-операции над ymm читали нули */
+static int is_vec_reg(opnd_t o)
+{
+    if (!opnd_is_reg(o)) return 0;
+    reg_id_t r = opnd_get_reg(o);
+    return (r >= DR_REG_XMM0 && r <= DR_REG_XMM15) ||
+           (r >= DR_REG_YMM0 && r <= DR_REG_YMM15);
+}
+
 /* 16-байтный блок из регистра или памяти (tmp для mem) */
 static const uint8_t *get_block16(estate_t *st, opnd_t o, uint8_t *tmp)
 {
-    if (is_xmm_reg(o))  return EX(st, xmm_idx(opnd_get_reg(o)));
+    if (is_vec_reg(o))  return EX(st, xmm_idx(opnd_get_reg(o)));
     if (opnd_is_memory_reference(o)) {
         memcpy(tmp, mem_addr(st, o), 16);
         return tmp;
@@ -97,7 +113,7 @@ static const uint8_t *get_block16(estate_t *st, opnd_t o, uint8_t *tmp)
 }
 static void put_block16(estate_t *st, opnd_t o, const uint8_t *v)
 {
-    if (is_xmm_reg(o))      memcpy(EX(st, xmm_idx(opnd_get_reg(o))), v, 16);
+    if (is_vec_reg(o))      memcpy(EX(st, xmm_idx(opnd_get_reg(o))), v, 16);
     else if (opnd_is_memory_reference(o)) memcpy(mem_addr(st, o), v, 16);
 }
 
@@ -107,7 +123,7 @@ static void put_block16(estate_t *st, opnd_t o, const uint8_t *v)
 static void get_block32(estate_t *st, opnd_t o, uint8_t *out32)
 {
     memset(out32, 0, 32);
-    if (is_xmm_reg(o)) {
+    if (is_vec_reg(o)) {
         int i = xmm_idx(opnd_get_reg(o));
         memcpy(out32, EX(st, i), 16);
         memcpy(out32 + 16, EY(st, i), 16);
@@ -606,6 +622,61 @@ static void wide_vpermq(uint8_t *d, const uint8_t *s, uint imm)
     }
     memcpy(d, r, 32);
 }
+
+/* ── FMA (двойное округление mul→add; см. README «Известные ограничения»).
+ * kind: 0=fmadd 1=fmsub 2=fnmadd 3=fnmsub (по знаку произведения/слагаемого)
+ * alt : 0=нет 1=fmaddsub (чётные lane: −prod+c, нечётные: +prod+c)
+ *              2=fmsubadd (чётные: +prod+c, нечётные: −prod+c)
+ * f231: 1 → произведение s1*s2, слагаемое dst (132/213: d*s1 и слагаемое s2)
+ * Семантика сверена с нативным железом (fma_sem, Xeon FMA): lane0 = sub. */
+static inline float ldf32(const uint8_t *p) { float v; memcpy(&v, p, 4); return v; }
+static inline uint64_t memcpy_bits(double v) { uint64_t b; memcpy(&b, &v, 8); return b; }
+
+static void fma_block(uint8_t *d, const uint8_t *s1, const uint8_t *s2,
+                      int kind, int is_pd, int alt, int form)
+{
+    int n = is_pd ? 2 : 4;               /* lane на 16-байтовую половину */
+    for (int i = 0; i < n; i++) {
+        int neg = (kind >= 2), sub = (kind & 1);
+        if (alt == 1)      { neg = !(i & 1); sub = 0; }
+        else if (alt == 2) { neg = 0;        sub = (i & 1); }
+        /* форма определяет пару множителей и слагаемое (SDM):
+         * 213: dst = src1×dst + src2   → p = s1*d, c = s2
+         * 231: dst = src1×src2 + dst   → p = s1*s2, c = d
+         * 132: dst = dst×src2 + src1   → p = d*s2, c = s1
+         * Ветвление по is_pd ДО вычислений: чтение неинициализированных
+         * float'ов (UB) ломало и double-путь после оптимизации.        */
+        if (is_pd) {
+            /* ВАЖНО: именно memcpy в double! ld64() возвращает БИТЫ как
+             * uint64_t — присваивание double дало бы целочисленное
+             * преобразование (0x3FF8... → 4.6e18), §6.18.              */
+            double a, q1, q2;
+            memcpy(&a,  d + i*8, 8);
+            memcpy(&q1, s1 + i*8, 8);
+            memcpy(&q2, s2 + i*8, 8);
+            double p, c;
+            if (form == 1)      { p = q1*q2; c = a;  }
+            else if (form == 2) { p = a*q2;  c = q1; }
+            else                { p = q1*a;  c = q2; }
+            double r = (neg ? -p : p) + (sub ? -c : c);
+            uint64_t bits; memcpy(&bits, &r, 8);
+            st64(d + i*8, bits);
+        } else {
+            float af, q1f, q2f;
+            memcpy(&af,  d + i*4, 4);
+            memcpy(&q1f, s1 + i*4, 4);
+            memcpy(&q2f, s2 + i*4, 4);
+            float pf, cf;
+            if (form == 1)      { pf = q1f*q2f; cf = af;  }
+            else if (form == 2) { pf = af*q2f;  cf = q1f; }
+            else                { pf = q1f*af;  cf = q2f; }
+            float r = (neg ? -pf : pf) + (sub ? -cf : cf);
+            uint32_t bits; memcpy(&bits, &r, 4);
+            st32(d + i*4, bits);
+        }
+    }
+}
+
 static void wide_vpermd(uint8_t *d, const uint8_t *idx, const uint8_t *tab)
 {
     uint8_t r[32];
@@ -668,7 +739,17 @@ static void pmaskmov_op(estate_t *st, emu_desc_t *d, int is_store)
     uint64_t basev = 0;
     if (is_gpr_reg(opnd_get_base(mem)))
         basev = *EG(st, gpr_idx(opnd_get_base(mem)));
-    const uint8_t *mv = is_xmm_reg(mask) ? EX(st, xmm_idx(opnd_get_reg(mask))) : EX(st, 0);
+    /* маска: ymm-форма читает полные 32Б (EX+EY) */
+    uint8_t mvb[32];
+    const uint8_t *mv;
+    if (is_vec_reg(mask)) {
+        int mi = xmm_idx(opnd_get_reg(mask));
+        memcpy(mvb, EX(st, mi), 16);
+        memcpy(mvb + 16, EY(st, mi), 16);
+        mv = mvb;
+    } else {
+        mv = EX(st, 0);
+    }
 
     if (is_store) {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
@@ -723,7 +804,17 @@ static void gather_op(estate_t *st, emu_desc_t *d)
     int scale = opnd_get_scale(mem);
     int disp  = opnd_get_disp(mem);
     int ii = xmm_idx(opnd_get_index(mem));
-    const uint8_t *mv = is_xmm_reg(mask) ? EX(st, xmm_idx(opnd_get_reg(mask))) : EX(st, 0);
+    /* маска: ymm-форма читает полные 32Б (EX+EY) */
+    uint8_t mvb[32];
+    const uint8_t *mv;
+    if (is_vec_reg(mask)) {
+        int mi = xmm_idx(opnd_get_reg(mask));
+        memcpy(mvb, EX(st, mi), 16);
+        memcpy(mvb + 16, EY(st, mi), 16);
+        mv = mvb;
+    } else {
+        mv = EX(st, 0);
+    }
 
     uint8_t r[32];
     memcpy(r, EX(st, di), 16);
@@ -1089,6 +1180,43 @@ static const uint8_t *src1_block(estate_t *st, emu_desc_t *d, uint8_t *tmp)
     return tmp;
 }
 
+/* pd vs ps у упакованных FMA-форм */
+static int fma_is_pd(int opc)
+{
+    switch (opc) {
+    case OP_vfmadd132pd: case OP_vfmadd213pd: case OP_vfmadd231pd:
+    case OP_vfmsub132pd: case OP_vfmsub213pd: case OP_vfmsub231pd:
+    case OP_vfnmadd132pd: case OP_vfnmadd213pd: case OP_vfnmadd231pd:
+    case OP_vfnmsub132pd: case OP_vfnmsub213pd: case OP_vfnmsub231pd:
+    case OP_vfmaddsub132pd: case OP_vfmaddsub213pd: case OP_vfmaddsub231pd:
+    case OP_vfmsubadd132pd: case OP_vfmsubadd213pd: case OP_vfmsubadd231pd:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* обработка одного FMA-случая (см. свитч emu_generic): 16Б нижняя половина
+ * + 16Б старшая (если ymm); для 132/213 произведение — старый dst */
+#define fma_case(kind_, alt_, form_)                                        \
+    do {                                                                    \
+        int di_ = xmm_idx(opnd_get_reg(d->dsts[0]));                        \
+        uint8_t D_[32], S1_[32], S2_[32];                                   \
+        get_block32(&st, d->dsts[0], D_);                                   \
+        get_block32(&st, d->srcs[0], S1_);                                  \
+        get_block32(&st, d->srcs[1], S2_);                                  \
+        fma_block(D_, S1_, S2_, (kind_), fma_is_pd(d->opc), (alt_),         \
+                  (form_));                                                 \
+        if (d->is_ymm) {                                                    \
+            fma_block(D_ + 16, S1_ + 16, S2_ + 16, (kind_),                 \
+                      fma_is_pd(d->opc), (alt_), (form_));                  \
+            memcpy(EY(&st, di_), D_ + 16, 16);                              \
+        } else if (d->is_vex && opnd_is_reg(d->dsts[0])) {                  \
+            memset(EY(&st, di_), 0, 16);   /* VEX.128: верх YMM в ноль */   \
+        }                                                                   \
+        memcpy(EX(&st, di_), D_, 16);                                       \
+    } while (0)
+
 int emu_generic(emu_desc_t *d)
 {
     void *dc = dr_get_current_drcontext();
@@ -1096,12 +1224,12 @@ int emu_generic(emu_desc_t *d)
     pass_ensure_tls(dc);
     st.buf = (uint8_t *)drmgr_get_tls_field(dc, g_tls_idx_buf);
     st.raw = (uint8_t *)drmgr_get_tls_field(dc, g_tls_idx_raw);
+    st.pc_next = d->pc_next;
 
     if (d->opc < OPC_MAX) {
         __atomic_fetch_add(&g_stat_generic[d->opc], 1, __ATOMIC_RELAXED);
     }
     __atomic_fetch_add(&g_dyn_generic, 1, __ATOMIC_RELAXED);
-
     uint8_t t1[16], t2[16], imm = 0;
     if (d->nsrc >= 1 && opnd_is_immed_int(d->srcs[d->nsrc - 1]))
         imm = (uint8_t)opnd_get_immed_int(d->srcs[d->nsrc - 1]);
@@ -1208,6 +1336,7 @@ int emu_generic(emu_desc_t *d)
         }
         memcpy(EX(&st, di), D, 16);
         if (d->is_ymm) memcpy(EY(&st, di), D + 16, 16);
+        else if (d->is_vex) memset(EY(&st, di), 0, 16); /* VEX.128: верх в ноль */
         break;
     }
 
@@ -1219,11 +1348,13 @@ int emu_generic(emu_desc_t *d)
         put_gpr_val(&st, d->dsts[0], v);
         break;
     }
-    case OP_pextrb: case OP_pextrw: case OP_pextrd: {
+    case OP_pextrb: case OP_pextrw: case OP_pextrd:
+    case OP_vpextrb: case OP_vpextrw: case OP_vpextrd: {   /* vpextrq = vpextrd */
         const uint8_t *sv = EX(&st, xmm_idx(opnd_get_reg(d->srcs[0])));
         uint64_t v = 0;
-        int esz = (d->opc == OP_pextrb) ? 1 : (d->opc == OP_pextrw) ? 2 :
-                  (d->opc == OP_pextrd) ? 4 : 8;
+        /* размер элемента — по размеру dst (rax=8Б у q-формы, eax=4Б...) */
+        opnd_size_t dz = opnd_get_size(d->dsts[0]);
+        int esz = (dz == OPSZ_1) ? 1 : (dz == OPSZ_2) ? 2 : (dz == OPSZ_8) ? 8 : 4;
         switch (esz) {
         case 1: v = sv[imm & 15]; break;
         case 2: v = ld16(sv + (imm & 7) * 2); break;
@@ -1233,62 +1364,62 @@ int emu_generic(emu_desc_t *d)
         put_gpr_val(&st, d->dsts[0], v);
         break;
     }
-    case OP_pinsrb: case OP_pinsrd: {   /* OP_pinsrq == OP_pinsrd (алиас) */
-        uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
+    case OP_pinsrb: case OP_pinsrd:   /* OP_pinsrq == OP_pinsrd (алиас) */
+    case OP_vpinsrb: case OP_vpinsrw: case OP_vpinsrd: { /* vpinsrq = vpinsrd */
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        uint8_t *dv = EX(&st, di);
         uint64_t v = get_gpr_val(&st, d->srcs[0]);
         opnd_size_t ssz = opnd_get_size(d->srcs[0]);
         if (ssz == OPSZ_1)      dv[imm & 15] = (uint8_t)v;
         else if (ssz == OPSZ_8) st64(dv + (imm & 1) * 8, v);
         else                    st32(dv + (imm & 3) * 4, (uint32_t)v);
+        if (d->is_vex) memset(EY(&st, di), 0, 16);      /* VEX.128 */
         break;
     }
 
-    /* ── PTEST / VTEST ── */
+    /* ── PTEST / VTEST ── источник может быть памятью (y/xmm vs m256/m128)!
+     * Читаем через get_block32: reg → EX+EY, mem → чтение по размеру.     */
     case OP_ptest: {
-        uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        const uint8_t *s2b = src2_block(&st, d, t2);
+        uint8_t s1b[32], s2v[32];
+        get_block32(&st, d->dsts[0], s1b);          /* dst — всегда reg */
+        get_block32(&st, d->srcs[1], s2v);          /* reg или память */
         if (d->is_ymm) {
             int zf = 1, cf = 1;
-            for (int h = 0; h < 2; h++) {
-                const uint8_t *dd = h ? EY(&st, xmm_idx(opnd_get_reg(d->dsts[0]))) : dv;
-                const uint8_t *ss = h ? EY(&st, xmm_idx(opnd_get_reg(d->srcs[1]))) : s2b;
-                for (int i = 0; i < 16; i++) {
-                    if (dd[i] & ss[i]) zf = 0;
-                    if (~dd[i] & ss[i]) cf = 0;
-                }
+            for (int i = 0; i < 32; i++) {
+                if (s1b[i] & s2v[i]) zf = 0;
+                if (~s1b[i] & s2v[i]) cf = 0;
             }
             flags_setmask(&st, (zf ? FZF : 0) | (cf ? FCF : 0), FCF|FZF|FSF|FOF|FAF|FPF);
         } else {
-            b_ptest(&st, dv, s2b);
+            b_ptest(&st, s1b, s2v);
         }
         break;
     }
     case OP_vtestps: case OP_vtestpd: {
-        const uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        const uint8_t *s2b = src2_block(&st, d, t2);
-        if (d->is_ymm) {
-            uint8_t dd[32], ss[32];
-            memcpy(dd, dv, 16); memcpy(dd+16, EY(&st, xmm_idx(opnd_get_reg(d->dsts[0]))), 16);
-            memcpy(ss, s2b, 16); memcpy(ss+16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
-            vtest(&st, dd, ss, d->opc == OP_vtestpd);
-        } else {
-            vtest(&st, dv, s2b, d->opc == OP_vtestpd);
-        }
+        uint8_t s1b[32], s2v[32];
+        get_block32(&st, d->dsts[0], s1b);
+        get_block32(&st, d->srcs[1], s2v);
+        vtest(&st, s1b, s2v, d->opc == OP_vtestpd);
         break;
     }
 
     /* ── переменные blendv ── */
     case OP_blendvps: case OP_blendvpd: {
+        /* src2 может быть памятью: берём полные 32Б через get_block32,
+         * младшая половина — s2v, старшая — s2v+16 (для reg это EY(idx)). */
+        uint8_t s2v[32];
         uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        const uint8_t *s2b = src2_block(&st, d, t2);
+        get_block32(&st, d->srcs[1], s2v);
         const uint8_t *m = EX(&st, 0);
-        if (d->opc == OP_blendvps) b_blendvps_m(dv, dv, s2b, m);
-        else                        b_blendvpd_m(dv, dv, s2b, m);
+        if (d->opc == OP_blendvps) b_blendvps_m(dv, dv, s2v, m);
+        else                        b_blendvpd_m(dv, dv, s2v, m);
         if (d->is_ymm) {
             int di = xmm_idx(opnd_get_reg(d->dsts[0]));
-            int si = is_xmm_reg(d->srcs[1]) ? xmm_idx(opnd_get_reg(d->srcs[1])) : di;
-            if (d->opc == OP_blendvps) b_blendvps_m(EY(&st, di), EY(&st, di), EY(&st, si), EY(&st, 0));
-            else                        b_blendvpd_m(EY(&st, di), EY(&st, di), EY(&st, si), EY(&st, 0));
+            if (d->opc == OP_blendvps) b_blendvps_m(EY(&st, di), EY(&st, di), s2v + 16, EY(&st, 0));
+            else                        b_blendvpd_m(EY(&st, di), EY(&st, di), s2v + 16, EY(&st, 0));
+        } else if (d->is_vex) {
+            int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+            memset(EY(&st, di), 0, 16);                     /* VEX.128 */
         }
         break;
     }
@@ -1300,14 +1431,14 @@ int emu_generic(emu_desc_t *d)
         break;
     }
 
-    /* ── 32-байтные cross-lane ── */
+    /* ── 32-байтные cross-lane ── источники могут быть памятью (BUG FIX:
+     * vpermq $i, m256, ymm раньше читал тень по мусорному индексу из
+     * opnd_get_reg(mem) → SIGSEGV/тихая порча, см. ARCHITECTURE §6.13) */
     case OP_vpermq: {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t s[32];
-        memcpy(s, EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        memcpy(s + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        wide_vpermq(s /* в себя небезопасно */, s, imm);
-        /* wide_vpermq пишет в локальный буфер — безопасно */
+        get_block32(&st, d->srcs[0], s);            /* reg или память */
+        wide_vpermq(s /* пишет в локальный буфер — безопасно */, s, imm);
         memcpy(EX(&st, di), s, 16);
         memcpy(EY(&st, di), s + 16, 16);
         break;
@@ -1315,10 +1446,8 @@ int emu_generic(emu_desc_t *d)
     case OP_vpermd: {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t idxs[32], tab[32];
-        memcpy(idxs, EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        memcpy(idxs + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        memcpy(tab, EX(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
-        memcpy(tab + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
+        get_block32(&st, d->srcs[0], idxs);
+        get_block32(&st, d->srcs[1], tab);
         wide_vpermd(idxs, idxs, tab);
         memcpy(EX(&st, di), idxs, 16);
         memcpy(EY(&st, di), idxs + 16, 16);
@@ -1327,20 +1456,20 @@ int emu_generic(emu_desc_t *d)
     case OP_vperm2f128: case OP_vperm2i128: {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t s1[32], s2[32], r[32];
-        memcpy(s1, EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        memcpy(s1 + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-        memcpy(s2, EX(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
-        memcpy(s2 + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
+        get_block32(&st, d->srcs[0], s1);
+        get_block32(&st, d->srcs[1], s2);
         wide_vperm2x128(r, s1, s2, imm);
         memcpy(EX(&st, di), r, 16);
         memcpy(EY(&st, di), r + 16, 16);
         break;
     }
     case OP_vcvtps2pd: {
-        /* src xmm 16Б → dst ymm 32Б */
+        /* src xmm/m128 16Б → dst ymm 32Б */
         if (d->is_ymm) {
+            uint8_t s16[16];
             int di = xmm_idx(opnd_get_reg(d->dsts[0]));
-            wide_cvtps2pd(EX(&st, di), EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))));
+            get_block16(&st, d->srcs[0], s16);      /* reg или память */
+            wide_cvtps2pd(EX(&st, di), s16);
             break;
         }
         /* 128-битная форма: cvtps2pd нативна — сюда не попадаем */
@@ -1350,14 +1479,38 @@ int emu_generic(emu_desc_t *d)
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         if (d->is_ymm) {
             uint8_t s[32];
-            memcpy(s, EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
-            memcpy(s + 16, EY(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
+            get_block32(&st, d->srcs[0], s);        /* reg или память */
             wide_cvtpd2ps(EX(&st, di), s);
         } else {
-            wide_cvtpd2ps(EX(&st, di), EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))));
+            uint8_t s16[16];
+            get_block16(&st, d->srcs[0], s16);
+            wide_cvtpd2ps(EX(&st, di), s16);
         }
         break;
     }
+
+    /* ── FMA (двойное округление; 256-битных форм нет в inline-пути
+     * rewrite_special — сюда ведут generic-диспетчер и trap-фоллбэк).
+     * kind: 0=fmadd 1=fmsub 2=fnmadd 3=fnmsub; alt: 1=fmaddsub 2=fmsubadd;
+     * f231: произведение s1*s2 и слагаемое dst.                     ── */
+    case OP_vfmadd132ps: case OP_vfmadd132pd: fma_case(0, 0, 2); break;
+    case OP_vfmadd213ps: case OP_vfmadd213pd: fma_case(0, 0, 0); break;
+    case OP_vfmadd231ps: case OP_vfmadd231pd: fma_case(0, 0, 1); break;
+    case OP_vfmsub132ps: case OP_vfmsub132pd: fma_case(1, 0, 2); break;
+    case OP_vfmsub213ps: case OP_vfmsub213pd: fma_case(1, 0, 0); break;
+    case OP_vfmsub231ps: case OP_vfmsub231pd: fma_case(1, 0, 1); break;
+    case OP_vfnmadd132ps: case OP_vfnmadd132pd: fma_case(2, 0, 2); break;
+    case OP_vfnmadd213ps: case OP_vfnmadd213pd: fma_case(2, 0, 0); break;
+    case OP_vfnmadd231ps: case OP_vfnmadd231pd: fma_case(2, 0, 1); break;
+    case OP_vfnmsub132ps: case OP_vfnmsub132pd: fma_case(3, 0, 2); break;
+    case OP_vfnmsub213ps: case OP_vfnmsub213pd: fma_case(3, 0, 0); break;
+    case OP_vfnmsub231ps: case OP_vfnmsub231pd: fma_case(3, 0, 1); break;
+    case OP_vfmaddsub132ps: case OP_vfmaddsub132pd: fma_case(0, 1, 2); break;
+    case OP_vfmaddsub213ps: case OP_vfmaddsub213pd: fma_case(0, 1, 0); break;
+    case OP_vfmaddsub231ps: case OP_vfmaddsub231pd: fma_case(0, 1, 1); break;
+    case OP_vfmsubadd132ps: case OP_vfmsubadd132pd: fma_case(0, 2, 2); break;
+    case OP_vfmsubadd213ps: case OP_vfmsubadd213pd: fma_case(0, 2, 0); break;
+    case OP_vfmsubadd231ps: case OP_vfmsubadd231pd: fma_case(0, 2, 1); break;
 
     /* ── vpmaskmov / gather ── */
     case OP_vpmaskmovd: case OP_vpmaskmovq:

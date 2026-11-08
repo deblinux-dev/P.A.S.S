@@ -137,6 +137,17 @@ static int opnd_is_xmmreg(opnd_t o)
            opnd_get_reg(o) <= DR_REG_XMM15;
 }
 
+/* Нормализация xmm-регистрового операнда до полного OPSZ_16.
+ * У app-операндов скалярных VEX-форм (vcvtsi2sd/vmulss и т.п.) DR
+ * ставит размер 8Б — movaps с таким операндом НЕкодируем и роняет
+ * релизный кодировщик DR (SIGSEGV при выбросе BB, §6.14).          */
+static opnd_t xmm16(opnd_t o)
+{
+    if (opnd_is_xmmreg(o))
+        return opnd_create_reg(opnd_get_reg(o));
+    return o;
+}
+
 /* stage mem→RAW_T через xmm15 (со спилом при первом использовании) */
 static void stage_mem(void *dc, instrlist_t *bb, instr_t *at, opnd_t mem,
                       uint tls_slot, int *used15)
@@ -247,7 +258,7 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         break;
     case VF_SHIFT:
         /* movaps dst, s1 ; op dst, count */
-        pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, d0, s1));
+        pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
         pass_ins(dc, bb, i, instr_create_1dst_2src(
             dc, e->legacy_op, d0, s2eff, d0));
         break;
@@ -256,17 +267,25 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         /* vmovss/vmovsd 2-формы: movss dst, m32; 3-формы: movaps dst, s1 ; movss dst, s2 */
         if ((e->vex_op == OP_vmovss || e->vex_op == OP_vmovsd)) {
             if (nsrc >= 2) {
-                pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, d0, s1));
+                pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
                 pass_ins(dc, bb, i, instr_create_1dst_1src(dc, e->legacy_op, d0, s2eff));
             } else {
                 pass_ins(dc, bb, i, instr_create_1dst_1src(dc, e->legacy_op, d0, s1));
             }
+        } else if (e->legacy_op == OP_cvtsi2ss || e->legacy_op == OP_cvtsi2sd) {
+            /* VEX cvtsi2s* xmm1, xmm2, r/m: слияние через movaps, затем
+             * легаси cvtsi2s* — в DR она с ОДНИМ источником (сливной
+             * операнд — сам dst; 2src-конструкция некодируема → крах
+             * релизного кодировщика DR, §6.14).                       */
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
+            pass_ins(dc, bb, i, instr_create_1dst_1src(
+                dc, e->legacy_op, xmm16(d0), s2eff));
         } else if (has_imm) {
-            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, d0, s1));
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, d0, s2eff, imm));
         } else {
-            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, d0, s1));
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, d0, s2eff, d0));
         }

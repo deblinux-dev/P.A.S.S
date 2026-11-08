@@ -188,6 +188,9 @@ typedef struct {
     uint8_t  flags_use, flags_def;
     uint8_t  uses_xmm0;          /* implicit xmm0 (blendv, pcmp*str*) */
     uint8_t  is_ymm;             /* 256-битная операция               */
+    uint8_t  is_vex;             /* VEX-форма: xmm-dst обнуляет верх YMM */
+    app_pc   pc_next;            /* app-PC следующей инструкции (для
+                                  * rip-относительных mem-операндов)  */
 } emu_desc_t;
 
 int  emu_generic(emu_desc_t *d);            /* clean call, 1 = обработано */

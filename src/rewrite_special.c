@@ -720,18 +720,22 @@ static int try_fma(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
     } else {
-        /* 132/213: dst = dst*s1 ± s2 */
+        /* БАГФИКС §6.14: у 132-формы множитель — (dst, s2), слагаемое s1!
+         * 213: dst = src1×dst + src2 → mul d0, s1 ; ±d0, s2
+         * 132: dst = dst×src2 + src1 → mul d0, s2 ; ±d0, s1            */
+        opnd_t mp = (e->form == 0) ? s2 : s1;   /* партнёр по умножению */
+        opnd_t ap = (e->form == 0) ? s1 : s2;   /* слагаемое            */
         switch (e->kind) {
         case 0: /* fmadd: mul ; add */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, s1, d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, s2, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, ap, d0));
             break;
         case 1: /* fmsub: mul ; sub */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, s1, d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, s2, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, ap, d0));
             break;
-        case 2: /* fnmadd: −(dst*s1) + s2 = s2 − dst*s1 → mul ; xor sign ; add */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, s1, d0));
+        case 2: /* fnmadd: −(dst*mp) + ap → mul ; инверсия знака ; add */
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
             /* инверсия знака всех элементов: pxor с 0x80-маской невозможна без
                константы — используем neg-трик: pxor xmm15,xmm15 ; subps dst, x15
                меняет порядок: нам нужно s2 − dst: subps d0, s2 даёт dst−s2 ✗.
@@ -747,10 +751,10 @@ static int try_fma(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, raw_opnd(RAW_T1, OPSZ_16), d0));
             pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, opnd_create_reg(X15), raw_opnd(RAW_T1, OPSZ_16), opnd_create_reg(X15)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, s2, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, ap, d0));
             break;
         case 3: /* fnmsub: −(dst*s1) − s2 → mul ; xor sign ; sub */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, s1, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
             used15 = 1;
@@ -758,7 +762,7 @@ static int try_fma(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, raw_opnd(RAW_T1, OPSZ_16), d0));
             pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, opnd_create_reg(X15), raw_opnd(RAW_T1, OPSZ_16), opnd_create_reg(X15)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, s2, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, ap, d0));
             break;
         }
         if (used15)

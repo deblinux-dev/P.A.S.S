@@ -74,7 +74,12 @@ void pass_ensure_tls(void *dc)
     void *raw_base = dr_get_dr_segment_base(g_tls_seg);
     uint8_t *buf = (uint8_t *)dr_thread_alloc(dc, BUF_SIZE);
     memset(buf, 0, BUF_SIZE);
-    drmgr_set_tls_field(dc, g_tls_idx_raw, raw_base);
+    /* БАГФИКС §6.16: C-код должен видеть РОВНО ту же память, что и
+     * inline-доступы raw_opnd(off) = gs:(g_tls_raw_off + off).
+     * Раньше сохранялся голый segment base — все чтения/записи тени
+     * EY()/emu-путей уходили на 0xe0 байт мимо (тихая порча/крахи). */
+    drmgr_set_tls_field(dc, g_tls_idx_raw,
+                        (uint8_t *)raw_base + g_tls_raw_off);
     drmgr_set_tls_field(dc, g_tls_idx_buf, buf);
 }
 

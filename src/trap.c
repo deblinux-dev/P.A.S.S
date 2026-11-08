@@ -22,6 +22,7 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
     int opc = instr_get_opcode(ins);
     opnd_size_t dsz = (instr_num_dsts(ins) > 0) ?
                       opnd_get_size(instr_get_dst(ins, 0)) : OPSZ_NA;
+    int is_vex = instr_bytes_vex(ins);
 
     if (opc_supported(opc, dsz) && opc != OP_cpuid && opc != OP_xgetbv) {
         instr_destroy(dc, ins);
@@ -67,6 +68,9 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
         d->uses_xmm0 = 1;
     if (opc == OP_mulx) d->gpr_src |= (1u << gpr_idx(DR_REG_RDX));
     d->is_ymm = (dsz == OPSZ_32);
+    d->is_vex = (uint8_t)is_vex;
+    /* rip-относительные операнды: app-PC следующей инструкции */
+    d->pc_next = dr_fragment_app_pc(mc->pc) + instr_length(dc, ins);
 
     /* строим состояние из mc + shadow и запускаем универсальный код:
        используем BUF как рабочую область (спил всех GPR/XMM) */

@@ -128,7 +128,9 @@ int opc_supported(int opc, opnd_size_t dsz)
     case OP_dppd: case OP_dpps: case OP_extractps: case OP_insertps:
     case OP_movntdqa: case OP_mpsadbw: case OP_packusdw: case OP_pblendvb:
     case OP_pcmpeqq: case OP_pextrb: case OP_pextrd:
+    case OP_vpextrb: case OP_vpextrw: case OP_vpextrd:   /* VEX-алиасы */
     case OP_pextrw: case OP_phminposuw: case OP_pinsrb: case OP_pinsrd:
+    case OP_vpinsrb: case OP_vpinsrw: case OP_vpinsrd:   /* VEX-алиасы */
     case OP_pmaxsb: case OP_pmaxsd: case OP_pmaxud:
     case OP_pmaxuw: case OP_pminsb: case OP_pminsd: case OP_pminud:
     case OP_pminuw: case OP_pmovsxbd: case OP_pmovsxbq: case OP_pmovsxbw:
