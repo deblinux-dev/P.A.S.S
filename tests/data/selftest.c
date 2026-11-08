@@ -36,6 +36,21 @@ static int fails = 0;
     } } while (0)
 
 /* ── эталоны (чистый C) ── */
+/* 64×64 → 128-битное произведение без __int128 (MSVC x86):
+ * schoolbook по 32-битным леммам. */
+static void ref_mul64x64(uint64_t x, uint64_t y, uint64_t *lo, uint64_t *hi)
+{
+    uint32_t x0 = (uint32_t)x, x1 = (uint32_t)(x >> 32);
+    uint32_t y0 = (uint32_t)y, y1 = (uint32_t)(y >> 32);
+    uint64_t p00 = (uint64_t)x0 * y0;
+    uint64_t p01 = (uint64_t)x0 * y1;
+    uint64_t p10 = (uint64_t)x1 * y0;
+    uint64_t p11 = (uint64_t)x1 * y1;
+    uint64_t m1  = p01 + (p00 >> 32);
+    uint64_t m2  = p10 + (uint32_t)m1;
+    *lo = ((uint64_t)(uint32_t)m2 << 32) | (uint32_t)p00;
+    *hi = p11 + (m2 >> 32) + (m1 >> 32);
+}
 static uint64_t ref_pext64(uint64_t v, uint64_t m)
 {
     uint64_t r = 0; int b = 0;
@@ -148,8 +163,10 @@ int main(void)
         {
             unsigned long long hi_store = 0;
             uint64_t lo_ret = _mulx_u64(v, m, &hi_store);
-            CHECK64("mulx_lo", lo_ret, (uint64_t)((unsigned __int128)v * m));
-            CHECK64("mulx_hi", hi_store, (uint64_t)(((unsigned __int128)v * m) >> 64));
+            uint64_t ref_lo, ref_hi;
+            ref_mul64x64(v, m, &ref_lo, &ref_hi);
+            CHECK64("mulx_lo", lo_ret, ref_lo);
+            CHECK64("mulx_hi", hi_store, ref_hi);
         }
     }
     /* ── BMI1 ── */
