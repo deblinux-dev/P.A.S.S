@@ -225,15 +225,23 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     build_desc(i, d);
     d->pc_next = instr_get_app_pc(i) + instr_length(dc, i);
 
-    /* операция с r10 в операндах не поддерживается generic-путём */
-    if ((d->gpr_src | d->gpr_dst) & (1u << gpr_idx(DR_REG_R10)))
-        return 0;
+    /* r10 в операндах поддерживается: carrier_begin спилит исходный r10
+     * в RAW_SV10, а ниже (4b) значение переносится в BUF_GPR(10) —
+     * эмулятор читает операнд оттуда же, откуда читает остальные GPR.
+     * Раньше такие инструкции отклонялись и оставались на native-пути
+     * (на реальном Core 2 — SIGILL и trap-fallback на каждый вылет). */
 
     /* (1) носитель r10 */
     carrier_begin(dc, bb, i);
 
-    /* (2) захват флагов-источников */
-    if (d->flags_use) {
+    /* (2) захват флагов: при flags_use — как источники; при flags_def —
+     * ОБЯЗАТЕЛЬНО даже если инструкция их не читает: эмулятор обновляет
+     * только арифметические биты поверх захваченного значения (flags_setmask
+     — read-modify-write), и popf вернёт приложению нетронутыми DF/IF/TF и
+     * прочие неопределяемые биты. Без захвата popf записал бы мусор из
+     * BUF_FLAGS: у node 8000+ эмуляций tzcnt/bzhi перевернули DF → rep movs/stos шли
+     * назад → «malloc(): corrupted top size». */
+    if (d->flags_use || d->flags_def) {
         pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
         pass_ins(dc, bb, i, INSTR_CREATE_pop(
             dc, buf_opnd(BUF_FLAGS, OPSZ_8)));
@@ -247,7 +255,8 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             dc, buf_opnd(BUF_XMM(k), OPSZ_16),
             opnd_create_reg(DR_REG_XMM0 + k)));
     }
-    /* (4) спилы GPR: RAX всегда — он носитель при перезагрузке флагов */
+    /* (4) спилы GPR: RAX всегда — он носитель при перезагрузке флагов.
+     * r10 в цикле исключён: его значение переносится отдельно в (4b). */
     uint32_t gprall = (d->gpr_src | d->gpr_dst | (1u << gpr_idx(DR_REG_RAX)))
                       & ~(1u << gpr_idx(DR_REG_R10));
     for (int k = 0; k < 16; k++) {
@@ -255,6 +264,17 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
             dc, buf_opnd(BUF_GPR(k), OPSZ_8),
             opnd_create_reg(DR_REG_RAX + k)));
+    }
+
+    /* (4b) операнд r10: исходное значение лежит в RAW_SV10 (gs-относительно,
+     * carrier_begin). Переносим в BUF_GPR(10) через rax: rax уже спилен
+     * выше (k=0 — первый в цикле), так что его значение не теряется. */
+    if ((d->gpr_src | d->gpr_dst) & (1u << gpr_idx(DR_REG_R10))) {
+        pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), raw_opnd(RAW_SV10, OPSZ_8)));
+        pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+            dc, buf_opnd(BUF_GPR(gpr_idx(DR_REG_R10)), OPSZ_8),
+            opnd_create_reg(DR_REG_RAX)));
     }
 
     /* (5) clean call */
@@ -322,10 +342,16 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instrlist_postinsert(bb, cur, ni);
         cur = ni;
     }
-    /* (7) восстановление r10 (обращение к клиентскому TLS — мета) */
-    if (!(gdst & (1u << gpr_idx(DR_REG_R10)))) {
-        instr_t *ni = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_R10),
-                                          raw_opnd(RAW_SV10, OPSZ_8));
+    /* (7) r10: если он выходной — результат операции (из BUF_GPR(10));
+     * иначе — исходное значение приложения из RAW_SV10 (gs-относительно,
+     * после clean call r10 всё ещё держит базу BUF — любой buf_opnd выше
+     * уже отработал, поэтому перезагрузка идёт последней). */
+    {
+        instr_t *ni = (gdst & (1u << gpr_idx(DR_REG_R10)))
+            ? INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_R10),
+                                  buf_opnd(BUF_GPR(gpr_idx(DR_REG_R10)), OPSZ_8))
+            : INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_R10),
+                                  raw_opnd(RAW_SV10, OPSZ_8));
         instr_set_meta(ni);
         instrlist_postinsert(bb, cur, ni);
         cur = ni;

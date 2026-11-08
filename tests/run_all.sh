@@ -40,7 +40,8 @@ for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4; do
 done
 
 echo "── дифф-тесты (побайтно native vs pass)"
-for t in t_lztz; do
+gcc -O1 -msse4.1 "$DATA/t_r10.c" -o t_r10 || bad "сборка t_r10"
+for t in t_lztz t_r10; do
     [ -x "$t" ] || continue
     "./$t" > n.bin 2>/dev/null
     run_pass -- "./$t" > p.bin 2>/dev/null
@@ -75,6 +76,18 @@ for t in tp ts2 ts3; do
     run_pass -- "./$t" > p.bin 2>/dev/null
     if cmp -s n.bin p.bin; then ok "$t"; else bad "$t (вывод различается)"; fi
 done
+
+echo "── предохранитель trap-цикла (t_deadloop, ARCHITECTURE §6.21)"
+gcc -O1 "$DATA/t_deadloop.c" -o t_deadloop || bad "сборка t_deadloop"
+if [ -x t_deadloop ]; then
+    rc=0
+    timeout 30 "$DRRUN" -c "$CLIENT" -target core2 -- ./t_deadloop >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = "86" ]; then
+        ok "t_deadloop (громкая остановка trap-цикла, exit 86)"
+    else
+        bad "t_deadloop: rc=$rc (ожидался 86; 124 = зависание — предохранитель не сработал)"
+    fi
+fi
 
 echo "── selftest (KAT-батарея)"
 # XFAIL: детерминированный крах в группе FMA — см. docs/ARCHITECTURE.md

@@ -11,7 +11,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.2              ║\n"
+        "  ║              Substitution  v0.2.1            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -149,7 +149,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2001\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2002\n");
 
     memset(&g_cfg, 0, sizeof(g_cfg));
     parse_options(argc, argv);

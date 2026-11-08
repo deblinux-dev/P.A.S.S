@@ -3,10 +3,36 @@
  * статическим рескрайнингом (например, сгенерированные JIT-ом),
  * ловятся по SIGILL (Linux) и эмулируются по месту. Результат —
  * модификация контекста прерванного потока и продолжение.
- * Windows: v0.1 только диагностика (exception event).              */
+ * Windows: тот же путь через exception event (VEH).              */
 #include "pass.h"
 #include <signal.h>
 #include <stdlib.h>
+
+/* Предохранитель trap-цикла: подряд идущие неудачи эмуляции на одном и
+ * том же PC. Некоторые рантаймы перехватывают SIGILL и возвращают
+ * управление на ту же инструкцию — без счётчика это выглядит как
+ * безмолвное зависание со 100% CPU и без единого сообщения (баг
+ * bun.exe, повторённый на Linux). Порог 64 — законный SIGILL-probing
+ * (детекция инструкций через сигнал) всегда либо продвигает PC
+ * обработчиком, либо редок; 64 подряд = замкнутый цикл. */
+#define TRAP_FAIL_LIMIT 64
+static app_pc g_last_fail_pc;
+static int g_fail_streak;
+
+/* громкое завершение при замкнутом trap-цикле: молчаливое зависание
+ * со 100% CPU хуже честного краха с диагнозом */
+static void trap_deadloop_abort(void *dc, instr_t *ins)
+{
+    dr_fprintf(STDERR,
+               "P.A.S.S.: замкнутый trap-цикл — приложение возвращает\n"
+               "управление на одну и ту же инструкцию %d раз подряд:\n"
+               "  ", TRAP_FAIL_LIMIT);
+    instr_disassemble(dc, ins, STDERR);
+    dr_fprintf(STDERR,
+               "\nP.A.S.S. не может её эмулировать. Чтобы не зависать\n"
+               "безмолвно со 100%% CPU — завершаю процесс (код 86).\n");
+    dr_exit_process(86);
+}
 
 /* Эмуляция инструкции из контекста сигнала.
  * Возвращает 1 при успехе (pc в mc продвинут), 0 — не смогли. */
@@ -24,7 +50,29 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
                       opnd_get_size(instr_get_dst(ins, 0)) : OPSZ_NA;
     int is_vex = instr_bytes_vex(ins);
 
+    /* предохранитель trap-цикла — считается для ЛЮБОГО SIGILL: замкнутый
+     * цикл «инструкция → SIGILL → обработчик возвращает на неё же» выглядит
+     * одинаково и для неэмулируемых опкодов, и для неизвестных нам
+     * (passthrough). Законный probing всегда продвигает PC обработчиком
+     * или уходит longjmp'ом — подряд один и тот же PC не встречается. */
+    if (g_last_fail_pc == mc->pc)
+        g_fail_streak++;
+    else {
+        g_last_fail_pc = mc->pc;
+        g_fail_streak = 1;
+    }
+
+    /* диагностика: каждое trap-срабатывание видно в -verbose 1.
+     * Без этого «закрытый» trap-цикл (одна и та же инструкция снова и
+     * снова) выглядит как безмолвный спин 100% CPU. */
+    if (g_cfg.verbose >= 1)
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] trap: SIGILL opc=%d @ " PIFX " (%d/%d)\n",
+                   opc, (ptr_uint_t)mc->pc, g_fail_streak, TRAP_FAIL_LIMIT);
+
     if (opc_supported(opc, dsz) && opc != OP_cpuid && opc != OP_xgetbv) {
+        if (g_fail_streak >= TRAP_FAIL_LIMIT)
+            trap_deadloop_abort(dc, ins);
         instr_destroy(dc, ins);
         return 0;   /* инструкция легальна — SIGILL по другой причине */
     }
@@ -91,6 +139,13 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
     *(uint32_t *)(buf + BUF_FLAGS) = (uint32_t)mc->xflags;
 
     if (!emu_generic(d)) {
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] trap: НЕТ эмуляции opc=%d @ " PIFX
+                   " — передаём приложению: ", opc, (ptr_uint_t)mc->pc);
+        instr_disassemble(dc, ins, STDERR);
+        dr_fprintf(STDERR, " (серия %d/%d)\n", g_fail_streak, TRAP_FAIL_LIMIT);
+        if (g_fail_streak >= TRAP_FAIL_LIMIT)
+            trap_deadloop_abort(dc, ins);
         dr_global_free(d, sizeof(emu_desc_t));
         instr_destroy(dc, ins);
         return 0;   /* нет эмуляции — SIGILL уйдёт приложению (громкое падение) */
