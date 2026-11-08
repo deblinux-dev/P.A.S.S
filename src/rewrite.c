@@ -491,7 +491,7 @@ dr_emit_flags_t pass_bb_event(void *dc, void *tag, instrlist_t *bb,
     if (translating)
         return DR_EMIT_DEFAULT;      /* результат детерминирован */
 
-    __atomic_fetch_add(&g_stat_bbs, 1, __ATOMIC_RELAXED);
+    PASS_ATOMIC_INC32(&g_stat_bbs);
 
     instr_t *i = instrlist_first(bb);
     while (i != NULL) {

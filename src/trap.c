@@ -165,7 +165,8 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
 {
     if (exc == NULL || exc->mcontext == NULL)
         return false;
-    if (exc->code != EXCEPTION_ILLEGAL_INSTRUCTION)
+    if (exc->record == NULL ||
+        exc->record->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
         return false;
     if (g_cfg.verbose) {
         dr_fprintf(STDERR, "[P.A.S.S.] trap (Win): illegal instr @ " PIFX "\n",

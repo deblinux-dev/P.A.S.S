@@ -575,15 +575,39 @@ static void aes_keygen(uint8_t *d, const uint8_t *s, uint imm)
 }
 
 /* ══════════════════ PCLMULQDQ ══════════════════ */
-typedef unsigned __int128 u128;
+/* 64×64 → 128-битное произведение без __int128 (MSVC x86 его не даёт):
+ * schoolbook по 32-битным леммам, §6.20. */
+static void mul64x64(uint64_t x, uint64_t y, uint64_t *lo, uint64_t *hi)
+{
+    uint32_t x0 = (uint32_t)x, x1 = (uint32_t)(x >> 32);
+    uint32_t y0 = (uint32_t)y, y1 = (uint32_t)(y >> 32);
+    uint64_t p00 = (uint64_t)x0 * y0;
+    uint64_t p01 = (uint64_t)x0 * y1;
+    uint64_t p10 = (uint64_t)x1 * y0;
+    uint64_t p11 = (uint64_t)x1 * y1;
+    uint64_t m1  = p01 + (p00 >> 32);           /* средний разряд */
+    uint64_t m2  = p10 + (uint32_t)m1;
+    *lo = ((uint64_t)(uint32_t)m2 << 32) | (uint32_t)p00;
+    *hi = p11 + (m2 >> 32) + (m1 >> 32);
+}
+
 static void pclmul_block(uint8_t *d, const uint8_t *s1, const uint8_t *s2, uint imm)
 {
     uint64_t a = ld64(s1 + ((imm & 1) ? 8 : 0));
     uint64_t b = ld64(s2 + ((imm & 16) ? 8 : 0));
-    u128 res = 0;
-    for (int i = 0; i < 64; i++)
-        if ((b >> i) & 1) res ^= (u128)a << i;
-    memcpy(d, &res, 16);
+    uint64_t lo = 0, hi = 0;
+    for (int i = 0; i < 64; i++) {
+        if ((b >> i) & 1) {
+            if (i == 0) {
+                lo ^= a;
+            } else {
+                lo ^= a << i;
+                hi ^= a >> (64 - i);
+            }
+        }
+    }
+    st64(d, lo);
+    st64(d + 8, hi);
 }
 
 /* ══════════════════ переменные сдвиги AVX2 ══════════════════ */
@@ -1047,13 +1071,12 @@ static void gpr_mulx(estate_t *st, emu_desc_t *d)
     uint64_t rdx = *EG(st, 2);  /* RDX */
     uint64_t src = get_gpr_val(st, d->srcs[0]);
     int is32 = (opnd_get_size(d->srcs[0]) == OPSZ_4);
-    unsigned __int128 p = (unsigned __int128)rdx * (unsigned __int128)src;
     uint64_t lo, hi;
     if (is32) {
         uint64_t pr = (uint64_t)((uint32_t)rdx * (uint32_t)src);
         lo = pr & 0xFFFFFFFF; hi = pr >> 32;
     } else {
-        lo = (uint64_t)p; hi = (uint64_t)(p >> 64);
+        mul64x64(rdx, src, &lo, &hi);
     }
     /* DR: dsts[0] = dest1 (high), dsts[1] = dest2 (low) */
     put_gpr_val(st, d->dsts[0], hi);
@@ -1227,9 +1250,9 @@ int emu_generic(emu_desc_t *d)
     st.pc_next = d->pc_next;
 
     if (d->opc < OPC_MAX) {
-        __atomic_fetch_add(&g_stat_generic[d->opc], 1, __ATOMIC_RELAXED);
+        PASS_ATOMIC_INC32(&g_stat_generic[d->opc]);
     }
-    __atomic_fetch_add(&g_dyn_generic, 1, __ATOMIC_RELAXED);
+    PASS_ATOMIC_INC32(&g_dyn_generic);
     uint8_t t1[16], t2[16], imm = 0;
     if (d->nsrc >= 1 && opnd_is_immed_int(d->srcs[d->nsrc - 1]))
         imm = (uint8_t)opnd_get_immed_int(d->srcs[d->nsrc - 1]);
