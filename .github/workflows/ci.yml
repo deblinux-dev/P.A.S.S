@@ -137,9 +137,12 @@ jobs:
 
       - name: Build pass.exe and selftest.exe
         shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          cl /O2 /Fe:pass.exe tools\\pass_launcher.c
-          cl /O2 /arch:AVX2 /Fe:selftest.exe tests\\data\\selftest.c
+          cl /O2 /Fe:pass.exe tools/pass_launcher.c
+          cl /O2 /arch:AVX2 /Fe:selftest.exe tests/data/selftest.c
           ls -l pass.exe selftest.exe
 
       - name: Smoke — selftest under drrun -target core2
