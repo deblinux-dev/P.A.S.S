@@ -46,8 +46,16 @@ jobs:
       - name: Download DynamoRIO
         if: steps.dr.outputs.cache-hit != 'true'
         run: |
-          curl -L --fail --retry 3 -o dr.tar.gz \
-            "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Linux-${DR_VERSION}.tar.gz"
+          URL="https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Linux-${DR_VERSION}.tar.gz"
+          for i in 1 2 3 4 5; do
+            echo "попытка $i/5..."
+            if curl -L --fail --retry 3 --retry-all-errors --connect-timeout 30 -o dr.tar.gz "$URL"; then
+              break
+            fi
+            rm -f dr.tar.gz
+            sleep 20
+          done
+          test -s dr.tar.gz || { echo "не удалось скачать DynamoRIO после 5 попыток"; exit 1; }
           tar xzf dr.tar.gz
           rm dr.tar.gz
           mv "DynamoRIO-Linux-${DR_VERSION}" dynamorio
@@ -106,8 +114,16 @@ jobs:
         if: steps.dr.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          curl -L --fail --retry 3 -o dr.zip \
-            "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
+          URL="https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
+          for i in 1 2 3 4 5; do
+            echo "попытка $i/5..."
+            if curl -L --fail --retry 3 --retry-all-errors --connect-timeout 30 -o dr.zip "$URL"; then
+              break
+            fi
+            rm -f dr.zip
+            sleep 20
+          done
+          test -s dr.zip || { echo "не удалось скачать DynamoRIO после 5 попыток"; exit 1; }
           powershell -NoProfile -Command "Expand-Archive -Path dr.zip -DestinationPath . -Force"
           rm -f dr.zip
           mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
