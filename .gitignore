@@ -1,0 +1,24 @@
+# артефакты сборки
+build/
+bin-linux/
+*.o
+*.so
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+
+# локальные загрузки DynamoRIO
+dynamorio/
+DynamoRIO-*/
+
+# пакеты
+*.zip
+*.tar.gz
+
+# прочее
+__pycache__/
+smoke.log
+launcher.log

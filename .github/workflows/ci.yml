@@ -1,0 +1,183 @@
+# ============================================================
+# P.A.S.S. — CI
+# ------------------------------------------------------------
+# Сборка клиента P.A.S.S. (DynamoRIO) + лаунчеров + тестов:
+#   * Linux x86-64:  libpass_client.so + ./pass  + полный
+#                    регрессионный прогон tests/run_all.sh
+#   * Windows x64:   pass_client.dll (MSVC) + pass.exe + smoke
+#                    selftest.exe под drrun -target core2
+# Тег v* → GitHub Release с готовыми архивами.
+# ============================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DR_VERSION: "11.91.20763"
+
+jobs:
+  linux:
+    name: Linux x86-64 — build + tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake 3.x (<4)
+        run: |
+          python3 -m pip install --quiet --break-system-packages "cmake==3.31.6" \
+            || python3 -m pip install --quiet "cmake==3.31.6"
+          echo "$(python3 -c 'import cmake; print(cmake.CMAKE_BIN_DIR)')" >> "$GITHUB_PATH"
+          cmake --version
+
+      - name: Cache DynamoRIO
+        id: dr
+        uses: actions/cache@v4
+        with:
+          path: dynamorio
+          key: dr-linux-${{ env.DR_VERSION }}
+
+      - name: Download DynamoRIO
+        if: steps.dr.outputs.cache-hit != 'true'
+        run: |
+          curl -L --fail --retry 3 -o dr.tar.gz \
+            "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Linux-${DR_VERSION}.tar.gz"
+          tar xzf dr.tar.gz
+          rm dr.tar.gz
+          mv "DynamoRIO-Linux-${DR_VERSION}" dynamorio
+
+      - name: Build libpass_client.so
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DDynamoRIO_DIR="$PWD/dynamorio/cmake"
+          cmake --build build --parallel "$(nproc)"
+          ls -l build/libpass_client.so
+
+      - name: Regression tests (tests/run_all.sh)
+        run: |
+          bash tests/run_all.sh "$PWD/build/libpass_client.so" "$PWD/dynamorio/bin64/drrun"
+
+      - name: Package PASS-linux-x64.zip
+        run: |
+          mkdir -p pkg/docs
+          cp build/libpass_client.so pkg/
+          cp tools/pass.sh pkg/pass
+          chmod +x pkg/pass
+          cp README.md LICENSE pkg/
+          cp docs/ARCHITECTURE.md docs/COVERAGE.md docs/WINDOWS.md pkg/docs/
+          (cd pkg && zip -qr ../PASS-linux-x64.zip .)
+          ls -l PASS-linux-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PASS-linux-x64
+          path: PASS-linux-x64.zip
+
+  windows:
+    name: Windows x64 — build + smoke
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CMake 3.x (<4)
+        shell: bash
+        run: |
+          python -m pip install --quiet "cmake==3.31.6"
+          echo "$(python -c 'import cmake; print(cmake.CMAKE_BIN_DIR)')" >> "$GITHUB_PATH"
+          cmake --version
+
+      - name: Cache DynamoRIO
+        id: dr
+        uses: actions/cache@v4
+        with:
+          path: dynamorio
+          key: dr-win-${{ env.DR_VERSION }}
+
+      - name: Download DynamoRIO
+        if: steps.dr.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L --fail --retry 3 -o dr.zip \
+            "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
+          unzip -q dr.zip
+          rm dr.zip
+          mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
+
+      - name: Build pass_client.dll (MSVC)
+        shell: bash
+        run: |
+          cmake -S . -B build -DDynamoRIO_DIR="$(pwd -W)/dynamorio/cmake"
+          cmake --build build --config Release
+          ls -l build/Release/pass_client.dll
+
+      - name: Build pass.exe and selftest.exe
+        shell: bash
+        run: |
+          cl /O2 /Fe:pass.exe tools\\pass_launcher.c
+          cl /O2 /arch:AVX2 /Fe:selftest.exe tests\\data\\selftest.c
+          ls -l pass.exe selftest.exe
+
+      - name: Smoke — selftest under drrun -target core2
+        shell: bash
+        run: |
+          cp build/Release/pass_client.dll .
+          run_smoke() {
+            dynamorio/bin64/drrun.exe -c pass_client.dll -target core2 -- selftest.exe > smoke.log 2>&1
+          }
+          if run_smoke; then
+            echo "selftest под P.A.S.S. (попытка 1): OK"
+          elif run_smoke; then
+            echo "selftest под P.A.S.S. (попытка 2): OK"
+          else
+            echo "── smoke.log ──"; cat smoke.log; exit 1
+          fi
+
+      - name: Package PASS-win-x64.zip
+        shell: bash
+        run: |
+          mkdir -p pkg/docs
+          cp pass.exe pass_client.dll README.md LICENSE pkg/
+          cp docs/ARCHITECTURE.md docs/COVERAGE.md docs/WINDOWS.md pkg/docs/
+          powershell -NoProfile -Command "Compress-Archive -Path pkg\\* -DestinationPath PASS-win-x64.zip -Force"
+          ls -l PASS-win-x64.zip
+
+      - name: Smoke — launcher pass.exe (DYNAMORIO_HOME)
+        shell: bash
+        run: |
+          DYNAMORIO_HOME="$PWD/dynamorio" pkg/pass.exe -target core2 -- selftest.exe > launcher.log 2>&1 \
+            || { echo "── launcher.log ──"; cat launcher.log; exit 1; }
+          echo "pass.exe: OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PASS-win-x64
+          path: PASS-win-x64.zip
+
+  release:
+    name: Release (tag v*)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: PASS-linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: PASS-win-x64
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            PASS-linux-x64.zip
+            PASS-win-x64.zip
+          generate_release_notes: true

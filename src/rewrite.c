@@ -1,0 +1,479 @@
+/* P.A.S.S. — rewrite.c
+ * Проход по базовым блокам, диспетчер перезаписи и генератор
+ * generic-пути (спил регистров → clean call → восстановление). */
+#include "pass.h"
+
+/* ─────────────── общие хелперы генерации ─────────────── */
+
+void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
+{
+    (void)dc;
+    /* Инструкции, обращающиеся к клиентскому RAW TLS (gs:disp),
+     * помечаем мета: иначе DR манглит gs как сегмент приложения
+     * (база приложения = 0) и запись уходит по нулевому адресу.
+     * Инструкции с app-памятью остаются app — их сбои транслируются
+     * корректно (fallback-семантика).                              */
+    int uses_tls = 0, uses_app_mem = 0;
+    for (int k = 0; k < instr_num_srcs(in) && !uses_app_mem; k++) {
+        opnd_t o = instr_get_src(in, k);
+        if (opnd_is_far_base_disp(o) && opnd_get_segment(o) == g_tls_seg)
+            uses_tls = 1;
+        else if (opnd_is_base_disp(o))
+            uses_app_mem = 1;
+    }
+    for (int k = 0; k < instr_num_dsts(in) && !uses_app_mem; k++) {
+        opnd_t o = instr_get_dst(in, k);
+        if (opnd_is_far_base_disp(o) && opnd_get_segment(o) == g_tls_seg)
+            uses_tls = 1;
+        else if (opnd_is_base_disp(o))
+            uses_app_mem = 1;
+    }
+    if (uses_tls && !uses_app_mem)
+        instr_set_meta(in);
+    instrlist_preinsert(bb, at, in);
+}
+
+/* копия mem-операнда со сдвигом смещения (для hi-половин) */
+opnd_t mem_off16(opnd_t mem, int disp_add, opnd_size_t sz)
+{
+    if (opnd_is_base_disp(mem)) {
+        return opnd_create_base_disp(opnd_get_base(mem), opnd_get_index(mem),
+                                     opnd_get_scale(mem),
+                                     opnd_get_disp(mem) + disp_add, sz);
+    }
+    if (opnd_is_far_base_disp(mem)) {
+        return opnd_create_far_base_disp(opnd_get_segment(mem), opnd_get_base(mem),
+                                         opnd_get_index(mem), opnd_get_scale(mem),
+                                         opnd_get_disp(mem) + disp_add, sz);
+    }
+    if (opnd_is_rel_addr(mem)) {
+        return opnd_create_rel_addr((byte *)((char *)opnd_get_addr(mem) + disp_add), sz);
+    }
+    if (opnd_is_abs_addr(mem)) {
+        return opnd_create_abs_addr((byte *)((char *)opnd_get_addr(mem) + disp_add), sz);
+    }
+    return mem;
+}
+
+/* [r10 + off] */
+opnd_t buf_opnd(uint off, opnd_size_t sz)
+{
+    return opnd_create_base_disp(DR_REG_R10, DR_REG_NULL, 0, (int)off, sz);
+}
+
+/* [gs: g_tls_raw_off + off] */
+opnd_t raw_opnd(uint off, opnd_size_t sz)
+{
+    return opnd_create_far_base_disp(g_tls_seg, DR_REG_NULL, DR_REG_NULL, 0,
+                                     (int)(g_tls_raw_off + off), sz);
+}
+
+/* начало «носителя»: сохранить r10, загрузить базу BUF в r10 */
+void carrier_begin(void *dc, instrlist_t *bb, instr_t *at)
+{
+    pass_ins(dc, bb, at, INSTR_CREATE_mov_st(
+        dc, raw_opnd(RAW_SV10, OPSZ_8), opnd_create_reg(DR_REG_R10)));
+    drmgr_insert_read_tls_field(dc, g_tls_idx_buf, bb, at, DR_REG_R10);
+}
+
+/* конец: восстановить r10 (если он не выходной регистр операции) */
+void carrier_end(void *dc, instrlist_t *bb, instr_t *at, uint32_t gpr_dst)
+{
+    if (gpr_dst & (1u << gpr_idx(DR_REG_R10)))
+        return;
+    pass_ins(dc, bb, at, INSTR_CREATE_mov_ld(
+        dc, opnd_create_reg(DR_REG_R10), raw_opnd(RAW_SV10, OPSZ_8)));
+}
+
+/* RAW_YHI[x] = 0 — два mov-imm, без регистров */
+void zero_yhi(void *dc, instrlist_t *bb, instr_t *at, int xi)
+{
+    /* 4×mov dword [gs:off], 0 — гарантированно кодируемая форма */
+    for (uint k = 0; k < 16; k += 4)
+        pass_ins(dc, bb, at, INSTR_CREATE_mov_st(
+            dc, raw_opnd(RAW_YHI(xi) + k, OPSZ_4), OPND_CREATE_INT32(0)));
+}
+
+/* ─────────────── таблица generic-опкодов ─────────────── */
+
+static const int generic_opcs[] = {
+    /* SSE4.1/4.2 векторные */
+    OP_pcmpgtq, OP_pcmpeqq, OP_pmulld, OP_pmuldq, OP_packusdw, OP_phminposuw,
+    OP_mpsadbw, OP_roundps, OP_roundpd, OP_roundss, OP_roundsd, OP_dpps,
+    OP_dppd, OP_blendps, OP_blendpd, OP_blendvps, OP_blendvpd, OP_pblendvb,
+    OP_vpblendd, OP_pminsb, OP_pmaxsb, OP_pminsd, OP_pmaxsd,
+    OP_pminuw, OP_pmaxuw, OP_pminud, OP_pmaxud,
+    OP_pmovsxbw, OP_pmovsxbd, OP_pmovsxbq, OP_pmovsxwd, OP_pmovsxwq,
+    OP_pmovsxdq, OP_pmovzxbw, OP_pmovzxbd, OP_pmovzxbq, OP_pmovzxwd,
+    OP_pmovzxwq, OP_pmovzxdq,
+    OP_ptest, OP_vtestps, OP_vtestpd,
+    OP_insertps, OP_extractps, OP_pextrb, OP_pextrw, OP_pextrd,
+    OP_pinsrb, OP_pinsrd,
+    /* AES-NI / PCLMUL */
+    OP_aesenc, OP_aesdec, OP_aesenclast, OP_aesdeclast, OP_aesimc,
+    OP_aeskeygenassist, OP_pclmulqdq, OP_vpclmulqdq,
+    /* AVX2 */
+    OP_vpsllvd, OP_vpsrlvd, OP_vpsravd, OP_vpsllvq, OP_vpsrlvq, OP_vpsravq,
+    OP_vpermq, OP_vpermd, OP_vperm2f128, OP_vperm2i128,
+    OP_vpmaskmovd, OP_vpmaskmovq,
+    OP_vpgatherdd, OP_vpgatherdq, OP_vpgatherqd, OP_vpgatherqq,
+    OP_vgatherdps, OP_vgatherdpd, OP_vgatherqps, OP_vgatherqpd,
+    OP_vcvtps2pd, OP_vcvtpd2ps,
+    /* GPR */
+    OP_crc32, OP_pext, OP_pdep, OP_bzhi, OP_bextr, OP_mulx, OP_adcx,
+    OP_adox, OP_popcnt, OP_lzcnt, OP_tzcnt,
+    0
+};
+
+static int is_generic_opc(int opc);
+
+int pass_is_generic_opc(int opc) { return is_generic_opc(opc); }
+
+static int is_generic_opc(int opc)
+{
+    for (int k = 0; generic_opcs[k] != 0; k++)
+        if (generic_opcs[k] == opc) return 1;
+    return 0;
+}
+
+
+/* ─────────────── build_desc ─────────────── */
+
+static void build_desc(instr_t *i, emu_desc_t *d)
+{
+    memset(d, 0, sizeof(*d));
+    d->opc = instr_get_opcode(i);
+    d->ndst = instr_num_dsts(i); if (d->ndst > 2) d->ndst = 2;
+    d->nsrc = instr_num_srcs(i); if (d->nsrc > 4) d->nsrc = 4;
+    for (int k = 0; k < d->ndst; k++) d->dsts[k] = instr_get_dst(i, k);
+    for (int k = 0; k < d->nsrc; k++) d->srcs[k] = instr_get_src(i, k);
+
+    for (int k = 0; k < 2; k++) {
+        if (k >= d->ndst) break;
+        opnd_t o = d->dsts[k];
+        if (opnd_is_reg(o)) {
+            reg_id_t r = opnd_get_reg(o);
+            if (r >= DR_REG_XMM0 && r <= DR_REG_XMM15) {
+                d->xmm_dst |= 1u << xmm_idx(r);
+                if (r == DR_REG_XMM0) d->uses_xmm0 = 1;
+            } else if (is_gpr_reg(r)) {
+                d->gpr_dst |= 1u << gpr_idx(r);
+            }
+        } else if (opnd_is_memory_reference(o)) {
+            reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+            if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
+            if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
+        }
+        if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
+    }
+    for (int k = 0; k < 4; k++) {
+        if (k >= d->nsrc) break;
+        opnd_t o = d->srcs[k];
+        if (opnd_is_reg(o)) {
+            reg_id_t r = opnd_get_reg(o);
+            if (r >= DR_REG_XMM0 && r <= DR_REG_XMM15) {
+                d->xmm_src |= 1u << xmm_idx(r);
+                if (r == DR_REG_XMM0) d->uses_xmm0 = 1;
+            } else if (is_gpr_reg(r)) {
+                d->gpr_src |= 1u << gpr_idx(r);
+            }
+        } else if (opnd_is_memory_reference(o)) {
+            reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+            if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
+            if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
+            if (ix >= DR_REG_XMM0 && ix <= DR_REG_XMM15)
+                d->xmm_src |= 1u << xmm_idx(ix);      /* gather: индекс в xmm */
+            if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
+        }
+        if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
+    }
+
+    /* implicit-операнды */
+    if (d->opc == OP_blendvps || d->opc == OP_blendvpd ||
+        d->opc == OP_pblendvb || d->opc == OP_pcmpestri || d->opc == OP_pcmpestrm)
+        d->uses_xmm0 = 1;
+    if (d->opc == OP_mulx)
+        d->gpr_src |= 1u << gpr_idx(DR_REG_RDX);      /* неявный RDX */
+    if (d->opc == OP_vzeroall)
+        d->xmm_dst = 0xFFFF;                          /* восстановить все xmm */
+
+    /* флаги */
+    uint eflags = instr_get_eflags(i, DR_QUERY_DEFAULT);
+    if (eflags & (EFLAGS_READ_CF | EFLAGS_READ_ZF | EFLAGS_READ_SF |
+                  EFLAGS_READ_OF | EFLAGS_READ_PF | EFLAGS_READ_AF |
+                  EFLAGS_READ_DF))
+        d->flags_use = 1;
+    if (eflags & (EFLAGS_WRITE_CF | EFLAGS_WRITE_ZF | EFLAGS_WRITE_SF |
+                  EFLAGS_WRITE_OF | EFLAGS_WRITE_PF | EFLAGS_WRITE_AF |
+                  EFLAGS_WRITE_DF))
+        d->flags_def = 1;
+}
+
+/* ─────────────── generic-путь (clean call) ─────────────── */
+
+int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
+{
+    if (g_cfg.verbose >= 2)
+        dr_fprintf(STDERR, "[P.A.S.S.] generic: opc=%d\n", instr_get_opcode(i));
+
+    emu_desc_t *d = (emu_desc_t *)dr_global_alloc(sizeof(emu_desc_t));
+    build_desc(i, d);
+
+    /* операция с r10 в операндах не поддерживается generic-путём */
+    if ((d->gpr_src | d->gpr_dst) & (1u << gpr_idx(DR_REG_R10)))
+        return 0;
+
+    /* (1) носитель r10 */
+    carrier_begin(dc, bb, i);
+
+    /* (2) захват флагов-источников */
+    if (d->flags_use) {
+        pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
+        pass_ins(dc, bb, i, INSTR_CREATE_pop(
+            dc, buf_opnd(BUF_FLAGS, OPSZ_8)));
+    }
+
+    /* (3) спилы xmm */
+    uint32_t xmmall = d->xmm_src | d->xmm_dst;
+    for (int k = 0; k < 16; k++) {
+        if (!(xmmall & (1u << k))) continue;
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, buf_opnd(BUF_XMM(k), OPSZ_16),
+            opnd_create_reg(DR_REG_XMM0 + k)));
+    }
+    /* (4) спилы GPR: RAX всегда — он носитель при перезагрузке флагов */
+    uint32_t gprall = (d->gpr_src | d->gpr_dst | (1u << gpr_idx(DR_REG_RAX)))
+                      & ~(1u << gpr_idx(DR_REG_R10));
+    for (int k = 0; k < 16; k++) {
+        if (!(gprall & (1u << k))) continue;
+        pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+            dc, buf_opnd(BUF_GPR(k), OPSZ_8),
+            opnd_create_reg(DR_REG_RAX + k)));
+    }
+
+    /* (5) clean call */
+    dr_insert_clean_call(dc, bb, i, (void *)emu_generic, true /*save fpstate*/,
+                         1, OPND_CREATE_INTPTR((ptr_int_t)d));
+
+    /* (6) восстановление: после call-последовательности, до i */
+    instr_t *cur = instr_get_prev(i);
+    uint32_t gdst = d->gpr_dst;
+    /* xmm-результаты */
+    for (int k = 0; k < 16; k++) {
+        if (!(d->xmm_dst & (1u << k))) continue;
+        instr_t *ni = INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM0 + k), buf_opnd(BUF_XMM(k), OPSZ_16));
+        instrlist_postinsert(bb, cur, ni);
+        cur = ni;
+    }
+    /* GPR-результаты, кроме rax (flags-танец) и r10 (носитель) */
+    for (int k = 0; k < 16; k++) {
+        if (!(gdst & (1u << k))) continue;
+        if (k == gpr_idx(DR_REG_RAX) || k == gpr_idx(DR_REG_R10)) continue;
+        instr_t *ni = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX + k), buf_opnd(BUF_GPR(k), OPSZ_8));
+        instrlist_postinsert(bb, cur, ni);
+        cur = ni;
+    }
+    /* VEX.128-запись обнуляет старшие половины (инвариант shadow).
+     * Проверяем по фактическому VEX-префиксу инструкции: легаси- и
+     * VEX-формы SSE4.1 имеют ОДИН opcode в DR (pmovsxbw и т.п.),
+     * табличный признак v0.1 ошибочно глушал обнуление для VEX-форм. */
+    if (d->xmm_dst != 0 && !d->is_ymm && instr_bytes_vex(i)) {
+        for (int k = 0; k < 16; k++) {
+            if (!(d->xmm_dst & (1u << k))) continue;
+            instr_t *z1 = INSTR_CREATE_mov_st(dc, raw_opnd(RAW_YHI(k), OPSZ_4),
+                                              OPND_CREATE_INT32(0));
+            instr_t *z2 = INSTR_CREATE_mov_st(dc, raw_opnd(RAW_YHI(k) + 4, OPSZ_4),
+                                              OPND_CREATE_INT32(0));
+            instr_t *z3 = INSTR_CREATE_mov_st(dc, raw_opnd(RAW_YHI(k) + 8, OPSZ_4),
+                                              OPND_CREATE_INT32(0));
+            instr_t *z4 = INSTR_CREATE_mov_st(dc, raw_opnd(RAW_YHI(k) + 12, OPSZ_4),
+                                              OPND_CREATE_INT32(0));
+            instr_set_meta(z1); instr_set_meta(z2);
+            instr_set_meta(z3); instr_set_meta(z4);
+            instrlist_postinsert(bb, cur, z1); cur = z1;
+            instrlist_postinsert(bb, cur, z2); cur = z2;
+            instrlist_postinsert(bb, cur, z3); cur = z3;
+            instrlist_postinsert(bb, cur, z4); cur = z4;
+        }
+    }
+    /* флаги-результаты */
+    if (d->flags_def) {
+        instr_t *n1 = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
+                                          buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *n2 = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
+        instr_t *n3 = INSTR_CREATE_popf(dc);
+        instrlist_postinsert(bb, cur, n1); cur = n1;
+        instrlist_postinsert(bb, cur, n2); cur = n2;
+        instrlist_postinsert(bb, cur, n3); cur = n3;
+    }
+    /* rax — всегда последним: popf затирает его носителем;
+       спил гарантирует исходное значение (rax — dst или источник) */
+    {
+        instr_t *ni = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
+                                          buf_opnd(BUF_GPR(0), OPSZ_8));
+        instrlist_postinsert(bb, cur, ni);
+        cur = ni;
+    }
+    /* (7) восстановление r10 (обращение к клиентскому TLS — мета) */
+    if (!(gdst & (1u << gpr_idx(DR_REG_R10)))) {
+        instr_t *ni = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_R10),
+                                          raw_opnd(RAW_SV10, OPSZ_8));
+        instr_set_meta(ni);
+        instrlist_postinsert(bb, cur, ni);
+        cur = ni;
+    }
+    (void)cur;
+
+    /* (8) удалить исходную инструкцию */
+    instrlist_remove(bb, i);
+    instr_destroy(dc, i);
+    return 1;
+}
+
+/* ─────────────── главный диспетчер ─────────────── */
+int g_disable_256 = 0, g_disable_128 = 0, g_disable_special = 0;
+
+static void report_unsupported(void *dc, instr_t *i)
+{
+    int opc = instr_get_opcode(i);
+    if (opc < OPC_MAX)
+        PASS_ATOMIC_INC32(&g_stat_unsupported[opc]);
+    if (g_cfg.verbose) {
+        dr_fprintf(STDERR, "[P.A.S.S.] нет эмуляции для opc=%d @ " PIFX
+                           " — останется на trap-fallback\n", opc,
+                   (ptr_uint_t)instr_get_app_pc(i));
+    }
+    (void)dc;
+}
+
+/* Обёртка переписывания: вокруг зоны вставки ставится sentinel-метка,
+ * после переписывания всем вставленным app-инструкциям проставляется
+ * translation-поле (требование DR для маппинга сигналов/стеков).    */
+typedef int (*rewrite_fn_t)(void *dc, instrlist_t *bb, instr_t *i);
+
+static int run_rewriter(void *dc, instrlist_t *bb, instr_t *i, rewrite_fn_t fn)
+{
+    instr_t *prev = instr_get_prev(i);
+    int opc0 = instr_get_opcode(i);   /* до fn(): fn уничтожает i */
+    app_pc pc = instr_get_app_pc(i);
+    instr_t *sentinel = INSTR_CREATE_label(dc);
+    instrlist_postinsert(bb, i, sentinel);
+    int handled = fn(dc, bb, i);
+    if (handled && opc0 < OPC_MAX)
+        PASS_ATOMIC_INC32(&g_stat_static[opc0]);
+    if (handled && g_cfg.verbose >= 3) {
+        dr_fprintf(STDERR, "[P.A.S.S.] rewrite opc=%d @ " PIFX ":\n",
+                   opc0, (ptr_uint_t)pc);
+        instr_t *n = (prev != NULL) ? instr_get_next(prev) : instrlist_first(bb);
+        while (n != sentinel && n != NULL) {
+            dr_fprintf(STDERR, "    ");
+            instr_disassemble(dc, n, STDERR);
+            dr_fprintf(STDERR, "\n");
+            n = instr_get_next(n);
+        }
+    }
+    if (handled) {
+        instr_t *n = (prev != NULL) ? instr_get_next(prev) : instrlist_first(bb);
+        while (n != sentinel && n != NULL) {
+            if (!instr_is_meta(n))
+                instr_set_translation(n, pc);
+            n = instr_get_next(n);
+        }
+    }
+    instrlist_remove(bb, sentinel);
+    instr_destroy(dc, sentinel);
+    return handled;
+}
+
+/* void-обёртки для cpuid/xgetbv-хуков */
+static int rewrite_cpuid_w(void *dc, instrlist_t *bb, instr_t *i)
+{ rewrite_cpuid(dc, bb, i); return 1; }
+static int rewrite_xgetbv_w(void *dc, instrlist_t *bb, instr_t *i)
+{ rewrite_xgetbv(dc, bb, i); return 1; }
+static int rewrite_nop_w(void *dc, instrlist_t *bb, instr_t *i)
+{
+    instr_t *nop = INSTR_CREATE_nop(dc);
+    instrlist_preinsert(bb, i, nop);
+    instrlist_remove(bb, i);
+    instr_destroy(dc, i);
+    return 1;
+}
+
+static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
+{
+    if (instr_is_meta(i)) return;
+    int opc = instr_get_opcode(i);
+    opnd_size_t dsz = (instr_num_dsts(i) > 0) ? opnd_get_size(instr_get_dst(i, 0))
+                                              : OPSZ_NA;
+
+    /* системные особые случаи */
+    if (opc == OP_cpuid && !g_no_spoof) { run_rewriter(dc, bb, i, rewrite_cpuid_w); return; }
+    if (opc == OP_xgetbv && !g_no_spoof) { run_rewriter(dc, bb, i, rewrite_xgetbv_w); return; }
+    if (opc == OP_prefetchw && !opc_supported(opc, dsz)) {
+        run_rewriter(dc, bb, i, rewrite_nop_w);
+        return;
+    }
+
+    if (opc_supported(opc, dsz))
+        return;                              /* passthrough */
+
+    /* AVX-512/EVEX — не эмулируем: громкий trap вместо тихого passthrough */
+    if (instr_bytes_evex(i)) {
+        report_unsupported(dc, i);
+        return;
+    }
+    for (int k = 0; k < instr_num_srcs(i); k++) {
+        if (opnd_is_reg(instr_get_src(i, k)) &&
+            opnd_get_reg(instr_get_src(i, k)) >= DR_REG_K0) {
+            report_unsupported(dc, i);
+            return;
+        }
+    }
+    for (int k = 0; k < instr_num_dsts(i); k++) {
+        if (opnd_is_reg(instr_get_dst(i, k)) &&
+            opnd_get_reg(instr_get_dst(i, k)) >= DR_REG_K0) {
+            report_unsupported(dc, i);
+            return;
+        }
+    }
+
+    if (is_generic_opc(opc)) {
+        if (g_cfg.enable_generic &&
+            run_rewriter(dc, bb, i, rewrite_generic_instr))
+            return;
+        report_unsupported(dc, i);
+        return;
+    }
+    if (g_cfg.enable_inline && run_rewriter(dc, bb, i, try_rewrite_vex))
+        return;
+    if (g_cfg.enable_inline && !g_disable_special &&
+        run_rewriter(dc, bb, i, try_rewrite_special))
+        return;
+
+    report_unsupported(dc, i);
+}
+
+dr_emit_flags_t pass_bb_event(void *dc, void *tag, instrlist_t *bb,
+                              bool for_trace, bool translating)
+{
+    (void)tag; (void)for_trace;
+    if (translating)
+        return DR_EMIT_DEFAULT;      /* результат детерминирован */
+
+    __atomic_fetch_add(&g_stat_bbs, 1, __ATOMIC_RELAXED);
+
+    instr_t *i = instrlist_first(bb);
+    while (i != NULL) {
+        instr_t *next = instr_get_next(i);
+        rewrite_instr(dc, bb, i);
+        i = next;
+    }
+    return DR_EMIT_DEFAULT;
+}
+
+void pass_rewrite_init(void)
+{
+    g_cfg.shadow_active = 1;   /* обнуление YHI безусловно, flush не нужен */
+}
