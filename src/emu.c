@@ -1572,8 +1572,7 @@ int emu_generic(emu_desc_t *d)
     case OP_tzcnt:  gpr_tzcnt(&st, d); break;
 
     default:
-        __atomic_fetch_add(&g_stat_unsupported[d->opc < OPC_MAX ? d->opc : 0],
-                           1, __ATOMIC_RELAXED);
+        PASS_ATOMIC_INC32(&g_stat_unsupported[d->opc < OPC_MAX ? d->opc : 0]);
         return 0;   /* не обработано — trap не должен «глотать» инструкцию */
     }
     return 1;
