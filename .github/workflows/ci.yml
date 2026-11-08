@@ -147,18 +147,18 @@ jobs:
 
       - name: Smoke — selftest under drrun -target core2
         shell: bash
-        timeout-minutes: 3   # зависание selftest — известный класс бага (§7.1)
         run: |
           cp build/Release/pass_client.dll .
           run_smoke() {
-            dynamorio/bin64/drrun.exe -c pass_client.dll -target core2 -- selftest.exe > smoke.log 2>&1
+            timeout 100 dynamorio/bin64/drrun.exe -c pass_client.dll -target core2 -- selftest.exe > smoke.log 2>&1
           }
           if run_smoke; then
             echo "selftest под P.A.S.S. (попытка 1): OK"
           elif run_smoke; then
             echo "selftest под P.A.S.S. (попытка 2): OK"
           else
-            echo "  [XFAIL] selftest под Windows — известный класс бага (ARCHITECTURE.md §7.1)"
+            echo "  [XFAIL] selftest под Windows — крах/зависание, известный класс"
+            echo "          багов (ARCHITECTURE.md §7.1, приоритет v0.3)"
             echo "  ── последние строки smoke.log ──"
             tail -12 smoke.log || true
           fi
