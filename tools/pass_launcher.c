@@ -176,9 +176,10 @@ int main(int argc, char **argv)
 
     find_drrun(drrun, sizeof(drrun), allow_download);
 
-    /* командная строка: drrun -client dll;0;"opts" -- app args... */
+    /* командная строка: drrun -c "pass_client.dll" [опции клиента] -- app args...
+     * Форма -c <client> [opts...] до "--" корректно парсится drrun на обеих ОС. */
     len = (size_t)_snprintf(cmdline, sizeof(cmdline) - 1,
-        "\"%s\" -client \"%s\";0;", drrun, client);
+        "\"%s\" -c \"%s\" ", drrun, client);
     cmdline[sizeof(cmdline) - 1] = 0;
 
     /* клиентские опции: всё до --, включая -target/-verbose */

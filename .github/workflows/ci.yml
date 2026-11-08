@@ -108,8 +108,8 @@ jobs:
         run: |
           curl -L --fail --retry 3 -o dr.zip \
             "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
-          unzip -q dr.zip
-          rm dr.zip
+          powershell -NoProfile -Command "Expand-Archive -Path dr.zip -DestinationPath . -Force"
+          rm -f dr.zip
           mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
 
       - name: Build pass_client.dll (MSVC)
