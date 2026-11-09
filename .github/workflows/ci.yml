@@ -223,7 +223,12 @@ jobs:
           rm -f dr.zip
           mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
 
-      - name: pass.exe и pass_client.dll из артефакта windows-job
+      - name: Артефакт (pass.exe + pass_client.dll) от windows-job
+        uses: actions/download-artifact@v4
+        with:
+          name: PASS-win-x64
+
+      - name: Распаковать pass.exe и pass_client.dll
         run: |
           powershell -NoProfile -Command "Expand-Archive -Path PASS-win-x64.zip -DestinationPath rel -Force"
           cp rel/pass.exe rel/pass_client.dll .
