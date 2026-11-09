@@ -180,6 +180,78 @@ jobs:
             || { echo "── launcher.log ──"; cat launcher.log; }
           echo "pass.exe: запуск выполнен (код возврата не фатален для CI)"
 
+      - name: Bun — download windows-x64 + baseline
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          curl -L --fail --retry 3 --connect-timeout 30 -o bunx.zip \
+            "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64.zip"
+          curl -L --fail --retry 3 --connect-timeout 30 -o bunb.zip \
+            "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64-baseline.zip"
+          mkdir -p bun-x64 bun-baseline
+          powershell -NoProfile -Command "Expand-Archive -Path bunx.zip -DestinationPath bun-x64 -Force"
+          powershell -NoProfile -Command "Expand-Archive -Path bunb.zip -DestinationPath bun-baseline -Force"
+          rm -f bunx.zip bunb.zip
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
+          test -n "$BUN_X64" && test -n "$BUN_BASE"
+          "$BUN_X64" --version
+          echo "bun x64 и baseline скачаны"
+
+      - name: Bun под P.A.S.S. и под чистым DR (диагностика §7.2)
+        # Итог — в лог, в Step Summary рана и в аннотации. Зависание bun —
+        # известный класс DR×bun (§7.2): НЕ фейлит CI.
+        shell: bash
+        timeout-minutes: 25
+        continue-on-error: true
+        run: |
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
+          DRRUN="dynamorio/bin64/drrun.exe"
+          export DYNAMORIO_HOME="$PWD/dynamorio"
+          RES=/tmp/bun_results.md
+          : > "$RES"
+
+          run_case() {
+            name="$1"; shift
+            t0=$(date +%s)
+            timeout 90 "$@" > bun_out.txt 2> bun_err.txt
+            rc=$?
+            t1=$(date +%s)
+            dt=$((t1 - t0))
+            out="$(head -c 200 bun_out.txt | tr '\r\n' ' ')"
+            err="$(tail -c 200 bun_err.txt | tr '\r\n' ' ')"
+            if [ "$rc" -eq 0 ]; then
+              verdict="OK"; ann="notice"
+            elif [ "$rc" -eq 124 ]; then
+              verdict="HANG (timeout 90s)"; ann="warning"
+            elif [ "$rc" -eq 86 ]; then
+              verdict="STOP — сработал предохранитель trap-цикла"; ann="warning"
+            else
+              verdict="FAIL rc=$rc"; ann="warning"
+            fi
+            printf "| %s | %s | %ss | `%s%s` |\n" "$name" "$verdict" "$dt" "$out" "$err" >> "$RES"
+            echo "── $name → $verdict (${dt}s)"
+            [ -n "$out" ] && echo "   stdout: $out"
+            [ -n "$err" ] && echo "   stderr: $err"
+            echo "::$ann::$name → $verdict"
+          }
+
+          echo "==== 1/9 native ====";                run_case "bun --version (нативно, контроль)"      "$BUN_X64" --version
+          echo "==== 2/9 native ====";                run_case "bun -e console.log (нативно, контроль)" "$BUN_X64" -e "console.log('Hello from bun!')"
+          echo "==== 3/9 чистый DR ====";             run_case "drrun без клиента -- bun --version (контроль §7.2)" "$DRRUN" -- "$BUN_X64" --version
+          echo "==== 4/9 client, native target ===="; run_case "pass -target native -- bun --version (DR+клиент, без переписывания)" ./pass.exe -target native -- "$BUN_X64" --version
+          echo "==== 5/9 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
+          echo "==== 6/9 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun -e 'Hello from P.A.S.S.!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Hello from P.A.S.S.!')"
+          echo "==== 7/9 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
+          echo "==== 8/9 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) --version" ./pass.exe -target core2 -- "$BUN_BASE" --version
+          echo "==== 9/9 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) -e 'Hello!'" ./pass.exe -target core2 -- "$BUN_BASE" -e "console.log('Hello from P.A.S.S. baseline!')"
+
+          echo "" >> "$RES"
+          echo "Ожидание по §7.2: чистый DR без клиента виснет на bun (Linux-факт)." >> "$RES"
+          cat "$RES"
+          cat "$RES" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: PASS-win-x64
