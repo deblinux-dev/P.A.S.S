@@ -309,6 +309,121 @@ jobs:
           cat "$RES"
           cat "$RES" >> "$GITHUB_STEP_SUMMARY"
 
+  windows-bun-mingw:
+    name: Windows (MinGW) — bun.exe под P.A.S.S.
+    # Гипотеза §7.3: краш -target core2 на bun — дефект MSVC-сборки
+    # клиента; тот же исходник с MinGW (как на Linux/GCC, KAT 231/231)
+    # должен работать. Говорит что угодно: selftest-якорь + bun-кейсы.
+    needs: [windows]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache DynamoRIO
+        id: dr
+        uses: actions/cache@v4
+        with:
+          path: dynamorio
+          key: dr-win-${{ env.DR_VERSION }}
+
+      - name: Download DynamoRIO
+        if: steps.dr.outputs.cache-hit != 'true'
+        run: |
+          URL="https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
+          for i in 1 2 3 4 5; do
+            echo "попытка $i/5..."
+            if curl -L --fail --retry 3 --retry-all-errors --connect-timeout 30 -o dr.zip "$URL"; then
+              break
+            fi
+            rm -f dr.zip
+            sleep 20
+          done
+          test -s dr.zip || { echo "не удалось скачать DynamoRIO после 5 попыток"; exit 1; }
+          powershell -NoProfile -Command "Expand-Archive -Path dr.zip -DestinationPath . -Force"
+          rm -f dr.zip
+          mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
+
+      - name: Сборка клиента MinGW (Ninja + gcc)
+        run: |
+          cmake -S . -B build-mgw -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+                -DDynamoRIO_DIR="$(pwd -W)/dynamorio/cmake"
+          cmake --build build-mgw -j 4
+          ls -l build-mgw/*.dll
+
+      - name: Сборка лаунчера и selftest (MinGW)
+        run: |
+          gcc -O2 -o pass.exe tools/pass_launcher.c
+          gcc -O2 -mavx2 -o selftest.exe tests/data/selftest.c
+          cp build-mgw/libpass_client.dll ./pass_client.dll
+          ls -l pass.exe pass_client.dll selftest.exe
+
+      - name: Bun — download windows-x64 + baseline
+        timeout-minutes: 5
+        run: |
+          curl -L --fail --retry 3 --connect-timeout 30 -o bunx.zip \
+            "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64.zip"
+          curl -L --fail --retry 3 --connect-timeout 30 -o bunb.zip \
+            "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64-baseline.zip"
+          mkdir -p bun-x64 bun-baseline
+          powershell -NoProfile -Command "Expand-Archive -Path bunx.zip -DestinationPath bun-x64 -Force"
+          powershell -NoProfile -Command "Expand-Archive -Path bunb.zip -DestinationPath bun-baseline -Force"
+          rm -f bunx.zip bunb.zip
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
+          test -n "$BUN_X64" && test -n "$BUN_BASE"
+          echo "bun x64 и baseline скачаны"
+
+      - name: Кейсы — selftest + bun под MinGW-клиентом
+        timeout-minutes: 20
+        run: |
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
+          export DYNAMORIO_HOME="$PWD/dynamorio"
+          RES=/tmp/mingw_results.md
+          : > "$RES"
+
+          run_case() {
+            name="$1"; shift
+            t0=$(date +%s)
+            rc=0
+            timeout -k 5 75 "$@" > case_out.txt 2> case_err.txt || rc=$?
+            t1=$(date +%s)
+            dt=$((t1 - t0))
+            out="$(head -c 200 case_out.txt | tr '\r\n' ' ')"
+            if [ "$rc" -eq 0 ]; then verdict="OK"; ann="notice"
+            elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then verdict="HANG"; ann="warning"
+            elif [ "$rc" -eq 86 ]; then verdict="STOP trap-fuse"; ann="warning"
+            else verdict="FAIL rc=$rc"; ann="warning"; fi
+            printf "| %s | %s | %ss | `%s` |\n" "$name" "$verdict" "$dt" "$out" >> "$RES"
+            echo "── $name → $verdict (${dt}s)"
+            [ -n "$out" ] && echo "   stdout: $out"
+            if [ "$rc" -ne 0 ]; then
+              echo "   stderr (последние 12 строк):"
+              tail -12 case_err.txt | sed 's/^/     /' || true
+            fi
+            echo "::$ann::$name → $verdict"
+          }
+
+          echo "## MinGW-клиент × bun (Windows CI)" >> "$RES"
+          echo "" >> "$RES"
+          echo "| кейс | вердикт | время | вывод |" >> "$RES"
+          echo "|---|---|---|---|" >> "$RES"
+
+          echo "==== 1/5 selftest KAT ====";            run_case "selftest под -target core2 (якорь)" ./pass.exe -target core2 -- selftest.exe
+          echo "==== 2/5 bun core2 ====";               run_case "pass(MinGW) -target core2 -- bun --version" ./pass.exe -target core2 -- "$BUN_X64" --version
+          echo "==== 3/5 bun core2 ====";               run_case "pass(MinGW) -target core2 -- bun -e 'Hello from P.A.S.S.!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Hello from P.A.S.S.!')"
+          echo "==== 4/5 кириллица ====";               run_case "pass(MinGW) -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
+          echo "==== 5/5 baseline ====";                run_case "pass(MinGW) -target core2 -- bun(baseline) --version" ./pass.exe -target core2 -- "$BUN_BASE" --version
+
+          cat "$RES"
+          cat "$RES" >> "$GITHUB_STEP_SUMMARY"
+
   release:
     name: Release (tag v*)
     if: startsWith(github.ref, 'refs/tags/v')
