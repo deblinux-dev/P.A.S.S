@@ -8,21 +8,34 @@ pass.exe -target core2 -- my_avx2_app.exe args...
 
 Всё. `pass.exe` — лаунчер, который:
 
-1. находит `drrun.exe` (рядом с собой → в `bin64\` → в `%DYNAMORIO_HOME%` →
-   в `%LOCALAPPDATA%\PASS\dynamorio`);
+1. находит **полную** установку DynamoRIO (bin64\drrun.exe +
+   lib64\release\dynamorio.dll — «огрызок» из одного drrun.exe не
+   принимается: без lib64 DR не может инжектиться и пишет
+   «incomplete installation») в каталоге pass.exe (включая
+   подпапки dynamorio\ и DynamoRIO-Windows-*\), в
+   %DYNAMORIO_HOME% или %LOCALAPPDATA%\PASS\dynamorio;
 2. если DynamoRIO не установлен — **скачивает релиз автоматически**
-   (PowerShell `Invoke-WebRequest`, ~30 МБ, однократно);
-3. запускает программу под клиентом `pass_client.dll` и передаёт её код
-   возврата в консоль (`%ERRORLEVEL%` работает).
+   (~450 МБ, один раз, через PowerShell: TLS 1.2 включён, распаковка
+   через tar или Expand-Archive);
+3. запускает программу под клиентом pass_client.dll, передавая drrun
+   ЯВНЫЙ ключ `-root` (без него drrun, запущенный вне bin64\, ищет
+   корень на два уровня вверх — источник ошибки «cannot find
+   …\lib64\drpreinject.dll» v0.2.0);
+4. передаёт её код возврата в консоль (`%ERRORLEVEL%` работает).
 
 Ключи лаунчера:
 
 ```bat
 pass.exe -h                       справка (по-русски)
 pass.exe -target haswell -- app.exe
+pass.exe -root C:\DR\DynamoRIO-Windows-11.91.20763 -- app.exe
 pass.exe -verbose 2 -- app.exe    диагностика
 pass.exe -no-download -- app.exe  запрет авто-скачивания
 ```
+
+Ручная установка без скачивания: распакуйте релиз DynamoRIO
+(папку DynamoRIO-Windows-11.91.20763 ЦЕЛИКОМ, вместе с lib64\)
+рядом с pass.exe — лаунчер найдёт её по маске DynamoRIO-*.
 
 Всё, что стоит до `--`, уходит клиенту P.A.S.S. (те же ключи, что и на
 Linux: `-target`, `-verbose`, `-nospoof`, `-emu_mask`, …), всё после `--` —
@@ -86,4 +99,7 @@ Windows-job в `.github/workflows/ci.yml` на каждом push:
 * Прогоны на реальном старом железе (настоящий Core 2 Duo)
   приветствуются — ожидается, что HW без AVX даст те же результаты
   через passthrough + эмуляцию.
-* JIT-процессы (Bun/Node) на Windows не проверялись.
+* JIT-процессы (Bun/Node) на Windows не проверялись. bun на Linux
+  виснет даже под чистым DynamoRIO 11.91.20763 без клиента
+  (см. ARCHITECTURE.md §7.2) — несовместимость DR×bun, не P.A.S.S.;
+  практический обход для bun — Intel SDE (`sde -future -- bun.exe ...`).

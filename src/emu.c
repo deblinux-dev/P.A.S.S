@@ -46,8 +46,13 @@ static void flags_setmask(estate_t *st, uint32_t set, uint32_t clr)
     fl = (fl & ~clr) | set;
     *EFLAG(st) = fl;
 }
-/* задать арифметические флаги по результату */
-static void flags_arith(estate_t *st, uint64_t res, uint64_t mask, int carry, int overflow)
+/* задать арифметические флаги по результату; биты из keep НЕ трогаются.
+ * §6.22: реальные Intel-микросхемы (наблюдение на Comet Lake) НЕ пишут
+ * PF для ANDN/BZHI/BEXTR/BLSI/BLSMSK/BLSR/SARX/SHLX/SHRX/RORX/MULX —
+ * эмуляция обязана сохранять PF нетронутым, иначе приложения, где
+ * флаги переживают инструкцию (bun.exe: бесконечный спин), ломаются. */
+static void flags_arith_k(estate_t *st, uint64_t res, uint64_t mask,
+                          int carry, int overflow, uint32_t keep)
 {
     uint32_t fl = 0;
     if ((res & mask) == 0) fl |= FZF;
@@ -60,7 +65,12 @@ static void flags_arith(estate_t *st, uint64_t res, uint64_t mask, int carry, in
         while (b) { p ^= (b & 1); b >>= 1; }
         if (p == 0) fl |= FPF;
     }
-    flags_setmask(st, fl, FCF|FPF|FAF|FZF|FSF|FOF);
+    flags_setmask(st, fl & ~keep, (FCF|FPF|FAF|FZF|FSF|FOF) & ~keep);
+}
+
+static void flags_arith(estate_t *st, uint64_t res, uint64_t mask, int carry, int overflow)
+{
+    flags_arith_k(st, res, mask, carry, overflow, 0);
 }
 
 /* ── доступ к операндам ── */
@@ -1024,7 +1034,13 @@ static void gpr_pext(estate_t *st, emu_desc_t *d)
             bit++;
         }
     put_gpr_val(st, d->dsts[0], res);
-    flags_setmask(st, msk ? 0 : FZF, FCF|FZF|FSF|FOF|FAF|FPF);
+    /* §6.22: флаги PDEP/PEXT — детерминированно по SDM (ZF/SF/PF по
+     * результату, CF/OF=0); реальные Intel отдают часть флагов
+     * микрокодом нерегулярно, но приложения флаги PDEP/PEXT не
+     * потребляют — детерминированность важнее. */
+    flags_arith_k(st, res,
+                  (opnd_get_size(d->dsts[0]) == OPSZ_8) ? ~0ull : 0xFFFFFFFFull,
+                  0, 0, 0);
 }
 static void gpr_pdep(estate_t *st, emu_desc_t *d)
 {
@@ -1037,7 +1053,9 @@ static void gpr_pdep(estate_t *st, emu_desc_t *d)
             bit++;
         }
     put_gpr_val(st, d->dsts[0], res);
-    flags_setmask(st, msk ? 0 : FZF, FCF|FZF|FSF|FOF|FAF|FPF);
+    flags_arith_k(st, res,
+                  (opnd_get_size(d->dsts[0]) == OPSZ_8) ? ~0ull : 0xFFFFFFFFull,
+                  0, 0, 0);
 }
 static void gpr_bzhi(estate_t *st, emu_desc_t *d)
 {
@@ -1051,7 +1069,7 @@ static void gpr_bzhi(estate_t *st, emu_desc_t *d)
     if (g_cfg.verbose >= 4)
         dr_fprintf(STDERR, "[P.A.S.S.] bzhi: src=%016llx idx=%d w=%d -> res=%016llx\n",
                    (unsigned long long)src, (int)idx, width, (unsigned long long)res);
-    flags_arith(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, (int)cf, 0);
+    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, (int)cf, 0, FPF);
 }
 static void gpr_bextr(estate_t *st, emu_desc_t *d)
 {
@@ -1063,7 +1081,77 @@ static void gpr_bextr(estate_t *st, emu_desc_t *d)
     uint64_t mask = (len >= 64) ? ~0ull : ((len == 0) ? 0 : ((1ull << len) - 1));
     uint64_t res = v & mask;
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, 0, 0);
+    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, 0, 0, FPF);
+}
+/* ══════════════════ BMI1/BMI2 (§6.22: generic-путь с точными флагами
+ * реального Intel; inline-вариант rewrite_special искажал CF у blsi/
+ * blsmsk, ставил PF там, где Intel его не пишет, и портил флаги
+ * shl-расширениями sarx/shlx/shrx — bun.exe уходил в бесконечный
+ * спин, KAT давал крах DR при sarx dst==rcx) ══════════════════ */
+static void gpr_andn(estate_t *st, emu_desc_t *d)
+{
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t s1 = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t s2 = get_gpr_val(st, d->srcs[1]) & mask;
+    uint64_t res = (~s1) & s2;
+    put_gpr_val(st, d->dsts[0], res);
+    flags_arith_k(st, res, mask, 0, 0, FPF);
+}
+static void gpr_blsi(estate_t *st, emu_desc_t *d)
+{
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t res = v & ((~v + 1) & mask);          /* x & -x */
+    put_gpr_val(st, d->dsts[0], res);
+    flags_arith_k(st, res, mask, (v != 0), 0, FPF);
+}
+static void gpr_blsmsk(estate_t *st, emu_desc_t *d)
+{
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t res = (v ^ (v - 1)) & mask;
+    put_gpr_val(st, d->dsts[0], res);
+    flags_arith_k(st, res, mask, (v == 0), 0, FPF);
+}
+static void gpr_blsr(estate_t *st, emu_desc_t *d)
+{
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t res = v & (v - 1);
+    put_gpr_val(st, d->dsts[0], res);
+    flags_arith_k(st, res, mask, (v == 0), 0, FPF);
+}
+static void gpr_bmi2shift(estate_t *st, emu_desc_t *d)
+{
+    /* sarx/shlx/shrx: флаги НЕ пишутся вовсе — сохраняем все */
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t c = get_gpr_val(st, d->srcs[1]) & ((w == 64) ? 63 : 31);
+    uint64_t res;
+    switch (d->opc) {
+    case OP_sarx: res = (w == 32)
+                        ? (uint64_t)(uint32_t)((int32_t)v >> (int)c)
+                        : (uint64_t)((int64_t)v >> (int)c); break;
+    case OP_shlx: res = (v << c) & mask; break;
+    default:      res = v >> c; break;   /* shrx */
+    }
+    put_gpr_val(st, d->dsts[0], res);
+}
+static void gpr_rorx(estate_t *st, emu_desc_t *d)
+{
+    int w = (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 64 : 32;
+    uint64_t mask = (w == 64) ? ~0ull : 0xFFFFFFFFull;
+    uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
+    uint64_t c = get_gpr_val(st, d->srcs[1]) & ((w == 64) ? 63 : 31);
+    uint64_t res = (w == 32)
+        ? (uint64_t)(((uint32_t)v >> (int)c) | ((uint32_t)v << (int)((32 - c) & 31)))
+        : ((v >> c) | (v << ((64 - c) & 63)));
+    put_gpr_val(st, d->dsts[0], res);
 }
 static void gpr_mulx(estate_t *st, emu_desc_t *d)
 {
@@ -1253,6 +1341,11 @@ int emu_generic(emu_desc_t *d)
         PASS_ATOMIC_INC32(&g_stat_generic[d->opc]);
     }
     PASS_ATOMIC_INC32(&g_dyn_generic);
+    /* §6.24: прогресс-счётчик — отличить «медленно, но работает» от
+     * бесконечного цикла: растёт — идёт работа, стоит — зацикливание */
+    if (g_cfg.verbose >= 1 && (g_dyn_generic % 500000) == 0)
+        dr_fprintf(STDERR, "[P.A.S.S.] generic: %llu эмуляций\n",
+                   (unsigned long long)g_dyn_generic);
     uint8_t t1[16], t2[16], imm = 0;
     if (d->nsrc >= 1 && opnd_is_immed_int(d->srcs[d->nsrc - 1]))
         imm = (uint8_t)opnd_get_immed_int(d->srcs[d->nsrc - 1]);
@@ -1375,9 +1468,13 @@ int emu_generic(emu_desc_t *d)
     case OP_vpextrb: case OP_vpextrw: case OP_vpextrd: {   /* vpextrq = vpextrd */
         const uint8_t *sv = EX(&st, xmm_idx(opnd_get_reg(d->srcs[0])));
         uint64_t v = 0;
-        /* размер элемента — по размеру dst (rax=8Б у q-формы, eax=4Б...) */
-        opnd_size_t dz = opnd_get_size(d->dsts[0]);
-        int esz = (dz == OPSZ_1) ? 1 : (dz == OPSZ_2) ? 2 : (dz == OPSZ_8) ? 8 : 4;
+        /* §6.23: размер ЭЛЕМЕНТА — по опкоду, не по размеру dst:
+         * pextrw/pextrb пишут в 32-битный GPR (нул-расширение), но
+         * элемент — слово/байт; прежний код брал OPSZ_4 у r32 и читал
+         * dword: pextrw $3 возвращал 0 вместо слова (срыв bun.exe). */
+        int esz = (d->opc == OP_pextrb || d->opc == OP_vpextrb) ? 1
+                : (d->opc == OP_pextrw || d->opc == OP_vpextrw) ? 2
+                : (opnd_get_size(d->dsts[0]) == OPSZ_8) ? 8 : 4;
         switch (esz) {
         case 1: v = sv[imm & 15]; break;
         case 2: v = ld16(sv + (imm & 7) * 2); break;
@@ -1392,9 +1489,15 @@ int emu_generic(emu_desc_t *d)
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t *dv = EX(&st, di);
         uint64_t v = get_gpr_val(&st, d->srcs[0]);
-        opnd_size_t ssz = opnd_get_size(d->srcs[0]);
-        if (ssz == OPSZ_1)      dv[imm & 15] = (uint8_t)v;
-        else if (ssz == OPSZ_8) st64(dv + (imm & 1) * 8, v);
+        /* §6.23: размер элемента — по опкоду (pinsrb/pinsrw берут младший
+         * байт/слово 32-битного GPR; прежний st32 по r/m32-размеру
+         * затирал соседние байты буфера). */
+        int esz = (d->opc == OP_pinsrb || d->opc == OP_vpinsrb) ? 1
+                : (d->opc == OP_pinsrw || d->opc == OP_vpinsrw) ? 2
+                : (opnd_get_size(d->srcs[0]) == OPSZ_8) ? 8 : 4;
+        if (esz == 1)           dv[imm & 15] = (uint8_t)v;
+        else if (esz == 2)      st16(dv + (imm & 7) * 2, (uint16_t)v);
+        else if (esz == 8)      st64(dv + (imm & 1) * 8, v);
         else                    st32(dv + (imm & 3) * 4, (uint32_t)v);
         if (d->is_vex) memset(EY(&st, di), 0, 16);      /* VEX.128 */
         break;
@@ -1570,6 +1673,12 @@ int emu_generic(emu_desc_t *d)
     case OP_popcnt: gpr_popcnt64(&st, d); break;
     case OP_lzcnt:  gpr_lzcnt(&st, d); break;
     case OP_tzcnt:  gpr_tzcnt(&st, d); break;
+    case OP_andn:   gpr_andn(&st, d); break;
+    case OP_blsi:   gpr_blsi(&st, d); break;
+    case OP_blsmsk: gpr_blsmsk(&st, d); break;
+    case OP_blsr:   gpr_blsr(&st, d); break;
+    case OP_sarx: case OP_shlx: case OP_shrx: gpr_bmi2shift(&st, d); break;
+    case OP_rorx:   gpr_rorx(&st, d); break;
 
     default:
         PASS_ATOMIC_INC32(&g_stat_unsupported[d->opc < OPC_MAX ? d->opc : 0]);

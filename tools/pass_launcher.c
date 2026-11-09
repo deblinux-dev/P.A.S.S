@@ -1,5 +1,5 @@
 /* ============================================================
- * P.A.S.S. — pass.exe (Windows-лаунчер)
+ * P.A.S.S. — pass.exe (Windows-лаунчер) v0.2.1
  * ------------------------------------------------------------
  * Простой запуск программ под P.A.S.S.:
  *
@@ -8,12 +8,20 @@
  *   -target <имя>     профиль CPU: core2 (по умолчанию),
  *                     nehalem, westmere, sandybridge, haswell, native
  *   -verbose <N>      диагностика 0..4
+ *   -root <каталог>   каталог DynamoRIO (по умолчанию — автопоиск)
  *   -no-download      не скачивать DynamoRIO автоматически
  *   прочие -ключи     передаются клиенту P.A.S.S. как есть
  *
- * Лаунчер сам находит drrun.exe (рядом с собой, в bin64\, в
- * %DYNAMORIO_HOME% или %LOCALAPPDATA%\PASS\dynamorio) и при
- * отсутствии скачивает релиз DynamoRIO с GitHub.
+ * Лаунчер ищет ПОЛНУЮ установку DynamoRIO (bin64\drrun.exe +
+ * lib64\release\dynamorio.dll — «огрызок» из одного drrun.exe не
+ * принимается: без lib64 DR не может инжектиться) в:
+ *   1) каталоге pass.exe (и в подпапках dynamorio\,
+ *      DynamoRIO-Windows-11.91.20763\, DynamoRIO-*\);
+ *   2) %DYNAMORIO_HOME%;
+ *   3) %LOCALAPPDATA%\PASS\dynamorio (сюда же авто-скачивание).
+ * Найденный корень передаётся drrun ЯВНО через -root: сам drrun,
+ * запущенный вне bin64\, вычисляет корень на два уровня вверх и
+ * получает «incomplete installation» (баг пользователя v0.2.0).
  *
  * Сборка (MSVC):  cl /O2 /Fe:pass.exe pass_launcher.c
  * Сборка (MinGW): gcc -O2 -o pass.exe pass_launcher.c
@@ -62,74 +70,162 @@ static bool file_exists(const char *path)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* найти drrun.exe; при need=true и отсутствии — скачать */
-static void find_drrun(char *out, size_t cap, bool allow_download)
+static void join2(char *out, size_t cap, const char *a, const char *b)
 {
-    char dir[MAX_PATH], path[MAX_PATH * 2];
+    _snprintf(out, cap - 1, "%s\\%s", a, b);
+    out[cap - 1] = 0;
+}
+
+/* корень DynamoRIO валиден: есть bin64\drrun.exe (или drrun.exe в
+ * самом корне — раскладка «распаковали содержимое»), lib64 и клиент
+ * dynamorio.dll. Возвращает путь к drrun.exe. */
+static bool dr_ok(const char *root, char *out, size_t cap)
+{
+    char p[MAX_PATH * 2];
+    join2(p, sizeof(p), root, "bin64\\drrun.exe");
+    if (!file_exists(p)) {
+        join2(p, sizeof(p), root, "drrun.exe");
+        if (!file_exists(p))
+            return false;
+    }
+    join2(p, sizeof(p), root, "lib64\\release\\dynamorio.dll");
+    if (!file_exists(p))
+        return false;
+    join2(p, sizeof(p), root, "bin64\\drrun.exe");
+    if (file_exists(p)) {
+        strncpy(out, p, cap - 1);
+        out[cap - 1] = 0;
+        return true;
+    }
+    join2(p, sizeof(p), root, "drrun.exe");
+    strncpy(out, p, cap - 1);
+    out[cap - 1] = 0;
+    return true;
+}
+
+static bool try_root(const char *root, char *drrun, size_t cap)
+{
+    char p[MAX_PATH];
+    if (root == NULL || root[0] == 0)
+        return false;
+    if (dr_ok(root, drrun, cap))
+        return true;
+    (void)p;
+    return false;
+}
+
+/* поиск полной установки; found_root — корень для drrun -root */
+static bool find_drrun(char *drrun, size_t dcap, char *root, size_t rcap)
+{
+    char dir[MAX_PATH], cand[MAX_PATH * 2], pattern[MAX_PATH * 2];
     exe_dir(dir, sizeof(dir));
 
-    /* 1) рядом с pass.exe и в bin64\ */
-    _snprintf(path, sizeof(path) - 1, "%s\\drrun.exe", dir);
-    path[sizeof(path) - 1] = 0;
-    if (file_exists(path)) { strncpy(out, path, cap - 1); out[cap - 1] = 0; return; }
-
-    _snprintf(path, sizeof(path) - 1, "%s\\bin64\\drrun.exe", dir);
-    path[sizeof(path) - 1] = 0;
-    if (file_exists(path)) { strncpy(out, path, cap - 1); out[cap - 1] = 0; return; }
-
-    /* 2) DYNAMORIO_HOME */
+    /* 1) сам каталог pass.exe */
+    if (try_root(dir, drrun, dcap)) {
+        strncpy(root, dir, rcap - 1); root[rcap - 1] = 0;
+        return true;
+    }
+    /* 2) рядом: dynamorio\ и DynamoRIO-Windows-<версия>\ */
+    join2(cand, sizeof(cand), dir, "dynamorio");
+    if (try_root(cand, drrun, dcap)) {
+        strncpy(root, cand, rcap - 1); root[rcap - 1] = 0;
+        return true;
+    }
+    join2(cand, sizeof(cand), dir, "DynamoRIO-Windows-" DR_VERSION);
+    if (try_root(cand, drrun, dcap)) {
+        strncpy(root, cand, rcap - 1); root[rcap - 1] = 0;
+        return true;
+    }
+    /* 3) любые DynamoRIO-* рядом (распакованный релиз любой версии) */
     {
-        const char *home = getenv("DYNAMORIO_HOME");
-        if (home != NULL) {
-            _snprintf(path, sizeof(path) - 1, "%s\\bin64\\drrun.exe", home);
-            path[sizeof(path) - 1] = 0;
-            if (file_exists(path)) { strncpy(out, path, cap - 1); out[cap - 1] = 0; return; }
+        HANDLE h;
+        WIN32_FIND_DATAA fd;
+        join2(pattern, sizeof(pattern), dir, "DynamoRIO-*");
+        h = FindFirstFileA(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    join2(cand, sizeof(cand), dir, fd.cFileName);
+                    if (try_root(cand, drrun, dcap)) {
+                        strncpy(root, cand, rcap - 1); root[rcap - 1] = 0;
+                        FindClose(h);
+                        return true;
+                    }
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
         }
     }
-
-    /* 3) %LOCALAPPDATA%\PASS\dynamorio\bin64\drrun.exe */
+    /* 4) DYNAMORIO_HOME */
+    {
+        const char *home = getenv("DYNAMORIO_HOME");
+        if (home != NULL && try_root(home, drrun, dcap)) {
+            strncpy(root, home, rcap - 1); root[rcap - 1] = 0;
+            return true;
+        }
+    }
+    /* 5) %LOCALAPPDATA%\PASS\dynamorio (цель авто-скачивания) */
     {
         const char *lad = getenv("LOCALAPPDATA");
         if (lad != NULL) {
-            _snprintf(path, sizeof(path) - 1,
-                      "%s\\PASS\\dynamorio\\bin64\\drrun.exe", lad);
-            path[sizeof(path) - 1] = 0;
-            if (file_exists(path)) { strncpy(out, path, cap - 1); out[cap - 1] = 0; return; }
-            if (!allow_download)
-                fail("drrun.exe не найден (и -no-download задан)");
-            print_utf8("pass.exe: DynamoRIO не найден — скачиваю релиз " DR_VERSION "...\n");
-            /* mkdir + download + unzip через PowerShell */
-            _snprintf(path, sizeof(path) - 1,
-                "powershell -NoProfile -ExecutionPolicy Bypass -Command \""
-                "$ErrorActionPreference='Stop';"
-                "$d='%s\\PASS';"
-                "New-Item -ItemType Directory -Force -Path $d | Out-Null;"
-                "Invoke-WebRequest -Uri '%s' -OutFile '$d\\dr.zip';"
-                "Expand-Archive -Force -Path '$d\\dr.zip' -DestinationPath '$d\\unz';"
-                "$src=Get-ChildItem '$d\\unz' -Directory | Select-Object -First 1;"
-                "Move-Item -Force -Path $src.FullName -Destination '$d\\dynamorio';"
-                "Remove-Item -Force '$d\\dr.zip'; Remove-Item -Force -Recurse '$d\\unz'\"",
-                lad, DR_URL);
-            path[sizeof(path) - 1] = 0;
-            {
-                int rc = system(path);
-                if (rc != 0)
-                    fail("не удалось скачать/распаковать DynamoRIO (нужен интернет "
-                         "или ручная установка: положите drrun.exe рядом с pass.exe)");
+            join2(cand, sizeof(cand), lad, "PASS\\dynamorio");
+            if (try_root(cand, drrun, dcap)) {
+                strncpy(root, cand, rcap - 1); root[rcap - 1] = 0;
+                return true;
             }
-            _snprintf(path, sizeof(path) - 1,
-                      "%s\\PASS\\dynamorio\\bin64\\drrun.exe", lad);
-            path[sizeof(path) - 1] = 0;
-            if (file_exists(path)) { strncpy(out, path, cap - 1); out[cap - 1] = 0; return; }
         }
     }
-    fail("drrun.exe не найден: положите его рядом с pass.exe или задайте DYNAMORIO_HOME");
+    return false;
+}
+
+/* авто-скачивание полной установки в %LOCALAPPDATA%\PASS\dynamorio */
+static bool download_dr(char *drrun, size_t dcap, char *root, size_t rcap)
+{
+    const char *lad = getenv("LOCALAPPDATA");
+    char cmd[8192], cand[MAX_PATH * 2];
+    int rc;
+    if (lad == NULL)
+        return false;
+    print_utf8("pass.exe: DynamoRIO не найден — скачиваю релиз " DR_VERSION
+               " (~450 МБ, один раз)...\n");
+    _snprintf(cmd, sizeof(cmd) - 1,
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \""
+        "$ErrorActionPreference='Stop';"
+        "[Net.ServicePointManager]::SecurityProtocol="
+        "[Net.SecurityProtocolType]::Tls12;"
+        "$d='%s\\PASS';"
+        "New-Item -ItemType Directory -Force -Path $d | Out-Null;"
+        "$z=Join-Path $d 'dr.zip'; $u=Join-Path $d 'unz';"
+        "Invoke-WebRequest -Uri '%s' -OutFile $z;"
+        "New-Item -ItemType Directory -Force -Path $u | Out-Null;"
+        "if (Get-Command tar -ErrorAction SilentlyContinue)"
+        " { tar -xf $z -C $u }"
+        " else { Expand-Archive -Force -Path $z -DestinationPath $u };"
+        "$src=(Get-ChildItem $u -Directory | Select-Object -First 1).FullName;"
+        "Move-Item -Force $src (Join-Path $d 'dynamorio');"
+        "Remove-Item -Force $z; Remove-Item -Force -Recurse $u\"",
+        lad, DR_URL);
+    cmd[sizeof(cmd) - 1] = 0;
+    rc = system(cmd);
+    if (rc != 0)
+        fail("не удалось скачать/распаковать DynamoRIO (нужен интернет).\n"
+             "  Ручная установка: распакуйте DynamoRIO-Windows-" DR_VERSION
+             ".zip рядом с pass.exe\n"
+             "  (папка DynamoRIO-Windows-" DR_VERSION " целиком — вместе с"
+             " lib64\\) и повторите запуск.");
+    join2(cand, sizeof(cand), lad, "PASS\\dynamorio");
+    if (try_root(cand, drrun, dcap)) {
+        strncpy(root, cand, rcap - 1); root[rcap - 1] = 0;
+        return true;
+    }
+    return false;
 }
 
 int main(int argc, char **argv)
 {
     char drrun[MAX_PATH * 2], client[MAX_PATH * 2], dir[MAX_PATH];
-    char cmdline[32768];
+    char cmdline[32768], root[MAX_PATH * 2];
+    char user_root[MAX_PATH * 2] = "";
     const char *target = "core2";
     bool allow_download = true;
     int app_argc0 = argc;              /* индекс первого аргумента приложения */
@@ -150,6 +246,9 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--") == 0) { app_argc0 = i + 1; break; }
         if (strcmp(argv[i], "-target") == 0 && i + 1 < argc) {
             target = argv[++i];
+        } else if (strcmp(argv[i], "-root") == 0 && i + 1 < argc) {
+            strncpy(user_root, argv[++i], sizeof(user_root) - 1);
+            user_root[sizeof(user_root) - 1] = 0;
         } else if (strcmp(argv[i], "-no-download") == 0) {
             allow_download = false;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0 ||
@@ -160,6 +259,7 @@ int main(int argc, char **argv)
                 "  pass.exe [ключи] -- program.exe [args...]\n\n"
                 "Ключи:\n"
                 "  -target <имя>   core2 | nehalem | westmere | sandybridge | haswell | native\n"
+                "  -root <каталог> каталог DynamoRIO (автопоиск по умолчанию)\n"
                 "  -verbose <N>    диагностика 0..4\n"
                 "  -no-download    не скачивать DynamoRIO автоматически\n"
                 "  -h              эта справка\n\n"
@@ -174,12 +274,31 @@ int main(int argc, char **argv)
     if (!file_exists(client))
         fail("pass_client.dll не найден рядом с pass.exe");
 
-    find_drrun(drrun, sizeof(drrun), allow_download);
+    if (user_root[0] != 0) {
+        /* явный -root: валидировать и использовать */
+        if (!try_root(user_root, drrun, sizeof(drrun)))
+            fail("в -root нет полной установки DynamoRIO: нужен\n"
+                 "  <root>\\bin64\\drrun.exe и <root>\\lib64\\release\\dynamorio.dll\n"
+                 "  (распакуйте релиз DynamoRIO ЦЕЛИКОМ).");
+        strncpy(root, user_root, sizeof(root) - 1);
+        root[sizeof(root) - 1] = 0;
+    } else if (!find_drrun(drrun, sizeof(drrun), root, sizeof(root))) {
+        if (!allow_download)
+            fail("DynamoRIO не найден (и -no-download задан): положите\n"
+                 "  распакованный релиз DynamoRIO рядом с pass.exe или задайте"
+                 " -root / DYNAMORIO_HOME.");
+        if (!download_dr(drrun, sizeof(drrun), root, sizeof(root)))
+            fail("DynamoRIO не найден и скачать не удалось: положите\n"
+                 "  распакованный релиз DynamoRIO рядом с pass.exe"
+                 " (папка целиком) или задайте -root.");
+    }
 
-    /* командная строка: drrun -c "pass_client.dll" [опции клиента] -- app args...
-     * Форма -c <client> [opts...] до "--" корректно парсится drrun на обеих ОС. */
+    /* командная строка: drrun -root <корень> -c "pass_client.dll"
+     * [опции клиента] -- app args...
+     * -root передаётся ЯВНО: drrun вне bin64\ иначе вычисляет корень
+     * на два уровня вверх (incomplete installation, v0.2.0).       */
     len = (size_t)_snprintf(cmdline, sizeof(cmdline) - 1,
-        "\"%s\" -c \"%s\" ", drrun, client);
+        "\"%s\" -root \"%s\" -c \"%s\" ", drrun, root, client);
     cmdline[sizeof(cmdline) - 1] = 0;
 
     /* клиентские опции: всё до --, включая -target/-verbose */
@@ -207,7 +326,7 @@ int main(int argc, char **argv)
     memset(&pi, 0, sizeof(pi));
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL,
                         &si, &pi))
-        fail("не удалось запустить drrun (см. выше, как найти DynamoRIO)");
+        fail("не удалось запустить drrun (см. PASS_LAUNCHER_DEBUG=1 для командной строки)");
     CloseHandle(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
     if (!GetExitCodeProcess(pi.hProcess, &code))

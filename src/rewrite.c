@@ -124,6 +124,13 @@ static const int generic_opcs[] = {
     /* GPR */
     OP_crc32, OP_pext, OP_pdep, OP_bzhi, OP_bextr, OP_mulx, OP_adcx,
     OP_adox, OP_popcnt, OP_lzcnt, OP_tzcnt,
+    /* §6.22: BMI1/BMI2 целиком в generic — inline-путь (rewrite_special)
+     * искажал флаги: CF у blsi/blsmsk, PF у всех логических BMI,
+     * и портил флаги shl/shr-расширениями sarx/shlx/shrx (SHLX флаги
+     * не пишет, а shl — пишет). bun.exe на этом уходил в бесконечный
+     * спин; sarx с dst==rcx оставался нативным и ронял DR. */
+    OP_andn, OP_blsi, OP_blsmsk, OP_blsr, OP_sarx, OP_shlx, OP_shrx,
+    OP_rorx,
     0
 };
 
@@ -277,9 +284,13 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             opnd_create_reg(DR_REG_RAX)));
     }
 
-    /* (5) clean call */
-    dr_insert_clean_call(dc, bb, i, (void *)emu_generic, true /*save fpstate*/,
-                         1, OPND_CREATE_INTPTR((ptr_int_t)d));
+    /* (5) clean call — save_fpstate только когда трогаем xmm/ymm:
+     * эмулятор скомпилирован с -mno-sse и xmm не портит, а fxsave+
+     * fninit+fxrstor на каждый чистый вызов съедали ~60% стоимости
+     * (bun.exe на core2: спин в OLL-обёртке DR, §6.24). */
+    bool fp = (d->xmm_src | d->xmm_dst) != 0;
+    dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
+                         OPND_CREATE_INTPTR((ptr_int_t)d));
 
     /* (6) восстановление: после call-последовательности, до i */
     instr_t *cur = instr_get_prev(i);

@@ -149,7 +149,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2002\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2003\n");
 
     memset(&g_cfg, 0, sizeof(g_cfg));
     parse_options(argc, argv);
