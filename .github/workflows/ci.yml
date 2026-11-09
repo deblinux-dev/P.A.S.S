@@ -348,20 +348,29 @@ jobs:
           rm -f dr.zip
           mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
 
-      - name: Сборка клиента MinGW (Ninja + gcc)
+      - name: Сборка клиента MinGW (gcc напрямую, без DR-cmake)
+        # DR-cmake подмешивает MSVC-флаги (/MT /GS-) в gcc-команду —
+        # собираем напрямую: статические lib DR (drmgr, drcontainers)
+        # + import dynamorio.lib; cpuid_hook.c — отдельно с -mno-sse.
         run: |
-          cmake -S . -B build-mgw -G Ninja -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-                -DDynamoRIO_DIR="$(pwd -W)/dynamorio/cmake"
-          cmake --build build-mgw -j 4
-          ls -l build-mgw/*.dll
+          ls dynamorio/lib64 dynamorio/ext/lib64
+          DRLIB="$(find dynamorio -name 'dynamorio.lib' | head -1)"
+          DRMGR="$(find dynamorio -name 'drmgr_static.lib' | head -1)"
+          DRCNT="$(find dynamorio -name 'drcontainers_static.lib' | head -1)"
+          test -n "$DRLIB" && test -n "$DRMGR"
+          CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
+          gcc $CFLAGS -mno-sse -mno-sse2 -mno-mmx -c src/cpuid_hook.c -o cpuid_hook.o
+          gcc -shared -o pass_client.dll \
+            src/pass.c src/features.c src/emu.c src/rewrite.c \
+            src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o \
+            $CFLAGS "$DRLIB" "$DRMGR" ${DRCNT:+$DRCNT} -static-libgcc
+          ls -l pass_client.dll
 
       - name: Сборка лаунчера и selftest (MinGW)
         run: |
           gcc -O2 -o pass.exe tools/pass_launcher.c
           gcc -O2 -mavx2 -o selftest.exe tests/data/selftest.c
-          cp build-mgw/libpass_client.dll ./pass_client.dll
-          ls -l pass.exe pass_client.dll selftest.exe
+          ls -l pass.exe selftest.exe
 
       - name: Bun — download windows-x64 + baseline
         timeout-minutes: 5
