@@ -354,17 +354,19 @@ jobs:
         # + import dynamorio.lib; cpuid_hook.c — отдельно (GHC-заголовки требуют sfence, -mno-sse убран; Core 2-совместимость держат -mno-sse3+).
         run: |
           ls dynamorio/lib64 dynamorio/ext/lib64
-          DRLIB="$(find dynamorio -name 'dynamorio.lib' | head -1)"
+          # MSVC import-библиотека dynamorio.lib не разрешается MinGW-ld —
+          # линкуемся ПРЯМО на dynamorio.dll (MinGW сам построит импорт).
+          DLDLL="$(find dynamorio -path '*release*' -name 'dynamorio.dll' | head -1)"
           DRMGR="$(find dynamorio -name 'drmgr_static.lib' | head -1)"
           DRCNT="$(find dynamorio -name 'drcontainers_static.lib' | head -1)"
           DRLIBC="$(find dynamorio -name 'drlibc.lib' | head -1)"
-          test -n "$DRLIB" && test -n "$DRMGR"
+          test -n "$DLDLL" && test -n "$DRMGR"
           CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
           gcc -shared -o pass_client.dll \
             src/pass.c src/features.c src/emu.c src/rewrite.c \
             src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o \
-            $CFLAGS "$DRLIB" "$DRMGR" ${DRCNT:+$DRCNT} ${DRLIBC:+$DRLIBC} -static-libgcc
+            $CFLAGS "$DLDLL" "$DRMGR" ${DRCNT:+$DRCNT} ${DRLIBC:+$DRLIBC} -static-libgcc
           ls -l pass_client.dll
 
       - name: Сборка лаунчера и selftest (MinGW)
