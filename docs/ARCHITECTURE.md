@@ -295,21 +295,56 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    (RVA 0x71ee0: isa_mode @+0x27, bytes @+0x10) отработал — массив dsts
    остался NULL. Классическое следствие вырезанного CLIENT_ASSERT в
    релизной сборке DR: instr_get_dst по инструкции без выделенного
-   массива dsts (num_dsts==0 либо label-data). Краш в ПЕРВОМ BB bun,
-   до любого verbose-вывода рерайтера.
+   массива dsts (num_dsts==0 либо label-data).
    ГИПОТЕЗА «дефект MSVC-сборки клиента» ОПРОВЕРГНУТА: job
    windows-bun-mingw собрал тот же клиент gcc/MinGW (рабочий рецепт
    в ci.yml: .def из таблицы экспорта dynamorio.dll → dlltool →
    import-lib; release-drmgr_static.lib + drcontainers.lib; порядок
    архивов --start-group; -fcommon против _USES_DR_VERSION_) — краш
-   на ТОМ ЖЕ PC. Компиляторо-независимо → причина в DR или в общем
-   для обеих сборок характере вызова. Отдельный дефект MinGW-сборки:
-   selftest-якорь зависает сразу после баннера клиента (не мешает
-   анализу, чинится отдельно).
-   ПЛАН v0.3: локализовать вызывающий instr_get_dst (кандидаты:
-   манглинг DR'ом наших gs-TLS-инструкций; label-data инструкции;
-   доступ к операндам в контексте исключения), репорт в DynamoRIO с
-   RVA-анализом; обход — защита на стороне вызова либо cronbuild-11.92+.
+   на ТОМ ЖЕ PC. Компиляторо-независимо.
+   КОРЕНЬ НАЙДЕН И УСТРАНЁН (сессия 2026-11-10, локальная репродукция
+   на Linux: selftest под -target core2 падал 25/25 с тем же
+   «FAIL mulx_…» + SIGSEGV в instr_get_dst, экспорт DR):
+   vex_map направлял comis-семью (vcomiss/vcomisd/vucomiss/vucomisd)
+   и vldmxcsr в формы VF_ND2/VF_DIR, читающие instr_get_dst(i, 0),
+   но DR моделирует эти legacy-опкоды БЕЗ dst-операндов (decode_table:
+   «comisd», xx, xx, Vsd, Wsd — 0 dsts, 2 srcs; ldmxcsr аналогично).
+   Инструкция с 0 dsts имеет dsts==NULL → чтение dsts[0] = SIGSEGV
+   внутри DR-экспорта. Рерайтер bun-овского кода доходил до них
+   мгновенно (glibc printf содержит vucomisd/vcomisd — потому краш
+   выглядел как «FAIL mulx_…» с обрезанным буфером stdout). ФИКС:
+   rewrite_0dst() — прямая замена VEX→legacy (comis: 0dst_2src с теми
+   же операндами; ldmxcsr: 0dst_1src) + защитные guard'ы
+   instr_num_dsts(i)==0 в rewrite_128/rewrite_256. Аудит всех 161
+   legacy-опкодов карты против decode_table: других 0-dst форм нет.
+   Диагностика остаётся в коде под env-гейтами: PASS_OPND_TRACE=1
+   (трассировщик instr_get_dst/instr_get_src с адресом call site'а),
+   PASS_SEGVDUMP=1 (скан стека при SIGSEGV), [MEMW]/[PEXTR]/[BUF]
+   при -verbose 4/5.
+   ЗА ЭТУ СЕССИЮ ПОПОУТ ЗАКРЫТ ЕЩЁ РЯД ДЕФЕКТОВ KAT (все —
+   расхождение с железом, локальные мини-репродукторы):
+   (а) mulx SWAP: vvvv (DR dsts[0]) ← младшая половина, modrm.reg
+       (dsts[1]) ← старшая; эмулятор писал наоборот — все 400 KAT
+       mulx выдавали got/want переставленными;
+   (б) vpinsrb/vpinsrd: в VEX-форме DR srcs = [H(xmm-база), Rd_Mb,
+       Ib] — прежний код читал srcs[0] как GPR → регистр заполнялся
+       мусором; фикс: база слияния из srcs[0], GPR из srcs[1],
+       legacy-форма без изменений;
+   (в) vmovd GPR→XMM ветка кlobber'ила xmm15 без спила/восстановления
+       (gcc держит там живые константы векторизованного MixColumns);
+   (г) vmovd mem→xmm: «нормализация» размера в OPSZ_8 превращала
+       vmovd m32 в movq — читались 4 лишних байта в xmm[4..7];
+       фикс: OPSZ_4/OPSZ_8 по опкоду;
+   (д) vpextrb/vpextrw с mem-приёмником: DR отдаёт mem-операнду
+       OPSZ_2, st16 затирал СОСЕДНИЙ байт нулём; фикс: запись
+       размером элемента по опкоду.
+   ОСТАЛСЯ ОДИН ИЗВЕСТНЫЙ ДЕФЕКТ (v0.3, приоритет 1): в длинных BB
+   с чередой generic-эмуляций часть XMM-спилов не достигает буфера
+   эмулятора (BUF_XMM содержит устаревшие значения; [BUF]/[PEXTR]
+   трасса: при верном регистре буфер отдаёт мусор, GPR-спилы при
+   этом корректны, адреса MEMW верны). Проявляется как флакующий
+   FAIL aesenc в selftest (реф-реализация MixColumns векторизована
+   gcc и опирается на цепочки vpextrb-сторов).
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)

@@ -378,6 +378,58 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
 /* ─────────────── главный диспетчер ─────────────── */
 int g_disable_256 = 0, g_disable_128 = 0, g_disable_special = 0;
 
+/* ── трассировка операндов: ловим вызовы get_dst/get_src по инструкциям
+ * без операндов до того, как релизный DR уронит процесс (см. pass.h).
+ * ra — адрес вызова в клиенте; вместе с печатью адреса самой обёртки
+ * это позволяет вычислить файловый offset call site'а (addr2line).
+ * Реальные функции доступны через asm-label на DR-экспорт (INSTR_GET_DST
+ * — internal API, клиентам недоступен).                              */
+extern opnd_t real_get_dst_fn(instr_t *instr, uint pos) __asm__("instr_get_dst");
+extern opnd_t real_get_src_fn(instr_t *instr, uint pos) __asm__("instr_get_src");
+
+opnd_t pass_traced_get_dst(instr_t *in, uint pos, void *ra)
+{
+    /* диагностика под env-гейтом PASS_OPND_TRACE=1: без неё — обычное
+     * поведение релизного DR (краш на dsts==NULL), с ней — громкий
+     * отчёт с адресом call site'а до краша (§7.3)                   */
+    static int on = -1;
+    if (on == -1)
+        on = (getenv("PASS_OPND_TRACE") != NULL);
+    if (on && (!instr_operands_valid(in) || pos >= (uint)instr_num_dsts(in))) {
+        void *self = (void *)&pass_traced_get_dst;
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][OPND-TRAP] dst pos=%u ndst=%u nsrc=%u opc=%d "
+                   "meta=%d valid=%d ra=" PIFX " self=" PIFX "\n",
+                   pos, (uint)instr_num_dsts(in), (uint)instr_num_srcs(in),
+                   instr_get_opcode(in), instr_is_meta(in) ? 1 : 0,
+                   instr_operands_valid(in) ? 1 : 0,
+                   (ptr_uint_t)ra, (ptr_uint_t)self);
+        dr_flush_file(STDERR);
+        dr_abort();
+    }
+    return real_get_dst_fn(in, pos);
+}
+
+opnd_t pass_traced_get_src(instr_t *in, uint pos, void *ra)
+{
+    static int on = -1;
+    if (on == -1)
+        on = (getenv("PASS_OPND_TRACE") != NULL);
+    if (on && (!instr_operands_valid(in) || pos >= (uint)instr_num_srcs(in))) {
+        void *self = (void *)&pass_traced_get_src;
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][OPND-TRAP] src pos=%u ndst=%u nsrc=%u opc=%d "
+                   "meta=%d valid=%d ra=" PIFX " self=" PIFX "\n",
+                   pos, (uint)instr_num_dsts(in), (uint)instr_num_srcs(in),
+                   instr_get_opcode(in), instr_is_meta(in) ? 1 : 0,
+                   instr_operands_valid(in) ? 1 : 0,
+                   (ptr_uint_t)ra, (ptr_uint_t)self);
+        dr_flush_file(STDERR);
+        dr_abort();
+    }
+    return real_get_src_fn(in, pos);
+}
+
 static void report_unsupported(void *dc, instr_t *i)
 {
     int opc = instr_get_opcode(i);

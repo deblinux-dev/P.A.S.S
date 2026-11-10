@@ -182,6 +182,10 @@ static void put_gpr_val(estate_t *st, opnd_t o, uint64_t val)
     }
     if (opnd_is_memory_reference(o)) {
         byte *a = mem_addr(st, o);
+        if (g_cfg.verbose >= 4)
+            dr_fprintf(STDERR, "[P.A.S.S.][MEMW] " PIFX " <- %02x (sz %d)\n",
+                       (ptr_uint_t)a, (unsigned)(val & 0xFF),
+                       (int)opnd_get_size(o));
         switch (opnd_get_size(o)) {
         case OPSZ_1: st8(a, (uint8_t)val); return;
         case OPSZ_2: st16(a, (uint16_t)val); return;
@@ -1155,7 +1159,10 @@ static void gpr_rorx(estate_t *st, emu_desc_t *d)
 }
 static void gpr_mulx(estate_t *st, emu_desc_t *d)
 {
-    /* MULX dst1, dst2, src: {dst2:dst1} = RDX * src (dst2=low, dst1=high) */
+    /* MULX: vvvv (DR dsts[0]) ← МЛАДШАЯ половина RDX*src,
+     *       modrm.reg (DR dsts[1]) ← старшая. Проверено нативным
+     * дизасмом gcc (_mulx_u64): vvvv=lo, reg=hi (§7.3, SWAP-баг v0.2:
+     * got/want менялись местами во всех 400 KAT mulx).            */
     uint64_t rdx = *EG(st, 2);  /* RDX */
     uint64_t src = get_gpr_val(st, d->srcs[0]);
     int is32 = (opnd_get_size(d->srcs[0]) == OPSZ_4);
@@ -1166,9 +1173,8 @@ static void gpr_mulx(estate_t *st, emu_desc_t *d)
     } else {
         mul64x64(rdx, src, &lo, &hi);
     }
-    /* DR: dsts[0] = dest1 (high), dsts[1] = dest2 (low) */
-    put_gpr_val(st, d->dsts[0], hi);
-    put_gpr_val(st, d->dsts[1], lo);
+    put_gpr_val(st, d->dsts[0], lo);
+    put_gpr_val(st, d->dsts[1], hi);
 }
 static void gpr_adcx_adox(estate_t *st, emu_desc_t *d)
 {
@@ -1346,6 +1352,20 @@ int emu_generic(emu_desc_t *d)
     if (g_cfg.verbose >= 1 && (g_dyn_generic % 500000) == 0)
         dr_fprintf(STDERR, "[P.A.S.S.] generic: %llu эмуляций\n",
                    (unsigned long long)g_dyn_generic);
+    if (g_cfg.verbose >= 5) {
+        dr_fprintf(STDERR, "[P.A.S.S.][BUF] opc=%d xmm0-3:", d->opc);
+        for (int k = 0; k < 4; k++) {
+            const uint8_t *b = st.buf + BUF_XMM(k);
+            dr_fprintf(STDERR, " %02x%02x%02x%02x", b[0], b[1], b[2], b[3]);
+        }
+        dr_fprintf(STDERR, " xmm6:");
+        {
+            const uint8_t *b = st.buf + BUF_XMM(6);
+            dr_fprintf(STDERR, " %02x%02x%02x%02x%02x%02x%02x%02x",
+                       b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        }
+        dr_fprintf(STDERR, "\n");
+    }
     uint8_t t1[16], t2[16], imm = 0;
     if (d->nsrc >= 1 && opnd_is_immed_int(d->srcs[d->nsrc - 1]))
         imm = (uint8_t)opnd_get_immed_int(d->srcs[d->nsrc - 1]);
@@ -1436,7 +1456,17 @@ int emu_generic(emu_desc_t *d)
         if (d->opc == OP_aesenc || d->opc == OP_aesdec ||
             d->opc == OP_aesenclast || d->opc == OP_aesdeclast ||
             d->opc == OP_aesimc) {
-            aes_block(D, S1, S2, d->opc);
+            /* §7.3 SWAP: порядок источников различается между формами!
+             * legacy (деструктивная 2-op): DR srcs = [Wdq(rm), Vdq(reg)]
+             *   → srcs[0] = КЛЮЧ (rm), srcs[1] = СОСТОЯНИЕ (reg).
+             * VEX (vaesenc, сюда ведёт и trap-fallback): srcs = [Hx, Wx]
+             *   → srcs[0] = СОСТОЯНИЕ, srcs[1] = КЛЮЧ.
+             * Без различения: legacy считал aesenc(ключ, сотс.), VEX —
+             * наоборот. KAT: selftest (vaesenc) и aestest (aesenc).    */
+            if (d->is_vex)
+                aes_block(D, S1, S2, d->opc);
+            else
+                aes_block(D, S2, S1, d->opc);
             if (d->is_ymm) aes_block(D + 16, S1 + 16, S2 + 16, d->opc);
         } else if (d->opc == OP_aeskeygenassist) {
             aes_keygen(D, S1, imm);
@@ -1467,6 +1497,10 @@ int emu_generic(emu_desc_t *d)
     case OP_pextrb: case OP_pextrw: case OP_pextrd:
     case OP_vpextrb: case OP_vpextrw: case OP_vpextrd: {   /* vpextrq = vpextrd */
         const uint8_t *sv = EX(&st, xmm_idx(opnd_get_reg(d->srcs[0])));
+        if (g_cfg.verbose >= 4)
+            dr_fprintf(STDERR, "[P.A.S.S.][PEXTR] opc=%d imm=%u src=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       d->opc, imm, sv[0], sv[1], sv[2], sv[3],
+                       sv[4], sv[5], sv[6], sv[7]);
         uint64_t v = 0;
         /* §6.23: размер ЭЛЕМЕНТА — по опкоду, не по размеру dst:
          * pextrw/pextrb пишут в 32-битный GPR (нул-расширение), но
@@ -1481,20 +1515,48 @@ int emu_generic(emu_desc_t *d)
         case 4: v = ld32(sv + (imm & 3) * 4); break;
         case 8: v = ld64(sv + (imm & 1) * 8); break;
         }
-        put_gpr_val(&st, d->dsts[0], v);
+        /* §7.3: mem-приёмник пишем размером ЭЛЕМЕНТА (по опкоду), не по
+         * opnd_get_size — DR отдаёт mem-операнду OPSZ_2, и st16 затирал
+         * СОСЕДНИЙ байт out[i+1] нулём (перепутанный KAT vpextrb-сторов). */
+        if (opnd_is_memory_reference(d->dsts[0])) {
+            byte *a = mem_addr(&st, d->dsts[0]);
+            int wes = (d->opc == OP_pextrb || d->opc == OP_vpextrb) ? 1
+                    : (d->opc == OP_pextrw || d->opc == OP_vpextrw) ? 2 : 4;
+            if (wes == 1) st8(a, (uint8_t)v);
+            else if (wes == 2) st16(a, (uint16_t)v);
+            else st32(a, (uint32_t)v);
+        } else {
+            put_gpr_val(&st, d->dsts[0], v);
+        }
         break;
     }
     case OP_pinsrb: case OP_pinsrd:   /* OP_pinsrq == OP_pinsrd (алиас) */
     case OP_vpinsrb: case OP_vpinsrw: case OP_vpinsrd: { /* vpinsrq = vpinsrd */
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t *dv = EX(&st, di);
-        uint64_t v = get_gpr_val(&st, d->srcs[0]);
-        /* §6.23: размер элемента — по опкоду (pinsrb/pinsrw берут младший
-         * байт/слово 32-битного GPR; прежний st32 по r/m32-размеру
-         * затирал соседние байты буфера). */
+        /* §7.3: порядок srcs зависит от формы!
+         * VEX (DR: Vdq ← H15_dq, Rd_Mb, Ib): srcs[0] = xmm-БАЗА слияния,
+         *   srcs[1] = GPR/mem-источник, imm = srcs[2].
+         * legacy (Vdq ← Rd_Mb, Ib): srcs[0] = GPR/mem, база = старый dst.
+         * Прежний код читал srcs[0] как GPR и в VEX-форме получал мусор:
+         * vpinsrb возвращал 0x25-заполненный регистр (срыв bun.exe).  */
+        opnd_t gsrc = d->is_vex ? d->srcs[1] : d->srcs[0];
+        uint64_t v;
+        if (d->is_vex) {
+            /* база слияния — xmm-операнд srcs[0]; копируем в dv (dst
+             * может не совпадать с базой: vpinsrb xmm0, xmm4, eax, 5) */
+            memcpy(dv, EX(&st, xmm_idx(opnd_get_reg(d->srcs[0]))), 16);
+        }
         int esz = (d->opc == OP_pinsrb || d->opc == OP_vpinsrb) ? 1
                 : (d->opc == OP_pinsrw || d->opc == OP_vpinsrw) ? 2
-                : (opnd_get_size(d->srcs[0]) == OPSZ_8) ? 8 : 4;
+                : (opnd_get_size(gsrc) == OPSZ_8) ? 8 : 4;
+        if (opnd_is_memory_reference(gsrc)) {
+            const uint8_t *mp = mem_addr(&st, gsrc);
+            v = (esz == 1) ? mp[0] : (esz == 2) ? ld16(mp)
+              : (esz == 8) ? ld64(mp) : ld32(mp);
+        } else {
+            v = get_gpr_val(&st, gsrc);
+        }
         if (esz == 1)           dv[imm & 15] = (uint8_t)v;
         else if (esz == 2)      st16(dv + (imm & 7) * 2, (uint16_t)v);
         else if (esz == 8)      st64(dv + (imm & 1) * 8, v);

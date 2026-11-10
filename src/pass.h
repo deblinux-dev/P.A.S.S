@@ -234,4 +234,16 @@ int  special_req_ok(int opc);   /* есть ли вообще обработчи
 void trap_init(void);
 void trap_exit(void);
 
+/* ── трассировка доступа к операндам (диагностика краша NULL dsts) ──
+ * Клиент зовёт DR-экспорт instr_get_dst/instr_get_src через PLT;
+ * в релизной сборке DR CLIENT_ASSERT вырезан и вызов по инструкции
+ * без операндов (dsts==NULL) даёт SIGSEGV без внятного стека.
+ * Обёртка печатает opc/num/ra и обрывает процесс ДО краша.         */
+opnd_t pass_traced_get_dst(instr_t *in, uint pos, void *ra);
+opnd_t pass_traced_get_src(instr_t *in, uint pos, void *ra);
+#undef instr_get_dst
+#undef instr_get_src
+#define instr_get_dst(in, pos) pass_traced_get_dst((in), (pos), __builtin_return_address(0))
+#define instr_get_src(in, pos) pass_traced_get_src((in), (pos), __builtin_return_address(0))
+
 #endif /* PASS_H */

@@ -177,6 +177,10 @@ static void restore15(void *dc, instrlist_t *bb, instr_t *at, int used15, int ds
 static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
                        const vex_map_ent_t *e)
 {
+    /* защитный guard: 0-dst формы сюда доходить не должны (см. rewrite_0dst);
+     * при неожиданном попадании — trap-fallback вместо краша на dsts[0] */
+    if (instr_num_dsts(i) == 0)
+        return 0;
     opnd_t d0 = instr_get_dst(i, 0);
     int nsrc = instr_num_srcs(i);
     opnd_t s1 = instr_get_src(i, 0);
@@ -225,9 +229,18 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
                    opnd_get_reg(d0) >= DR_REG_XMM0 && opnd_get_reg(d0) <= DR_REG_XMM15 &&
                    is_gpr_reg(opnd_get_reg(s1))) {
             /* GPR → XMM: через T0 (прямой movq r64→xmm тоже segv-ится
-             * в кодировщике). Верхние 8 байт результата — нули.     */
+             * в кодировщике). Верхние 8 байт результата — нули.
+             * §7.3: xmm15 используется как носитель — ОБЯЗАТЕЛЕН спил
+             * в RAW_S15 и восстановление (если dst != xmm15): раньше
+             * ветка молча гробила живые данные приложения в xmm15
+             * (в векторизованном MixColumns gcc держит там константы
+             * умножения — KAT расходился с железом).                */
             reg_id_t g = gpr_norm(opnd_get_reg(s1));
             int di2 = xmm_idx(opnd_get_reg(d0));
+            int spill15 = (di2 != 15);
+            if (spill15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
             pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
                 dc, raw_opnd(RAW_T0, OPSZ_8), opnd_create_reg(g)));
             pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
@@ -238,11 +251,19 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
                 dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_T0, OPSZ_16)));
             pass_ins(dc, bb, i, INSTR_CREATE_movaps(
                 dc, opnd_create_reg(DR_REG_XMM0 + di2), opnd_create_reg(DR_REG_XMM15)));
+            if (spill15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
         } else if (e->vex_op == OP_vmovd || e->vex_op == OP_vmovq) {
-            /* GPR↔mem направления: нормализуем размер в 8 байт */
+            /* GPR↔mem направления: vmovd двигает ровно 4 байта (верх
+             * xmm обнуляется), vmovq — 8. Прежняя «нормализация» в
+             * OPSZ_8 превращала vmovd m32 в movq: читались 4 лишних
+             * байта стека в xmm[4..7], мусор расползался через
+             * unpck/blend (срыв KAT MixColumns, §7.3).              */
+            opnd_size_t msz = (e->vex_op == OP_vmovq) ? OPSZ_8 : OPSZ_4;
             opnd_t dd = d0, ss = s1;
-            opnd_set_size(&dd, OPSZ_8);
-            opnd_set_size(&ss, OPSZ_8);
+            if (opnd_is_memory_reference(dd)) opnd_set_size(&dd, msz);
+            if (opnd_is_memory_reference(ss)) opnd_set_size(&ss, msz);
             pass_ins(dc, bb, i, instr_create_1dst_1src(dc, e->legacy_op, dd, ss));
         } else {
             pass_ins(dc, bb, i, instr_create_1dst_1src(dc, e->legacy_op, d0, s1));
@@ -325,6 +346,9 @@ static void remove_orig(void *dc, instrlist_t *bb, instr_t *i)
 static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
                        const vex_map_ent_t *e)
 {
+    /* защитный guard: см. rewrite_128 */
+    if (instr_num_dsts(i) == 0)
+        return 0;
     opnd_t d0 = instr_get_dst(i, 0);
     int nsrc = instr_num_srcs(i);
     opnd_t s1 = instr_get_src(i, 0);
@@ -535,6 +559,30 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
 
 /* ══════════════ точка входа ══════════════ */
 
+/* §7.3: comis-семья (comiss/comisd/ucomiss/ucomisd) и ldmxcsr — legacy-формы
+ * в DR моделируются БЕЗ dst-операндов (xx, xx, V, W): пишут только флаги/MXCSR.
+ * Инструкция с 0 dsts имеет dsts==NULL, и любой instr_get_dst(i, 0) в релизной
+ * сборке DR (CLIENT_ASSERT вырезан) — детерминированный SIGSEGV на dsts[0]
+ * (Windows CI: 0xC0000005 @ dynamorio.dll+0x7250c на bun/selftest; Linux:
+ * OPND-TRAP opc=662 OP_vucomisd ndst=0 nsrc=2). VEX-форма семантически
+ * идентична legacy (недеструктивное чтение), поэтому — прямая замена на
+ * legacy-инструкцию с теми же операндами.                                   */
+static int rewrite_0dst(void *dc, instrlist_t *bb, instr_t *i,
+                        const vex_map_ent_t *e)
+{
+    if (e->vex_op == OP_vldmxcsr) {
+        pass_ins(dc, bb, i, INSTR_CREATE_ldmxcsr(dc, instr_get_src(i, 0)));
+    } else {
+        /* comis: srcs = (V, W) — порядок совпадает с legacy */
+        pass_ins(dc, bb, i, instr_create_0dst_2src(dc, e->legacy_op,
+                                                   instr_get_src(i, 0),
+                                                   instr_get_src(i, 1)));
+    }
+    instrlist_remove(bb, i);
+    instr_destroy(dc, i);
+    return 1;
+}
+
 extern int g_disable_256, g_disable_128;
 int try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i)
 {
@@ -542,6 +590,10 @@ int try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i)
     const vex_map_ent_t *e = vex_map_lookup(opc);
     if (e == NULL || e->form == VF_SPECIAL)
         return 0;
+
+    /* 0-dst формы (comis-семья, ldmxcsr) — отдельный путь, см. выше */
+    if (instr_num_dsts(i) == 0)
+        return rewrite_0dst(dc, bb, i, e);
 
     /* widen-формы с разными размерами src/dst (vcvtps2pd ymm, xmm) — в generic */
     if (instr_num_dsts(i) > 0 &&

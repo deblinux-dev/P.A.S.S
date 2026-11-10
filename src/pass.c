@@ -151,6 +151,18 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
     dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2003\n");
 
+#ifdef LINUX
+    /* временная диагностика: перехват SIGSEGV для скана стека краша —
+     * только при PASS_SEGVDUMP=1 (иначе подменяет обработчик DR)     */
+    {
+        const char *sv = getenv("PASS_SEGVDUMP");
+        if (sv != NULL) {
+            extern void pass_segv_dump_install(void);
+            pass_segv_dump_install();
+        }
+    }
+#endif
+
     memset(&g_cfg, 0, sizeof(g_cfg));
     parse_options(argc, argv);
 
