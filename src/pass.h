@@ -235,15 +235,22 @@ void trap_init(void);
 void trap_exit(void);
 
 /* ── трассировка доступа к операндам (диагностика краша NULL dsts) ──
- * Клиент зовёт DR-экспорт instr_get_dst/instr_get_src через PLT;
- * в релизной сборке DR CLIENT_ASSERT вырезан и вызов по инструкции
- * без операндов (dsts==NULL) даёт SIGSEGV без внятного стека.
- * Обёртка печатает opc/num/ra и обрывает процесс ДО краша.         */
+ * Клиент зовёт DR-экспорт instr_get_dst/instr_get_src; в релизной
+ * сборке DR CLIENT_ASSERT вырезан и вызов по инструкции без
+ * операндов (dsts==NULL) даёт SIGSEGV без внятного стека. Обёртка
+ * печатает opc/num/ra и обрывает процесс ДО краша (PASS_OPND_TRACE).
+ * ra: GCC/MinGW — __builtin_return_address, MSVC — _ReturnAddress.  */
+#ifdef _MSC_VER
+#include <intrin.h>
+#define PASS_RA() _ReturnAddress()
+#else
+#define PASS_RA() __builtin_return_address(0)
+#endif
 opnd_t pass_traced_get_dst(instr_t *in, uint pos, void *ra);
 opnd_t pass_traced_get_src(instr_t *in, uint pos, void *ra);
 #undef instr_get_dst
 #undef instr_get_src
-#define instr_get_dst(in, pos) pass_traced_get_dst((in), (pos), __builtin_return_address(0))
-#define instr_get_src(in, pos) pass_traced_get_src((in), (pos), __builtin_return_address(0))
+#define instr_get_dst(in, pos) pass_traced_get_dst((in), (pos), PASS_RA())
+#define instr_get_src(in, pos) pass_traced_get_src((in), (pos), PASS_RA())
 
 #endif /* PASS_H */

@@ -384,8 +384,18 @@ int g_disable_256 = 0, g_disable_128 = 0, g_disable_special = 0;
  * это позволяет вычислить файловый offset call site'а (addr2line).
  * Реальные функции доступны через asm-label на DR-экспорт (INSTR_GET_DST
  * — internal API, клиентам недоступен).                              */
+/* Реальные функции: GCC/MinGW — asm-label на DR-экспорт; MSVC —
+ * unresolved-символ, разрешаемый линкером через /alternatename
+ * (INSTR_GET_DST — internal API, клиентам недоступен).             */
+#ifdef _MSC_VER
+opnd_t real_get_dst_fn(instr_t *instr, uint pos);
+#pragma comment(linker, "/alternatename:real_get_dst_fn=instr_get_dst")
+opnd_t real_get_src_fn(instr_t *instr, uint pos);
+#pragma comment(linker, "/alternatename:real_get_src_fn=instr_get_src")
+#else
 extern opnd_t real_get_dst_fn(instr_t *instr, uint pos) __asm__("instr_get_dst");
 extern opnd_t real_get_src_fn(instr_t *instr, uint pos) __asm__("instr_get_src");
+#endif
 
 opnd_t pass_traced_get_dst(instr_t *in, uint pos, void *ra)
 {
