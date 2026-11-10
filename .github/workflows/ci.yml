@@ -356,8 +356,9 @@ jobs:
         run: |
           DLDLL="$(find dynamorio -path '*lib64/release*' -name 'dynamorio.dll' | head -1)"
           DRMGR="$(find dynamorio -path '*ext/lib64/release*' -name 'drmgr_static.lib' | head -1)"
-          test -n "$DLDLL" && test -n "$DRMGR"
-          echo "DLDLL=$DLDLL"; echo "DRMGR=$DRMGR"
+          DRCNT="$(find dynamorio -path '*ext/lib64/release*' -name 'drcontainers.lib' | head -1)"
+          test -n "$DLDLL" && test -n "$DRMGR" && test -n "$DRCNT"
+          echo "DLDLL=$DLDLL"; echo "DRMGR=$DRMGR"; echo "DRCNT=$DRCNT"
           # .def из 64-битного DLL. Строки имён имеют вид "[   42] имя";
           # заголовок "[Ordinal/Name Pointer] Table -- Ordinal Base 1"
           # тоже начинается с '[' — отсекаем требованием $2 = число].
@@ -377,7 +378,7 @@ jobs:
           # поэтому drmgr_static (ссылается на dr_*) ДОЛЖЕН стоять раньше
           # dr_gcc.a; --start-group закрывает и обратные ссылки.
           if gcc -shared -o pass_client.dll $SRCS $CFLAGS \
-               -Wl,--start-group "$DRMGR" dr_gcc.a -Wl,--end-group \
+               -Wl,--start-group "$DRMGR" "$DRCNT" dr_gcc.a -Wl,--end-group \
                -static-libgcc 2> link1.err; then
             echo "линк OK: import-lib от dlltool"
           else
@@ -385,7 +386,7 @@ jobs:
             tail -8 link1.err
             echo "== фолбэк: прямая линковка на dynamorio.dll"
             gcc -shared -o pass_client.dll $SRCS $CFLAGS \
-              "$DLDLL" "$DRMGR" -static-libgcc \
+              "$DLDLL" "$DRMGR" "$DRCNT" -static-libgcc \
               -Wl,--allow-multiple-definition
             echo "линк OK: прямая линковка на DLL"
           fi
