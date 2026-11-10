@@ -371,7 +371,10 @@ jobs:
           grep -qx dr_fprintf dr.def
           dlltool -d dr.def -D "$DLDLL" -l dr_gcc.a -m i386:x86-64
           test -s dr_gcc.a && ls -l dr_gcc.a
-          CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
+          # -fcommon: глобальные данные из заголовков DR (_USES_DR_VERSION_,
+          # _DR_CLIENT_AVX512_CODE_IN_USE_) в MSVC-объектах drmgr определены
+          # явно; gcc 10+ (-fno-common) даёт второй экземпляр — конфликт.
+          CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -fcommon -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
           SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o"
           # порядок критичен: GNU ld обрабатывает архивы одним проходом,
@@ -395,7 +398,9 @@ jobs:
       - name: Сборка лаунчера и selftest (MinGW)
         run: |
           gcc -O2 -o pass.exe tools/pass_launcher.c
-          gcc -O2 -mavx2 -o selftest.exe tests/data/selftest.c
+          # GCC (в отличие от MSVC /arch:AVX2) не включает BMI1/BMI2/FMA/
+          # LZCNT/AES/PCLMUL через -mavx2 — для KAT-интриnsics нужны явно:
+          gcc -O2 -mavx2 -mbmi -mbmi2 -mlzcnt -mfma -maes -mpclmul -o selftest.exe tests/data/selftest.c
           ls -l pass.exe selftest.exe
 
       - name: Bun — download windows-x64 + baseline
