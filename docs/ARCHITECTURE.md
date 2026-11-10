@@ -277,20 +277,39 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    Windows рекомендовать проверять bun последней сборки после апгрейда
    DR (например cronbuild-11.92+), если несовместимость ушла.
    Финальная проверка — bun.exe под Windows на реальном Core 2.
-3. Windows CI × bun 1.4.4 (CI run, 2026-11-09, 10 кейсов, windows-bun):
+3. Windows CI × bun 1.4.4 (CI runs #22–#33, 2026-11-09/10):
    (а) bun нативно — OK; (б) ЧИСТЫЙ DR без клиента — bun --version OK:
    несовместимость п.2 — Linux-специфична, на Windows DR 11.91.20763 ×
    bun СОВМЕСТИМЫ; (в) клиент с `-target native` — OK; (г) все кейсы с
    `-target core2` (--version, -e 'Hello'/'Привет', baseline-сборка)
-   падают детерминированным КРАШОМ КЛИЕНТА: «P.A.S.S. internal crash»,
-   0xC0000005, PC = dynamorio.dll+0x7250c, сразу после переписывания
-   movups/cmpsd-последовательностей с TLS-спиллами (opc=739/675) — тот
-   же класс, что §7.1 (дефект MSVC-сборки клиента; на Linux/GCC тот же
-   код проходит KAT 231/231). Процесс после краша не завершается сам:
-   осиротевший bun.exe держал CI-job (bun-диагностика вынесена в
-   отдельный job с job-таймаутом 30 мин + `timeout -k`). Приоритет
-   v0.3: починить MSVC-сборку клиента либо собрать Windows-релиз
-   клиентом MinGW (проверка гипотезы — job windows-bun-mingw).
+   падают детерминированным крашем: DR печатает «P.A.S.S. internal
+   crash» (имя клиента подставляет САМ DR из dr_set_client_name — это
+   его собственный отчёт VEH), 0xC0000005, PC = dynamorio.dll+0x7250c,
+   Read по адресу 0. Процесс после «Program aborted» сам не завершается
+   (осиротевший bun.exe держал CI-job — bun-диагностика вынесена в
+   отдельный job c job-таймаутом 30 мин + `timeout -k`).
+   РАЗБОР КРАША (дизасм dynamorio.dll cronbuild-11.91.20763): PC 0x7250c
+   — inline-хвост `instr_get_dst`: `movups (%rax,%r8,8),%xmm0` (функция
+   RVA 0x724d0–0x7251d по .pdata); rax = instr->dsts (instr_t+0x40) =
+   NULL, idx = 0; флаг INSTR_OPERANDS_VALID проверен, decode-колбэк
+   (RVA 0x71ee0: isa_mode @+0x27, bytes @+0x10) отработал — массив dsts
+   остался NULL. Классическое следствие вырезанного CLIENT_ASSERT в
+   релизной сборке DR: instr_get_dst по инструкции без выделенного
+   массива dsts (num_dsts==0 либо label-data). Краш в ПЕРВОМ BB bun,
+   до любого verbose-вывода рерайтера.
+   ГИПОТЕЗА «дефект MSVC-сборки клиента» ОПРОВЕРГНУТА: job
+   windows-bun-mingw собрал тот же клиент gcc/MinGW (рабочий рецепт
+   в ci.yml: .def из таблицы экспорта dynamorio.dll → dlltool →
+   import-lib; release-drmgr_static.lib + drcontainers.lib; порядок
+   архивов --start-group; -fcommon против _USES_DR_VERSION_) — краш
+   на ТОМ ЖЕ PC. Компиляторо-независимо → причина в DR или в общем
+   для обеих сборок характере вызова. Отдельный дефект MinGW-сборки:
+   selftest-якорь зависает сразу после баннера клиента (не мешает
+   анализу, чинится отдельно).
+   ПЛАН v0.3: локализовать вызывающий instr_get_dst (кандидаты:
+   манглинг DR'ом наших gs-TLS-инструкций; label-data инструкции;
+   доступ к операндам в контексте исключения), репорт в DynamoRIO с
+   RVA-анализом; обход — защита на стороне вызова либо cronbuild-11.92+.
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)
