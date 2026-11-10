@@ -350,30 +350,40 @@ jobs:
 
       - name: Сборка клиента MinGW (gcc напрямую, без DR-cmake)
         # DR-cmake подмешивает MSVC-флаги (/MT /GS-) в gcc-команду —
-        # собираем напрямую: статические lib DR (drmgr, drcontainers)
-        # + import dynamorio.lib; cpuid_hook.c — отдельно (GHC-заголовки требуют sfence, -mno-sse убран; Core 2-совместимость держат -mno-sse3+).
+        # собираем напрямую: release-drmgr_static.lib (DEBUG-версия не
+        # содержит drmgr_* символов!) + import-lib dynamorio.dll.
+        # find строго по lib64/release: в зипе раньше идёт lib32.
         run: |
-          ls dynamorio/lib64 dynamorio/ext/lib64
-          # DR-шный PE (и .lib, и прямой dll-link) MinGW-ld не разрешает.
-          # Каноничный путь: objdump читает таблицу экспорта dynamorio.dll →
-          # генерируем .def → dlltool строит MinGW import-библиотеку.
-          DLDLL="$(find dynamorio -path '*release*' -name 'dynamorio.dll' | head -1)"
-          DRMGR="$(find dynamorio -name 'drmgr_static.lib' | head -1)"
-          DRCNT="$(find dynamorio -name 'drcontainers_static.lib' | head -1)"
-          DRLIBC="$(find dynamorio -name 'drlibc.lib' | head -1)"
+          DLDLL="$(find dynamorio -path '*lib64/release*' -name 'dynamorio.dll' | head -1)"
+          DRMGR="$(find dynamorio -path '*ext/lib64/release*' -name 'drmgr_static.lib' | head -1)"
           test -n "$DLDLL" && test -n "$DRMGR"
-          objdump -p "$DLDLL" | sed -n '/\[Ordinal\/Name Pointer\] Table/,$p' \
-            | awk 'NF>0 && $1 ~ /^\[/{print $NF}' > dr.def
-          echo "экспортов в .def: $(wc -l < dr.def)"; head -3 dr.def
-          test "$(wc -l < dr.def)" -gt 100
+          echo "DLDLL=$DLDLL"; echo "DRMGR=$DRMGR"
+          # .def из 64-битного DLL. Строки имён имеют вид "[   42] имя";
+          # заголовок "[Ordinal/Name Pointer] Table -- Ordinal Base 1"
+          # тоже начинается с '[' — отсекаем требованием $2 = число].
+          {
+            printf 'LIBRARY dynamorio.dll\nEXPORTS\n'
+            objdump -p "$DLDLL" | sed -n '/\[Ordinal\/Name Pointer\] Table/,$p' \
+              | awk 'NF>0 && $1=="[" && $2 ~ /^[0-9]+\]$/ {print $NF}' | sort -u
+          } > dr.def
+          echo "экспортов в .def: $(tail -n +3 dr.def | wc -l)"; head -4 dr.def
+          grep -qx dr_fprintf dr.def
           dlltool -d dr.def -D "$DLDLL" -l dr_gcc.a -m i386:x86-64
-          ls -l dr_gcc.a
+          test -s dr_gcc.a && ls -l dr_gcc.a
           CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
-          gcc -shared -o pass_client.dll \
-            src/pass.c src/features.c src/emu.c src/rewrite.c \
-            src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o \
-            $CFLAGS dr_gcc.a "$DRMGR" ${DRCNT:+$DRCNT} ${DRLIBC:+$DRLIBC} -static-libgcc
+          SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o"
+          if gcc -shared -o pass_client.dll $SRCS $CFLAGS \
+               dr_gcc.a "$DRMGR" -static-libgcc 2> link1.err; then
+            echo "линк OK: import-lib от dlltool"
+          else
+            echo "== dlltool-импорт не разрешился; хвост ошибок:"
+            tail -8 link1.err
+            echo "== фолбэк: прямая линковка на dynamorio.dll"
+            gcc -shared -o pass_client.dll $SRCS $CFLAGS \
+              "$DLDLL" "$DRMGR" -static-libgcc
+            echo "линк OK: прямая линковка на DLL"
+          fi
           ls -l pass_client.dll
 
       - name: Сборка лаунчера и selftest (MinGW)
