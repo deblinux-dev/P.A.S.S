@@ -373,15 +373,20 @@ jobs:
           CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
           SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/trap.c cpuid_hook.o"
+          # порядок критичен: GNU ld обрабатывает архивы одним проходом,
+          # поэтому drmgr_static (ссылается на dr_*) ДОЛЖЕН стоять раньше
+          # dr_gcc.a; --start-group закрывает и обратные ссылки.
           if gcc -shared -o pass_client.dll $SRCS $CFLAGS \
-               dr_gcc.a "$DRMGR" -static-libgcc 2> link1.err; then
+               -Wl,--start-group "$DRMGR" dr_gcc.a -Wl,--end-group \
+               -static-libgcc 2> link1.err; then
             echo "линк OK: import-lib от dlltool"
           else
             echo "== dlltool-импорт не разрешился; хвост ошибок:"
             tail -8 link1.err
             echo "== фолбэк: прямая линковка на dynamorio.dll"
             gcc -shared -o pass_client.dll $SRCS $CFLAGS \
-              "$DLDLL" "$DRMGR" -static-libgcc
+              "$DLDLL" "$DRMGR" -static-libgcc \
+              -Wl,--allow-multiple-definition
             echo "линк OK: прямая линковка на DLL"
           fi
           ls -l pass_client.dll
