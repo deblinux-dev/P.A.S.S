@@ -390,7 +390,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     }
     /* флаги: безусловное восстановление — прокси (5b) мог их портить,
      * а обёртка emu_generic кладёт app-флаги в BUF_FLAGS на каждом вызове */
-    if (true) {
+    if (1) {
         instr_t *n1 = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
                                           buf_opnd(BUF_FLAGS, OPSZ_8));
         instr_t *n2 = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));

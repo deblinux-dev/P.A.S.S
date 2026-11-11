@@ -108,7 +108,12 @@ static byte *mem_addr(estate_t *st, opnd_t op)
  * реальному адресу уже в кэше (rewrite.c): фолт в кэше DR транслирует
  * в app-PC инструкции — SEH/сигналы работают как нативно. Inline-путь
  * прозрачен изначально (там реальные инструкции).                 */
-static __thread jmp_buf g_emu_jmp;
+#ifdef _MSC_VER
+# define PASS_TLS __declspec(thread)
+#else
+# define PASS_TLS __thread
+#endif
+static PASS_TLS jmp_buf g_emu_jmp;
 static int emu_generic_impl(emu_desc_t *d);
 
 static void emu_fault_record(estate_t *st, byte *addr, int is_write)
