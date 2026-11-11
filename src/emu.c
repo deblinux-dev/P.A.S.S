@@ -7,6 +7,7 @@
  * эмулятора не трогает xmm/ymm приложения. Плавающая точка —
  * через x87.                                                 */
 #include "pass.h"
+#include <setjmp.h>
 #include <math.h>
 
 typedef struct {
@@ -94,6 +95,47 @@ static byte *mem_addr(estate_t *st, opnd_t op)
     return opnd_compute_address(op, &mc);
 }
 
+/* ── §7.3: прозрачность фолтов generic-пути ──
+ * Mem-операнды эмулируемых инструкций разыменуются из clean call в
+ * клиентской DLL. ЛЕГИТИМНЫЙ page fault приложения (SEH-пробы CRT/кучи
+ * Windows, guard-page стека) внутри clean call DR классифицирует как
+ * internal crash — приложение не получает исключение (проверено:
+ * dr_register_signal_event для клиентских фолтов не вызывается;
+ * bun.exe умирал в первые 8с старта). Все доступы к памяти приложения
+ * — через dr_safe_read/dr_safe_write; при невозможности — записать
+ * адрес/тип в RAW_FAULT/RAW_TG и прервать эмуляцию longjmp'ом.
+ * Сгенерированный код после clean call исполняет ПРОКСИ-доступ по
+ * реальному адресу уже в кэше (rewrite.c): фолт в кэше DR транслирует
+ * в app-PC инструкции — SEH/сигналы работают как нативно. Inline-путь
+ * прозрачен изначально (там реальные инструкции).                 */
+static __thread jmp_buf g_emu_jmp;
+static int emu_generic_impl(emu_desc_t *d);
+
+static void emu_fault_record(estate_t *st, byte *addr, int is_write)
+{
+    /* §7.3: слоты в BUF (r10-относительные), а не в RAW (gs): в контексте
+     * доставки сигнала gs-база ненадёжна, а r10-носитель жив до (7). */
+    if (st->buf != NULL) {
+        *(uint64_t *)(st->buf + BUF_TG) = 1u | ((uint64_t)(is_write & 1) << 1);
+        *(uint64_t *)(st->buf + BUF_FAULT) = (uint64_t)(uintptr_t)addr;
+    }
+    longjmp(g_emu_jmp, 1);
+}
+
+static void emu_safe_read(estate_t *st, void *src, void *dst, size_t n)
+{
+    size_t done = 0;
+    if (!dr_safe_read(src, n, dst, &done) || done != n)
+        emu_fault_record(st, (byte *)src, 0);
+}
+
+static void emu_safe_write(estate_t *st, void *dst, const void *src, size_t n)
+{
+    size_t done = 0;
+    if (!dr_safe_write(dst, n, src, &done) || done != n)
+        emu_fault_record(st, (byte *)dst, 1);
+}
+
 static int is_xmm_reg(opnd_t o)
 {
     return opnd_is_reg(o) && opnd_get_reg(o) >= DR_REG_XMM0 &&
@@ -115,7 +157,7 @@ static const uint8_t *get_block16(estate_t *st, opnd_t o, uint8_t *tmp)
 {
     if (is_vec_reg(o))  return EX(st, xmm_idx(opnd_get_reg(o)));
     if (opnd_is_memory_reference(o)) {
-        memcpy(tmp, mem_addr(st, o), 16);
+        emu_safe_read(st, mem_addr(st, o), tmp, 16);
         return tmp;
     }
     memset(tmp, 0, 16);
@@ -124,7 +166,7 @@ static const uint8_t *get_block16(estate_t *st, opnd_t o, uint8_t *tmp)
 static void put_block16(estate_t *st, opnd_t o, const uint8_t *v)
 {
     if (is_vec_reg(o))      memcpy(EX(st, xmm_idx(opnd_get_reg(o))), v, 16);
-    else if (opnd_is_memory_reference(o)) memcpy(mem_addr(st, o), v, 16);
+    else if (opnd_is_memory_reference(o)) emu_safe_write(st, mem_addr(st, o), v, 16);
 }
 
 /* 32-байтный блок: reg → EX+EY (или shadow), mem → чтение по фактическому
@@ -147,7 +189,7 @@ static void get_block32(estate_t *st, opnd_t o, uint8_t *out32)
         case OPSZ_16: n = 16; break;
         default: n = 32; break;
         }
-        memcpy(out32, mem_addr(st, o), n);
+        emu_safe_read(st, mem_addr(st, o), out32, n);
     }
 }
 
@@ -158,12 +200,12 @@ static uint64_t get_gpr_val(estate_t *st, opnd_t o)
         return *EG(st, gpr_idx(opnd_get_reg(o)));
     if (opnd_is_memory_reference(o)) {
         byte *a = mem_addr(st, o);
-        switch (opnd_get_size(o)) {
-        case OPSZ_1: return ld8(a);
-        case OPSZ_2: return ld16(a);
-        case OPSZ_4: return ld32(a);
-        default:     return ld64(a);
-        }
+        size_t n = (opnd_get_size(o) == OPSZ_1) ? 1
+                 : (opnd_get_size(o) == OPSZ_2) ? 2
+                 : (opnd_get_size(o) == OPSZ_4) ? 4 : 8;
+        uint64_t v = 0;
+        emu_safe_read(st, a, &v, n);
+        return v;
     }
     if (opnd_is_immed_int(o)) return (uint64_t)opnd_get_immed_int(o);
     return 0;
@@ -182,16 +224,21 @@ static void put_gpr_val(estate_t *st, opnd_t o, uint64_t val)
     }
     if (opnd_is_memory_reference(o)) {
         byte *a = mem_addr(st, o);
+        size_t n = (opnd_get_size(o) == OPSZ_1) ? 1
+                 : (opnd_get_size(o) == OPSZ_2) ? 2
+                 : (opnd_get_size(o) == OPSZ_4) ? 4 : 8;
+        uint64_t tmp = 0;
+        switch (n) {
+        case 1: tmp = (uint8_t)val; break;
+        case 2: tmp = (uint16_t)val; break;
+        case 4: tmp = (uint32_t)val; break;
+        default: tmp = val; break;
+        }
         if (g_cfg.verbose >= 4)
             dr_fprintf(STDERR, "[P.A.S.S.][MEMW] " PIFX " <- %02x (sz %d)\n",
                        (ptr_uint_t)a, (unsigned)(val & 0xFF),
                        (int)opnd_get_size(o));
-        switch (opnd_get_size(o)) {
-        case OPSZ_1: st8(a, (uint8_t)val); return;
-        case OPSZ_2: st16(a, (uint16_t)val); return;
-        case OPSZ_4: st32(a, (uint32_t)val); return;
-        default:     st64(a, val); return;
-        }
+        emu_safe_write(st, a, &tmp, n);
     }
 }
 
@@ -799,7 +846,8 @@ static void pmaskmov_op(estate_t *st, emu_desc_t *d, int is_store)
             if (!(m >> (esz*8 - 1))) continue;
             int64_t idx = (int64_t)(int32_t)ld32(EX(st, xmm_idx(idxreg)) + i*4);
             byte *a = (byte *)(basev + idx*scale + disp);
-            if (esz == 4) st32(a, ld32(tmp + i*4)); else st64(a, ld64(tmp + i*8));
+            uint64_t w = (esz == 4) ? ld32(tmp + i*4) : ld64(tmp + i*8);
+            emu_safe_write(st, a, &w, esz);
         }
     } else {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
@@ -811,7 +859,9 @@ static void pmaskmov_op(estate_t *st, emu_desc_t *d, int is_store)
             if (!(m >> (esz*8 - 1))) continue;
             int64_t idx = (int64_t)(int32_t)ld32(EX(st, xmm_idx(idxreg)) + i*4);
             byte *a = (byte *)(basev + idx*scale + disp);
-            if (esz == 4) st32(r + i*4, ld32(a)); else st64(r + i*8, ld64(a));
+            uint64_t v = 0;
+            emu_safe_read(st, a, &v, esz);
+            if (esz == 4) st32(r + i*4, (uint32_t)v); else st64(r + i*8, v);
         }
         memcpy(EX(st, di), r, 16);
         if (d->is_ymm) memcpy(EY(st, di), r + 16, 16);
@@ -867,7 +917,9 @@ static void gather_op(estate_t *st, emu_desc_t *d)
             ? (int64_t)(int32_t)ld32(EX(st, ii) + i*4)
             : (int64_t)ld64(EX(st, ii) + i*8);
         byte *a = (byte *)(basev + idx*scale + disp);
-        if (data_sz == 4) st32(r + i*4, ld32(a)); else st64(r + i*8, ld64(a));
+        uint64_t v = 0;
+        emu_safe_read(st, a, &v, data_sz);
+        if (data_sz == 4) st32(r + i*4, (uint32_t)v); else st64(r + i*8, v);
     }
     memcpy(EX(st, di), r, 16);
     if (d->is_ymm) memcpy(EY(st, di), r + 16, 16);
@@ -1336,6 +1388,36 @@ static int fma_is_pd(int opc)
 
 int emu_generic(emu_desc_t *d)
 {
+    /* §7.3: обёртка прозрачности фолтов — emu_safe_read/write при
+     * недоступной памяти приложения записывают адрес/тип в RAW_FAULT/
+     * RAW_TG и longjmp'ят сюда; сгенерированный код после clean call
+     * исполнит настоящий доступ по этому адресу уже в кэше (см.
+     * rewrite.c), и фолт доставится приложению как при нативном
+     * исполнении. */
+    void *dc0 = dr_get_current_drcontext();
+    uint8_t *buf0 = (uint8_t *)drmgr_get_tls_field(dc0, g_tls_idx_buf);
+    if (buf0 != NULL) {
+        *(uint64_t *)(buf0 + BUF_TG) = 0;
+        *(uint64_t *)(buf0 + BUF_FAULT) = 0;
+    }
+    /* app-флаги → BUF_FLAGS всегда: их восстанавливает безусловный
+     * (6)-рестор (прокси (5b) портит флаги test/shr) */
+    {
+        uint8_t *buf0 = (uint8_t *)drmgr_get_tls_field(dc0, g_tls_idx_buf);
+        dr_mcontext_t mc0;
+        memset(&mc0, 0, sizeof(mc0));
+        mc0.size = sizeof(mc0);
+        mc0.flags = DR_MC_CONTROL;
+        if (buf0 != NULL && dr_get_mcontext(dc0, &mc0))
+            *(uint32_t *)(buf0 + BUF_FLAGS) = (uint32_t)mc0.xflags;
+    }
+    if (setjmp(g_emu_jmp) != 0)
+        return 1;              /* фолт записан — эмуляция прервана */
+    return emu_generic_impl(d);
+}
+
+int emu_generic_impl(emu_desc_t *d)
+{
     void *dc = dr_get_current_drcontext();
     estate_t st;
     pass_ensure_tls(dc);
@@ -1562,9 +1644,8 @@ int emu_generic(emu_desc_t *d)
             byte *a = mem_addr(&st, d->dsts[0]);
             int wes = (d->opc == OP_pextrb || d->opc == OP_vpextrb) ? 1
                     : (d->opc == OP_pextrw || d->opc == OP_vpextrw) ? 2 : 4;
-            if (wes == 1) st8(a, (uint8_t)v);
-            else if (wes == 2) st16(a, (uint16_t)v);
-            else st32(a, (uint32_t)v);
+            uint64_t tmp = (uint64_t)v;   /* §7.3: запись размером элемента */
+            emu_safe_write(&st, a, &tmp, wes);
         } else {
             put_gpr_val(&st, d->dsts[0], v);
         }
@@ -1592,8 +1673,9 @@ int emu_generic(emu_desc_t *d)
                 : (opnd_get_size(gsrc) == OPSZ_8) ? 8 : 4;
         if (opnd_is_memory_reference(gsrc)) {
             const uint8_t *mp = mem_addr(&st, gsrc);
-            v = (esz == 1) ? mp[0] : (esz == 2) ? ld16(mp)
-              : (esz == 8) ? ld64(mp) : ld32(mp);
+            uint64_t v64 = 0;
+            emu_safe_read(&st, (void *)mp, &v64, esz);
+            v = v64;
         } else {
             v = get_gpr_val(&st, gsrc);
         }

@@ -125,6 +125,9 @@ extern uint32_t g_stat_bbs;
                                          ВАЖНО: в v0.1 r10 спилился в
                                          RAW_YHI(0) — порча тени ymm0  */
 #define RAW_T2      464u              /* третий staging (алиасинг dst==src) */
+#define RAW_FAULT   472u              /* §7.3: адрес недоступной памяти (фолт
+                                       * generic-пути; код в RAW_TG: bit0=фолт,
+                                       * bit1=запись). Прокси в rewrite.c. */
 #define RAW_SIZE    480u              /* 60 слотов по 8Б         */
 
 /* ───────────── per-thread BUF (доступ C-кода через r10) ─────────────
@@ -133,7 +136,10 @@ extern uint32_t g_stat_bbs;
 #define BUF_XMM(i)  (128u + (i)*16u)   /* образ xmm: 128..383      */
 #define BUF_FLAGS   384u               /* образ eflags             */
 #define BUF_CPU     392u               /* cpuid scratch 6×8Б       */
-#define BUF_SIZE    440u
+#define BUF_TG      440u               /* §7.3: код фолта generic-пути
+                                          (bit0=фолт, bit1=запись)   */
+#define BUF_FAULT   448u               /* адрес недоступной памяти   */
+#define BUF_SIZE    456u
 
 /* Индексы регистров (xmm_idx принимает и XMM, и YMM; gpr_idx
  * нормализует любой ширинный GPR — EAX/AX/AL → RAX)               */

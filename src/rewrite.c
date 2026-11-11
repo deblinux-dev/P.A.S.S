@@ -292,6 +292,59 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
                          OPND_CREATE_INTPTR((ptr_int_t)d));
 
+    /* (5b) §7.3: прокси фолта. Если эмуляция столкнулась с недоступной
+     * памятью приложения (emu_safe_read/write: BUF_TG != 0), здесь, в
+     * кэше, исполняется НАСТОЯЩИЙ 1-байтовый доступ по записанному
+     * адресу: фолт в кэше DR транслирует в app-PC эмулируемой
+     * инструкции — SEH (Windows) и сигналы (Linux) приложения работают
+     * как при нативном исполнении. BUF_TG: bit0 = фолт, bit1 = запись
+     * (r10-относительные слоты: в контексте доставки сигнала gs-база
+     * ненадёжна — доступ 0x290 фолтил, r10-носитель жив до (7)).
+     * ОГРАНИЧЕНИЯ: прокси стоит ПОСЛЕ clean call — вне DR-umbrella —
+     * поэтому НИ СТЕКА (красная зона!), ни регистров, кроме rax
+     * (безусловно восстанавливается в (6)), трогать нельзя. Флаги
+     * прокси портит (test/shr) — их восстанавливает безусловный
+     * (6)-рестор из BUF_FLAGS, куда обёртка emu_generic кладёт
+     * app-флаги на каждом вызове. При фолте доставляются флаги после
+     * test/shr — отличие от нативных pre-instruction флагов принято
+     * как ограничение v1 (хендлеры флаги не читают).             */
+    {
+        instr_t *l_end = INSTR_CREATE_label(dc);
+        instr_t *l_read = INSTR_CREATE_label(dc);
+        instr_t *p_movc = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_TG, OPSZ_8));
+        instr_t *p_t0 = INSTR_CREATE_test(
+            dc, opnd_create_reg(DR_REG_RAX), opnd_create_reg(DR_REG_RAX));
+        instr_t *p_jz = INSTR_CREATE_jcc(dc, OP_jz, opnd_create_instr(l_end));
+        instr_t *p_shr = INSTR_CREATE_shr(
+            dc, opnd_create_reg(DR_REG_RAX), OPND_CREATE_INT8(1));
+        instr_t *p_jr = INSTR_CREATE_jcc(dc, OP_jz, opnd_create_instr(l_read));
+        instr_t *p_mova = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
+        instr_t *p_wr = INSTR_CREATE_mov_st(
+            dc, opnd_create_base_disp(DR_REG_RAX, DR_REG_NULL, 0, 0, OPSZ_1),
+            OPND_CREATE_INT8(0));
+        instr_t *p_jmp = INSTR_CREATE_jmp_short(dc, opnd_create_instr(l_end));
+        instr_t *p_rd = INSTR_CREATE_movzx(
+            dc, opnd_create_reg(DR_REG_EAX), opnd_create_base_disp(
+                DR_REG_RAX, DR_REG_NULL, 0, 0, OPSZ_1));
+        instr_t *proxy_ins[] = { p_movc, p_t0, p_jz, p_shr, p_jr,
+                                 p_mova, p_wr, p_jmp, p_rd };
+        for (size_t pi = 0; pi < sizeof(proxy_ins)/sizeof(proxy_ins[0]); pi++)
+            instr_set_translation(proxy_ins[pi], instr_get_app_pc(i));
+        instrlist_preinsert(bb, i, p_movc);
+        instrlist_preinsert(bb, i, p_t0);
+        instrlist_preinsert(bb, i, p_jz);
+        instrlist_preinsert(bb, i, p_shr);
+        instrlist_preinsert(bb, i, p_jr);
+        instrlist_preinsert(bb, i, p_mova);
+        instrlist_preinsert(bb, i, p_wr);
+        instrlist_preinsert(bb, i, p_jmp);
+        instrlist_preinsert(bb, i, l_read);
+        instrlist_preinsert(bb, i, p_rd);
+        instrlist_preinsert(bb, i, l_end);
+    }
+
     /* (6) восстановление: после call-последовательности, до i */
     instr_t *cur = instr_get_prev(i);
     uint32_t gdst = d->gpr_dst;
@@ -335,8 +388,9 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             instrlist_postinsert(bb, cur, z4); cur = z4;
         }
     }
-    /* флаги-результаты */
-    if (d->flags_def) {
+    /* флаги: безусловное восстановление — прокси (5b) мог их портить,
+     * а обёртка emu_generic кладёт app-флаги в BUF_FLAGS на каждом вызове */
+    if (true) {
         instr_t *n1 = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
                                           buf_opnd(BUF_FLAGS, OPSZ_8));
         instr_t *n2 = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
