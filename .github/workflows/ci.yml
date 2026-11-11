@@ -301,17 +301,16 @@ jobs:
           # §7.3: краш 0x71082a06 — ВНУТРИ dynamorio.dll (vsnprintf-подобный
           # код: movb $'d'/$'e' в выходной буфер), ловится как internal crash;
           # VMM-теория опровергнута (-vm_size 1G не меняет ничего).
-          # Это DR-ский internal-problem-report падает при форматировании
-          # на уже испорченном указателе.Witness: лог DR через env
-          # DYNAMORIO_OPTIONS (в обход перехвата -verbose самим drrun).
-          echo "==== 4b/10 DR-verbose→stderr ===="; TMO=300 DYNAMORIO_OPTIONS="-verbose 2 -log_to_stderr" run_case "env DR -verbose 2 -log_to_stderr -- bun --version" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
-          echo "==== 4c/10 DR-logfile ====";        TMO=300 DYNAMORIO_OPTIONS="-verbose 2" run_case "env DR -verbose 2 + logfile -- bun --version" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
-          echo "── хвост DR-логов:"
-          for f in drlog*/*.log drlog* log*/*.log log.* 2>/dev/null; do
-            [ -f "$f" ] || continue
-            echo "── $f ($(wc -l < "$f") строк), последние 40:"
-            tail -40 "$f" | sed 's/^/     /'
+          # Релизный DR не логирует (loglevel — только в DEBUG-сборке).
+          # Краш = fault#1 в DR → репорт → сам репорт падает (порча).
+          # Эксперименты: (а) когда в старте bun; (б) зависят ли от размера BB;
+          # (в) от размера стека DR.
+          for t in 8 16 32 64; do
+            TMO=$t timeout -k 5 $t "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version > bo.txt 2> be.txt || true
+            if grep -q "internal crash" be.txt; then echo "── брекетинг: краш УЖЕ при TMO=${t}s"; break; else echo "── брекетинг: TMO=${t}s — краша нет ($(head -c 60 bo.txt | tr '\r\n' ' '))"; fi
           done
+          echo "==== 4b/10 max_bb_instrs ===="; TMO=200 run_case "drrun -ops max_bb_instrs 64 -- bun --version (маленькие BB)" "$DRRUN" -ops "-max_bb_instrs 64" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 4c/10 stack_size ====";    TMO=200 run_case "drrun -ops stack_size 256K -- bun --version" "$DRRUN" -ops "-stack_size 256K" -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 5/10 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
           echo "==== 6/10 verbose-диагностика ====";   run_case "pass -verbose 3 -target core2 -- bun --version (диагностика зависания)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
@@ -323,6 +322,83 @@ jobs:
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"
           cat "$RES"
           cat "$RES" >> "$GITHUB_STEP_SUMMARY"
+
+  windows-bun-debug:
+    name: "Windows debug-DR — bun под core2 (охота за fault#1)"
+    # Релизный DR не логирует (loglevel — только DEBUG-сборка), а debug-DR
+    # на 900с не дошёл до точки краша. Отдельная джоба с 45-минутным кейсом:
+    # debug DR громко ассертит и логирует причину внутреннего фолта.
+    needs: [windows]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache DynamoRIO
+        id: dr
+        uses: actions/cache@v4
+        with:
+          path: dynamorio
+          key: dr-win-${{ env.DR_VERSION }}
+
+      - name: Download DynamoRIO
+        if: steps.dr.outputs.cache-hit != 'true'
+        run: |
+          URL="https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DR_VERSION}/DynamoRIO-Windows-${DR_VERSION}.zip"
+          for i in 1 2 3 4 5; do
+            echo "попытка $i/5..."
+            if curl -L --fail --retry 3 --retry-all-errors --connect-timeout 30 -o dr.zip "$URL"; then
+              break
+            fi
+            rm -f dr.zip
+            sleep 20
+          done
+          test -s dr.zip || { echo "не удалось скачать DynamoRIO после 5 попыток"; exit 1; }
+          powershell -NoProfile -Command "Expand-Archive -Path dr.zip -DestinationPath . -Force"
+          rm -f dr.zip
+          mv "DynamoRIO-Windows-${DR_VERSION}" dynamorio
+
+      - name: Артефакт (pass.exe + pass_client.dll) от windows-job
+        uses: actions/download-artifact@v4
+        with:
+          name: PASS-win-x64
+
+      - name: Распаковать pass.exe и pass_client.dll
+        run: |
+          powershell -NoProfile -Command "Expand-Archive -Path PASS-win-x64.zip -DestinationPath rel -Force"
+          cp rel/pass.exe rel/pass_client.dll .
+          ls -l pass.exe pass_client.dll
+
+      - name: Bun — download windows-x64
+        timeout-minutes: 5
+        run: |
+          curl -L --fail --retry 3 --connect-timeout 30 -o bunx.zip \
+            "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64.zip"
+          mkdir -p bun-x64
+          powershell -NoProfile -Command "Expand-Archive -Path bunx.zip -DestinationPath bun-x64 -Force"
+          rm -f bunx.zip
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          test -n "$BUN_X64"
+          "$BUN_X64" --version
+
+      - name: debug-DR — bun --version (45 мин)
+        timeout-minutes: 50
+        run: |
+          BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
+          DRRUN="dynamorio/bin64/drrun.exe"
+          echo "старт debug-DR прогона..."
+          rc=0
+          timeout -k 5 2700 "$DRRUN" -debug -c pass_client.dll -target core2 -- "$BUN_X64" --version > dbg_out.txt 2> dbg_err.txt || rc=$?
+          echo "rc=$rc"
+          echo "── stderr: последние 60 строк"
+          tail -60 dbg_err.txt | sed 's/^/     /' || true
+          echo "── stdout: $(head -c 200 dbg_out.txt)"
+          echo "── ASSERT/Ошибка в stderr:"
+          grep -iE "assert|internal|error|exception" dbg_err.txt | head -20 || echo "(нет)"
 
   windows-bun-mingw:
     name: Windows (MinGW) — bun.exe под P.A.S.S.
