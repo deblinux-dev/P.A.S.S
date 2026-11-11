@@ -90,16 +90,14 @@ if [ -x t_deadloop ]; then
 fi
 
 echo "── selftest (KAT-батарея)"
-# XFAIL: детерминированный крах в группе FMA — см. docs/ARCHITECTURE.md
-# §7.1 (приоритет v0.3). 8 групп из 9 проходят; крах локализован и
-# изолирован, остальные 15 тестов стабильны. Не фейлит CI, но
-# печатается громко, чтобы не потерять.
+# XFAIL оставлен как предохранитель: после фиксов comis-краша (01c026a)
+# и NDS-алиасинга (v0.3) selftest зелёный 10/10 локально; при регрессе
+# печатается громко, но не фейлит CI.
 if ./selftest_s >/dev/null 2>&1; then
     if run_pass -- ./selftest_s >/dev/null 2>&1 || run_pass -- ./selftest_s >/dev/null 2>&1; then
         ok "selftest"
     else
-        echo "  [XFAIL] selftest (под pass) — известный крах группы FMA,"
-        echo "          см. docs/ARCHITECTURE.md §7.1; не влияет на CI"
+        echo "  [XFAIL] selftest (под pass) — регресс: см. docs/ARCHITECTURE.md §7.3"
     fi
 else bad "selftest (нативно)"; fi
 
