@@ -191,7 +191,8 @@ jobs:
     runs-on: windows-latest
     # Жёсткий потолок job'а: осиротевший зависший bun.exe не должен держать
     # ран бесконечно (step-таймаут не убивает дерево процессов на Windows).
-    timeout-minutes: 30
+    # 60 мин: диагностические кейсы §7.3 имеют TMO=600с.
+    timeout-minutes: 60
     continue-on-error: true   # hang bun — известный класс §7.2; не краснит CI
     defaults:
       run:
@@ -252,9 +253,9 @@ jobs:
           echo "bun x64 и baseline скачаны"
 
       - name: Bun под P.A.S.S. и под чистым DR (10 кейсов)
-        # Итог — в лог, Step Summary и аннотации. Каждый кейс: TERM через 75с,
-        # принудительный KILL ещё через 5с (timeout -k 5 75).
-        timeout-minutes: 22
+        # Итог — в лог, Step Summary и аннотации. Каждый кейс: TERM через 75с
+        # (можно перекрыть env TMO), принудительный KILL ещё через 5с.
+        timeout-minutes: 45
         run: |
           BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
           BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
@@ -267,7 +268,7 @@ jobs:
             name="$1"; shift
             t0=$(date +%s)
             rc=0
-            timeout -k 5 75 "$@" > bun_out.txt 2> bun_err.txt || rc=$?
+            timeout -k 5 "${TMO:-75}" "$@" > bun_out.txt 2> bun_err.txt || rc=$?
             t1=$(date +%s)
             dt=$((t1 - t0))
             out="$(head -c 200 bun_out.txt | tr '\r\n' ' ')"
@@ -297,6 +298,13 @@ jobs:
           echo "==== 2/10 native ====";                run_case "bun -e console.log (нативно, контроль)" "$BUN_X64" -e "console.log('Hello from bun!')"
           echo "==== 3/10 чистый DR ====";             run_case "drrun без клиента -- bun --version (контроль §7.2)" "$DRRUN" -- "$BUN_X64" --version
           echo "==== 4/10 client, native target ===="; run_case "pass -target native -- bun --version (DR+клиент, без переписывания)" ./pass.exe -target native -- "$BUN_X64" --version
+          # §7.3: краш 0x71082a06 — внутри warning-пути DR при исчерпании
+          # VMM-резерва (512М на Windows x64; строки «Out of contiguous
+          # memory» / «thrashing on low virtual memory» рядом с PC 0x82a06).
+          # Эксперимент: VMM 1G и более агрессивный reset кэша.
+          echo "==== 4b/10 vm_size 1G ====";             TMO=600 run_case "drrun -vm_size 1G -target core2 -- bun --version (VMM 512М→1G)" "$DRRUN" -vm_size 1G -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 4c/10 vm_size 1G + reset 30% ===="; TMO=600 run_case "drrun -vm_size 1G -reset_at_vmm_percent_free_limit 30 -- bun --version" "$DRRUN" -vm_size 1G -reset_at_vmm_percent_free_limit 30 -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 4d/10 базовый VMM, контроль скорости ===="; TMO=600 run_case "drrun -c pass_client.dll -target core2 -- bun --version (без опций, 600с)" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 5/10 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
           echo "==== 6/10 verbose-диагностика ====";   run_case "pass -verbose 3 -target core2 -- bun --version (диагностика зависания)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
