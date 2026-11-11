@@ -301,10 +301,17 @@ jobs:
           # §7.3: краш 0x71082a06 — ВНУТРИ dynamorio.dll (vsnprintf-подобный
           # код: movb $'d'/$'e' в выходной буфер), ловится как internal crash;
           # VMM-теория опровергнута (-vm_size 1G не меняет ничего).
-          # Это DR-ский internal-problem-report падает при форматировании.
-          # Эксперимент: debug-сборка DR (громкие ASSERT'ы) + DR-verbose.
-          echo "==== 4b/10 debug DR ====";     TMO=900 run_case "drrun -debug -target core2 -- bun --version (ASSERT'ы DR)" "$DRRUN" -debug -c pass_client.dll -target core2 -- "$BUN_X64" --version
-          echo "==== 4c/10 DR-verbose ====";   TMO=600 run_case "drrun -verbose 2 -target core2 -- bun --version (лог DR)" "$DRRUN" -verbose 2 -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          # Это DR-ский internal-problem-report падает при форматировании
+          # на уже испорченном указателе.Witness: лог DR через env
+          # DYNAMORIO_OPTIONS (в обход перехвата -verbose самим drrun).
+          echo "==== 4b/10 DR-verbose→stderr ===="; TMO=300 DYNAMORIO_OPTIONS="-verbose 2 -log_to_stderr" run_case "env DR -verbose 2 -log_to_stderr -- bun --version" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 4c/10 DR-logfile ====";        TMO=300 DYNAMORIO_OPTIONS="-verbose 2" run_case "env DR -verbose 2 + logfile -- bun --version" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "── хвост DR-логов:"
+          for f in drlog*/*.log drlog* log*/*.log log.* 2>/dev/null; do
+            [ -f "$f" ] || continue
+            echo "── $f ($(wc -l < "$f") строк), последние 40:"
+            tail -40 "$f" | sed 's/^/     /'
+          done
           echo "==== 5/10 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
           echo "==== 6/10 verbose-диагностика ====";   run_case "pass -verbose 3 -target core2 -- bun --version (диагностика зависания)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
