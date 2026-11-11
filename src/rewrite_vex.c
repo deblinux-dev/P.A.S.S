@@ -203,6 +203,24 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         }
     }
 
+    /* §7.3 (NDS-алиасинг 128): rm-операнд (s2) может СОВПАДАТЬ с dst при
+     * vvvv != dst — vpxor xmm0, xmm1, xmm0 (обычная кодировка gcc для
+     * va ^= vb в векторизованных циклах). Последовательность VF_NDS —
+     * «movaps dst←s1 ; легаси dst←dst op s2» — затирает исходное значение
+     * s2 первым же movaps: va^vb превращалось в 0 (срыв KAT selftest/
+     * aesenc и любых зависимых цепочек). rewrite_256 этот класс уже
+     * стадирует (БАГ v0.1, «алиасинг dst == src»), 128-путь — нет.
+     * Фикс: стадировать исходный s2 в RAW_T0 ДО movaps. С mem-стадией
+     * не пересекается: s2 либо рег (здесь), либо mem (stage_mem выше). */
+    if ((e->form == VF_NDS || e->form == VF_SHIFT) &&
+        opnd_is_reg(s2) && opnd_is_reg(d0) &&
+        opnd_get_reg(s2) == opnd_get_reg(d0)) {
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, raw_opnd(RAW_T0, OPSZ_16),
+            opnd_create_reg(opnd_get_reg(s2))));
+        s2eff = raw_opnd(RAW_T0, OPSZ_16);
+    }
+
     switch (e->form) {
     case VF_DIR:
         if ((e->vex_op == OP_vmovd || e->vex_op == OP_vmovq) &&

@@ -1347,6 +1347,46 @@ int emu_generic(emu_desc_t *d)
         PASS_ATOMIC_INC32(&g_stat_generic[d->opc]);
     }
     PASS_ATOMIC_INC32(&g_dyn_generic);
+    /* §7.3 diag (PASS_CMPBUF=1): сверить спилы в BUF с фактическим
+     * контекстом приложения. Спилы-инструкции вставлены ДО clean call
+     * и регистров не меняют, поэтому app-контекст (сохранённый DR-шным
+     * прологом clean call при save_fpstate=true) обязан совпадать с
+     * BUF. Расхождение = спил не достиг буфера (carrier-десинк) или
+     * ушёл мимо BUF. Сравниваем только спиленные слоты: при fp=false
+     * mc.simd невалиден.                                                  */
+    {
+        static int cmpbuf = -1;
+        if (cmpbuf == -1)
+            cmpbuf = (getenv("PASS_CMPBUF") != NULL) ? 1 : 0;
+        if (cmpbuf && (d->xmm_src | d->xmm_dst) != 0) {
+            dr_mcontext_t mc;
+            memset(&mc, 0, sizeof(mc));
+            mc.size = sizeof(mc);
+            mc.flags = (dr_mcontext_flags_t)DR_MC_ALL;
+            if (dr_get_mcontext(dc, &mc)) {
+                for (int k = 0; k < 16; k++) {
+                    if (!((d->xmm_src | d->xmm_dst) & (1u << k))) continue;
+                    if (memcmp(st.buf + BUF_XMM(k), &mc.simd[k], 16) != 0) {
+                        const uint8_t *bv = st.buf + BUF_XMM(k);
+                        const uint8_t *mv = (const uint8_t *)&mc.simd[k];
+                        dr_fprintf(STDERR,
+                                   "[CMPBUF] opc=%d MISMATCH xmm%d\n"
+                                   "  BUF: %02x%02x%02x%02x%02x%02x%02x%02x"
+                                   "%02x%02x%02x%02x%02x%02x%02x%02x\n"
+                                   "  MC : %02x%02x%02x%02x%02x%02x%02x%02x"
+                                   "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                   d->opc, k,
+                                   bv[0], bv[1], bv[2], bv[3], bv[4], bv[5],
+                                   bv[6], bv[7], bv[8], bv[9], bv[10], bv[11],
+                                   bv[12], bv[13], bv[14], bv[15],
+                                   mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
+                                   mv[6], mv[7], mv[8], mv[9], mv[10], mv[11],
+                                   mv[12], mv[13], mv[14], mv[15]);
+                    }
+                }
+            }
+        }
+    }
     /* §6.24: прогресс-счётчик — отличить «медленно, но работает» от
      * бесконечного цикла: растёт — идёт работа, стоит — зацикливание */
     if (g_cfg.verbose >= 1 && (g_dyn_generic % 500000) == 0)
