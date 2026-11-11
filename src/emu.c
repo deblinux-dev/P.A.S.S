@@ -1412,9 +1412,11 @@ int emu_generic(emu_desc_t *d)
         dr_mcontext_t mc0;
         memset(&mc0, 0, sizeof(mc0));
         mc0.size = sizeof(mc0);
-        mc0.flags = DR_MC_CONTROL;
-        if (buf0 != NULL && dr_get_mcontext(dc0, &mc0))
+        mc0.flags = DR_MC_INTEGER | DR_MC_CONTROL;
+        if (buf0 != NULL && dr_get_mcontext(dc0, &mc0)) {
             *(uint32_t *)(buf0 + BUF_FLAGS) = (uint32_t)mc0.xflags;
+            *(uint64_t *)(buf0 + BUF_R10) = (uint64_t)mc0.r10;
+        }
     }
     if (setjmp(g_emu_jmp) != 0)
         return 1;              /* фолт записан — эмуляция прервана */

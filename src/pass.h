@@ -139,7 +139,8 @@ extern uint32_t g_stat_bbs;
 #define BUF_TG      440u               /* §7.3: код фолта generic-пути
                                           (bit0=фолт, bit1=запись)   */
 #define BUF_FAULT   448u               /* адрес недоступной памяти   */
-#define BUF_SIZE    456u
+#define BUF_R10     456u               /* app-значение r10 (обёртка) */
+#define BUF_SIZE    464u
 
 /* Индексы регистров (xmm_idx принимает и XMM, и YMM; gpr_idx
  * нормализует любой ширинный GPR — EAX/AX/AL → RAX)               */

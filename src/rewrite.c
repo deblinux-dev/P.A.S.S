@@ -311,6 +311,10 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     {
         instr_t *l_end = INSTR_CREATE_label(dc);
         instr_t *l_read = INSTR_CREATE_label(dc);
+        /* фолт-путь восстанавливает КОНТЕКСТ ПРИЛОЖЕНИЯ (флаги, rax,
+         * r10 из BUF — туда их кладёт обёртка) ДО настоящего доступа:
+         * доставленный хендлеру контекст отличается от нативного одним
+         * регистром-throwaway (r10 = адрес фолта / прочитанный байт). */
         instr_t *p_movc = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_TG, OPSZ_8));
         instr_t *p_t0 = INSTR_CREATE_test(
@@ -319,17 +323,44 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instr_t *p_shr = INSTR_CREATE_shr(
             dc, opnd_create_reg(DR_REG_RAX), OPND_CREATE_INT8(1));
         instr_t *p_jr = INSTR_CREATE_jcc(dc, OP_jz, opnd_create_instr(l_read));
-        instr_t *p_mova = INSTR_CREATE_mov_ld(
+        /* WRITE-путь */
+        instr_t *p_wfa = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
-        instr_t *p_wr = INSTR_CREATE_mov_st(
-            dc, opnd_create_base_disp(DR_REG_RAX, DR_REG_NULL, 0, 0, OPSZ_1),
+        instr_t *p_wpush = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
+        instr_t *p_wfl = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *p_wpushf = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
+        instr_t *p_wpopf = INSTR_CREATE_popf(dc);
+        instr_t *p_wrax = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_GPR(0), OPSZ_8));
+        instr_t *p_wr10 = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_R10, OPSZ_8));
+        instr_t *p_wpop = INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_R10));
+        instr_t *p_wacc = INSTR_CREATE_mov_st(
+            dc, opnd_create_base_disp(DR_REG_R10, DR_REG_NULL, 0, 0, OPSZ_1),
             OPND_CREATE_INT8(0));
-        instr_t *p_jmp = INSTR_CREATE_jmp_short(dc, opnd_create_instr(l_end));
-        instr_t *p_rd = INSTR_CREATE_movzx(
-            dc, opnd_create_reg(DR_REG_EAX), opnd_create_base_disp(
+        instr_t *p_wjmp = INSTR_CREATE_jmp_short(dc, opnd_create_instr(l_end));
+        /* READ-путь */
+        instr_t *p_rfa = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
+        instr_t *p_rpush = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
+        instr_t *p_rfl = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *p_rpushf = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
+        instr_t *p_rpopf = INSTR_CREATE_popf(dc);
+        instr_t *p_rrax = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_GPR(0), OPSZ_8));
+        instr_t *p_rr10 = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_R10, OPSZ_8));
+        instr_t *p_rpop = INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_R10));
+        instr_t *p_racc = INSTR_CREATE_movzx(
+            dc, opnd_create_reg(DR_REG_R10D), opnd_create_base_disp(
                 DR_REG_RAX, DR_REG_NULL, 0, 0, OPSZ_1));
         instr_t *proxy_ins[] = { p_movc, p_t0, p_jz, p_shr, p_jr,
-                                 p_mova, p_wr, p_jmp, p_rd };
+                                 p_wfa, p_wpush, p_wfl, p_wpushf, p_wpopf,
+                                 p_wrax, p_wr10, p_wpop, p_wacc, p_wjmp,
+                                 p_rfa, p_rpush, p_rfl, p_rpushf, p_rpopf,
+                                 p_rrax, p_rr10, p_rpop, p_racc };
         for (size_t pi = 0; pi < sizeof(proxy_ins)/sizeof(proxy_ins[0]); pi++)
             instr_set_translation(proxy_ins[pi], instr_get_app_pc(i));
         instrlist_preinsert(bb, i, p_movc);
@@ -337,11 +368,26 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instrlist_preinsert(bb, i, p_jz);
         instrlist_preinsert(bb, i, p_shr);
         instrlist_preinsert(bb, i, p_jr);
-        instrlist_preinsert(bb, i, p_mova);
-        instrlist_preinsert(bb, i, p_wr);
-        instrlist_preinsert(bb, i, p_jmp);
+        instrlist_preinsert(bb, i, p_wfa);
+        instrlist_preinsert(bb, i, p_wpush);
+        instrlist_preinsert(bb, i, p_wfl);
+        instrlist_preinsert(bb, i, p_wpushf);
+        instrlist_preinsert(bb, i, p_wpopf);
+        instrlist_preinsert(bb, i, p_wrax);
+        instrlist_preinsert(bb, i, p_wr10);
+        instrlist_preinsert(bb, i, p_wpop);
+        instrlist_preinsert(bb, i, p_wacc);
+        instrlist_preinsert(bb, i, p_wjmp);
         instrlist_preinsert(bb, i, l_read);
-        instrlist_preinsert(bb, i, p_rd);
+        instrlist_preinsert(bb, i, p_rfa);
+        instrlist_preinsert(bb, i, p_rpush);
+        instrlist_preinsert(bb, i, p_rfl);
+        instrlist_preinsert(bb, i, p_rpushf);
+        instrlist_preinsert(bb, i, p_rpopf);
+        instrlist_preinsert(bb, i, p_rrax);
+        instrlist_preinsert(bb, i, p_rr10);
+        instrlist_preinsert(bb, i, p_rpop);
+        instrlist_preinsert(bb, i, p_racc);
         instrlist_preinsert(bb, i, l_end);
     }
 
