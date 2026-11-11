@@ -298,13 +298,13 @@ jobs:
           echo "==== 2/10 native ====";                run_case "bun -e console.log (нативно, контроль)" "$BUN_X64" -e "console.log('Hello from bun!')"
           echo "==== 3/10 чистый DR ====";             run_case "drrun без клиента -- bun --version (контроль §7.2)" "$DRRUN" -- "$BUN_X64" --version
           echo "==== 4/10 client, native target ===="; run_case "pass -target native -- bun --version (DR+клиент, без переписывания)" ./pass.exe -target native -- "$BUN_X64" --version
-          # §7.3: краш 0x71082a06 — внутри warning-пути DR при исчерпании
-          # VMM-резерва (512М на Windows x64; строки «Out of contiguous
-          # memory» / «thrashing on low virtual memory» рядом с PC 0x82a06).
-          # Эксперимент: VMM 1G и более агрессивный reset кэша.
-          echo "==== 4b/10 vm_size 1G ====";             TMO=600 run_case "drrun -vm_size 1G -target core2 -- bun --version (VMM 512М→1G)" "$DRRUN" -vm_size 1G -c pass_client.dll -target core2 -- "$BUN_X64" --version
-          echo "==== 4c/10 vm_size 1G + reset 30% ===="; TMO=600 run_case "drrun -vm_size 1G -reset_at_vmm_percent_free_limit 30 -- bun --version" "$DRRUN" -vm_size 1G -reset_at_vmm_percent_free_limit 30 -c pass_client.dll -target core2 -- "$BUN_X64" --version
-          echo "==== 4d/10 базовый VMM, контроль скорости ===="; TMO=600 run_case "drrun -c pass_client.dll -target core2 -- bun --version (без опций, 600с)" "$DRRUN" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          # §7.3: краш 0x71082a06 — ВНУТРИ dynamorio.dll (vsnprintf-подобный
+          # код: movb $'d'/$'e' в выходной буфер), ловится как internal crash;
+          # VMM-теория опровергнута (-vm_size 1G не меняет ничего).
+          # Это DR-ский internal-problem-report падает при форматировании.
+          # Эксперимент: debug-сборка DR (громкие ASSERT'ы) + DR-verbose.
+          echo "==== 4b/10 debug DR ====";     TMO=900 run_case "drrun -debug -target core2 -- bun --version (ASSERT'ы DR)" "$DRRUN" -debug -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 4c/10 DR-verbose ====";   TMO=600 run_case "drrun -verbose 2 -target core2 -- bun --version (лог DR)" "$DRRUN" -verbose 2 -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 5/10 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
           echo "==== 6/10 verbose-диагностика ====";   run_case "pass -verbose 3 -target core2 -- bun --version (диагностика зависания)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
