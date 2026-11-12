@@ -8,6 +8,15 @@
  * через x87.                                                 */
 #include "pass.h"
 #include <setjmp.h>
+#ifdef _MSC_VER
+/* §7.3: MSVC setjmp регистрирует EH-фрейм в SEH-цепочке потока; под
+ * DR clean call контекст нестандартен — любой exception во время
+ * эмуляции шёл в НАШ фильтр (client RVA 0x245eb, cmp 0xE06D7363) и
+ * падал в нём (internal crash без [EXC]). _setjmp не регистрирует
+ * EH-фрейм — longjmp совместим. */
+# undef setjmp
+# define setjmp _setjmp
+#endif
 #include <math.h>
 
 typedef struct {
