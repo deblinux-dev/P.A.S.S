@@ -312,7 +312,7 @@ jobs:
           echo "==== 4b/10 max_bb_instrs ===="; TMO=200 run_case "drrun -ops max_bb_instrs 64 -- bun --version (маленькие BB)" "$DRRUN" -ops "-max_bb_instrs 64" -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 4c/10 stack_size ====";    TMO=200 run_case "drrun -ops stack_size 256K -- bun --version" "$DRRUN" -ops "-stack_size 256K" -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 5/10 полный P.A.S.S. ====";       run_case "pass -target core2 -- bun --version"    ./pass.exe -target core2 -- "$BUN_X64" --version
-          echo "==== 6/10 verbose-диагностика ====";   PASS_EXCLOG=1 run_case "pass -verbose 3 -target core2 -- bun --version (поток исключений)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
+          echo "==== 6/10 verbose-диагностика ====";   PASS_EXCLOG=1 PASS_SEGVDUMP=1 run_case "pass -verbose 3 -target core2 -- bun --version (поток исключений)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
           echo "==== 8/10 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) --version" ./pass.exe -target core2 -- "$BUN_BASE" --version
           echo "==== 9/10 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) -e 'Hello!'" ./pass.exe -target core2 -- "$BUN_BASE" -e "console.log('Hello from P.A.S.S. baseline!')"
