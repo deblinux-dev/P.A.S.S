@@ -150,19 +150,23 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_fprintf(STDERR, "[P.A.S.S.] client base " PIFX "\n",
                (ptr_uint_t)dr_get_client_base(id));
 #ifdef WINDOWS
-    /* §7.3: карта модулей для адресов рерайтов (bun под core2:
-     * opc=675/662 @ 0x7ff7...d52/d56 — какой модуль?) */
+    /* §7.3: карта модулей в ФАЙЛ рядом с клиентом (stderr-хвост 200Б
+     * её затирает): rерайты opc=675/662 @ 0x7ff7...d52/d56 — чей код? */
     {
-        dr_module_iterator_t *mi = dr_module_iterator_start();
-        while (dr_module_iterator_hasnext(mi)) {
-            module_data_t *md = dr_module_iterator_next(mi);
-            dr_fprintf(STDERR, "[MOD] " PIFX ".." PIFX " %s\n",
-                       (ptr_uint_t)md->start, (ptr_uint_t)md->end,
-                       dr_module_preferred_name(md) != NULL
-                           ? dr_module_preferred_name(md) : "?");
-            dr_free_module_data(md);
+        file_t f = dr_open_file("modmap.txt", DR_FILE_WRITE_OVERWRITE);
+        if (f != INVALID_FILE) {
+            dr_module_iterator_t *mi = dr_module_iterator_start();
+            while (dr_module_iterator_hasnext(mi)) {
+                module_data_t *md = dr_module_iterator_next(mi);
+                dr_fprintf(f, "[MOD] " PIFX ".." PIFX " %s\n",
+                           (ptr_uint_t)md->start, (ptr_uint_t)md->end,
+                           dr_module_preferred_name(md) != NULL
+                               ? dr_module_preferred_name(md) : "?");
+                dr_free_module_data(md);
+            }
+            dr_module_iterator_stop(mi);
+            dr_close_file(f);
         }
-        dr_module_iterator_stop(mi);
     }
 #endif
     (void)id;
