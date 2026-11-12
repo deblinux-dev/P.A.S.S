@@ -1418,8 +1418,18 @@ int emu_generic(emu_desc_t *d)
             *(uint64_t *)(buf0 + BUF_R10) = (uint64_t)mc0.r10;
         }
     }
-    if (setjmp(g_emu_jmp) != 0)
-        return 1;              /* фолт записан — эмуляция прервана */
+    if (setjmp(g_emu_jmp) != 0) {
+        /* фолт записан — эмуляция прервана, доставит прокси */
+        static volatile int exclog = -1;
+        if (exclog == -1)
+            exclog = (getenv("PASS_EXCLOG") != NULL) ? 1 : 0;
+        if (exclog)
+            dr_fprintf(STDERR, "[EMUFLT] opc=%d addr=" PIFX " w=%d\n",
+                       d->opc,
+                       (ptr_uint_t)*(uint64_t *)(buf0 + BUF_FAULT),
+                       (int)(*(uint64_t *)(buf0 + BUF_TG) >> 1));
+        return 1;
+    }
     return emu_generic_impl(d);
 }
 

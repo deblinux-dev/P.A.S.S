@@ -220,6 +220,22 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
 {
     if (exc == NULL || exc->mcontext == NULL)
         return false;
+    {
+        static volatile int exclog = -1;
+        if (exclog == -1)
+            exclog = (getenv("PASS_EXCLOG") != NULL) ? 1 : 0;
+        if (exclog && exc->record != NULL)
+            dr_fprintf(STDERR,
+                       "[EXC] code=0x%08x addr=" PIFX " rawpc=" PIFX
+                       " apppc=" PIFX "\n",
+                       (unsigned)exc->record->ExceptionCode,
+                       (exc->record->ExceptionCode == 0xC0000005 &&
+                        exc->record->NumberParameters >= 2)
+                           ? (ptr_uint_t)exc->record->ExceptionInformation[1]
+                           : 0,
+                       (ptr_uint_t)exc->raw_mcontext->pc,
+                       (ptr_uint_t)exc->mcontext->pc);
+    }
     if (exc->record == NULL ||
         exc->record->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
         return false;
