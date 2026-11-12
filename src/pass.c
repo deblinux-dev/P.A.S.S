@@ -164,6 +164,16 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
         }
     }
 #endif
+#else
+    {
+        const char *sv = getenv("PASS_SEGVDUMP");
+        if (sv != NULL) {
+            extern void pass_veh_install(void *, size_t);
+            /* размер .text: грубо 0x30000 (клиент ~150К кода) */
+            pass_veh_install((void *)dr_get_client_base(id), 0x30000);
+        }
+    }
+#endif
 
     memset(&g_cfg, 0, sizeof(g_cfg));
     parse_options(argc, argv);

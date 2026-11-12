@@ -83,3 +83,44 @@ void pass_segv_dump_install(void)
     sigaction(SIGBUS, &sa, NULL);
 }
 #endif /* LINUX */
+
+/* ════════ Windows: VEH-лог исключений в клиентском модуле ════════
+ * §7.3: фатальный фолт при bun происходит в КОДЕ КЛИЕНТА (RVA
+ * 0x245eb), DR классифицирует его как internal crash и исключение
+ * до dr_exception_event не доходит. VEH с первым приоритетом видит
+ * КАЖДОЕ исключение до DR-хендлера; логируем только те, чей rip
+ * внутри клиентского модуля (остальные — служебные DR, их тысячи). */
+#ifdef WINDOWS
+#include <windows.h>
+
+static void *veh_client_lo, *veh_client_hi;
+
+static long NTAPI veh_log(PEXCEPTION_POINTERS ep)
+{
+    if (ep == NULL || ep->ExceptionRecord == NULL ||
+        ep->ContextRecord == NULL)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    if (rip < (uintptr_t)veh_client_lo || rip >= (uintptr_t)veh_client_hi)
+        return EXCEPTION_CONTINUE_SEARCH;
+    dr_fprintf(STDERR, "[VEH] code=0x%08x rip-rva=" PIFX " access=" PIFX
+               " rsp=" PIFX "\n",
+               (unsigned)ep->ExceptionRecord->ExceptionCode,
+               rip - (uintptr_t)veh_client_lo,
+               (ep->ExceptionRecord->ExceptionCode == 0xC0000005 &&
+                ep->ExceptionRecord->NumberParameters >= 2)
+                   ? (ptr_uint_t)ep->ExceptionRecord->ExceptionInformation[1]
+                   : 0,
+               (ptr_uint_t)ep->ContextRecord->Rsp);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void pass_veh_install(void *client_base, size_t client_size)
+{
+    veh_client_lo = client_base;
+    veh_client_hi = (char *)client_base + client_size;
+    AddVectoredExceptionHandler(1, veh_log);
+    dr_fprintf(STDERR, "[P.A.S.S.] VEH installed: client " PIFX ".." PIFX "\n",
+               (ptr_uint_t)veh_client_lo, (ptr_uint_t)veh_client_hi);
+}
+#endif
