@@ -163,7 +163,6 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
             pass_segv_dump_install();
         }
     }
-#endif
 #else
     {
         const char *sv = getenv("PASS_SEGVDUMP");
