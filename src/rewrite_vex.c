@@ -80,7 +80,10 @@ static const vex_map_ent_t vex_map[] = {
     E(vdivss, divss, VF_NDS, F_AVX), E(vdivsd, divsd, VF_NDS, F_AVX),
     E(vminss, minss, VF_NDS, F_AVX), E(vminsd, minsd, VF_NDS, F_AVX),
     E(vmaxss, maxss, VF_NDS, F_AVX), E(vmaxsd, maxsd, VF_NDS, F_AVX),
-    E(vcmpss, cmpss, VF_NDS, F_AVX), E(vcmpsd, cmpsd, VF_NDS, F_AVX),
+    /* §7.3: vcmps* убраны из inline-карты — создание legacy OP_cmpsd
+     * через instr_create_1dst_2src даёт некодируемую инструкцию
+     * (краш эмиссии, bbC/bbE репродукторы); generic-путь корректен */
+    /* E(vcmpss, cmpss, VF_NDS, F_AVX), E(vcmpsd, cmpsd, VF_NDS, F_AVX),
     E(vsqrtss, sqrtss, VF_NDS, F_AVX), E(vsqrtsd, sqrtsd, VF_NDS, F_AVX),
     E(vrsqrtss, rsqrtss, VF_NDS, F_AVX), E(vrcpss, rcpss, VF_NDS, F_AVX),
     E(vcvtsi2ss, cvtsi2ss, VF_NDS, F_AVX), E(vcvtsi2sd, cvtsi2sd, VF_NDS, F_AVX),

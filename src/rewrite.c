@@ -298,23 +298,17 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
      * адресу: фолт в кэше DR транслирует в app-PC эмулируемой
      * инструкции — SEH (Windows) и сигналы (Linux) приложения работают
      * как при нативном исполнении. BUF_TG: bit0 = фолт, bit1 = запись
-     * (r10-относительные слоты: в контексте доставки сигнала gs-база
-     * ненадёжна — доступ 0x290 фолтил, r10-носитель жив до (7)).
-     * ОГРАНИЧЕНИЯ: прокси стоит ПОСЛЕ clean call — вне DR-umbrella —
-     * поэтому НИ СТЕКА (красная зона!), ни регистров, кроме rax
-     * (безусловно восстанавливается в (6)), трогать нельзя. Флаги
-     * прокси портит (test/shr) — их восстанавливает безусловный
-     * (6)-рестор из BUF_FLAGS, куда обёртка emu_generic кладёт
-     * app-флаги на каждом вызове. При фолте доставляются флаги после
-     * test/shr — отличие от нативных pre-instruction флагов принято
-     * как ограничение v1 (хендлеры флаги не читают).             */
+     * (r10-относительные слоты: gs-база в контексте доставки сигнала
+     * ненадёжен). Фолт-путь восстанавливает КОНТЕКСТ ПРИЛОЖЕНИЯ
+     * (флаги/rax/r10 из BUF_FLAGS/BUF_GPR(0)/BUF_R10 — их кладёт
+     * обёртка emu_generic) ДО настоящего доступа; доставленный
+     * контекст отличается от нативного одним регистром-throwaway
+     * (r10 = адрес фолта / прочитанный байт). Прокси идёт ПОСЛЕ
+     * clean call — вне DR-umbrella — rax кlobber'ится осознанно
+     * (восстанавливается в (6)), флаги чинит безусловный (6)-рестор. */
     {
         instr_t *l_end = INSTR_CREATE_label(dc);
         instr_t *l_read = INSTR_CREATE_label(dc);
-        /* фолт-путь восстанавливает КОНТЕКСТ ПРИЛОЖЕНИЯ (флаги, rax,
-         * r10 из BUF — туда их кладёт обёртка) ДО настоящего доступа:
-         * доставленный хендлеру контекст отличается от нативного одним
-         * регистром-throwaway (r10 = адрес фолта / прочитанный байт). */
         instr_t *p_movc = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_TG, OPSZ_8));
         instr_t *p_t0 = INSTR_CREATE_test(
@@ -379,14 +373,6 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instrlist_preinsert(bb, i, p_wacc);
         instrlist_preinsert(bb, i, p_wjmp);
         instrlist_preinsert(bb, i, l_read);
-        instrlist_preinsert(bb, i, p_rfa);
-        instrlist_preinsert(bb, i, p_rpush);
-        instrlist_preinsert(bb, i, p_rfl);
-        instrlist_preinsert(bb, i, p_rpushf);
-        instrlist_preinsert(bb, i, p_rpopf);
-        instrlist_preinsert(bb, i, p_rrax);
-        instrlist_preinsert(bb, i, p_rr10);
-        instrlist_preinsert(bb, i, p_rpop);
         instrlist_preinsert(bb, i, p_racc);
         instrlist_preinsert(bb, i, l_end);
     }

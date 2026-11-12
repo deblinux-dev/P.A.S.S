@@ -149,6 +149,20 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
     dr_fprintf(STDERR, "[P.A.S.S.] client base " PIFX "\n",
                (ptr_uint_t)dr_get_client_base(id));
+#ifdef LINUX
+    /* §7.3: DR загружен кастомным лоадером (анонимно в maps) — печатаем
+     * все exec-регионы для привязки crash PC к rva libdynamorio */
+    {
+        FILE *mf = fopen("/proc/self/maps", "r");
+        if (mf != NULL) {
+            char line[512];
+            while (fgets(line, sizeof(line), mf) != NULL)
+                if (strstr(line, "r-xp") != NULL)
+                    dr_fprintf(STDERR, "[MAP] %s", line);
+            fclose(mf);
+        }
+    }
+#endif
 #ifdef WINDOWS
     /* §7.3: карта модулей в ФАЙЛ рядом с клиентом (stderr-хвост 200Б
      * её затирает): rерайты opc=675/662 @ 0x7ff7...d52/d56 — чей код? */
