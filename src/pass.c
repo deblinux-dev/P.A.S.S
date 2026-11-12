@@ -147,6 +147,9 @@ static void pass_exit(void)
 DR_EXPORT
 void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
+    dr_fprintf(STDERR, "[P.A.S.S.] client base " PIFX "\n",
+               (ptr_uint_t)dr_get_client_base(id));
+{
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
     dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2003\n");
