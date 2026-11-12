@@ -8,15 +8,15 @@
  * через x87.                                                 */
 #include "pass.h"
 #include <setjmp.h>
-#ifdef _MSC_VER
-/* §7.3: MSVC setjmp регистрирует EH-фрейм в SEH-цепочке потока; под
- * DR clean call контекст нестандартен — любой exception во время
- * эмуляции шёл в НАШ фильтр (client RVA 0x245eb, cmp 0xE06D7363) и
- * падал в нём (internal crash без [EXC]). _setjmp не регистрирует
- * EH-фрейм — longjmp совместим. */
-# undef setjmp
-# define setjmp _setjmp
-#endif
+/* §7.3: setjmp/longjmp НА WINDOWS УДАЛЕНЫ. MSVC x64 ЛЮБОЙ setjmp
+ * (включая _setjmp) строится на SEH-фреймворке (0x19930522-магия,
+ * client RVA 0x2470b); под DR clean call регистрация EH-фрейма в
+ * нестандартном контексте отравляет SEH-цепочку потока — первый же
+ * exception идёт в наш фильтр и падает в нём (internal crash без
+ * [EXC]). Альтернатива — abort БЕЗ unwind: emu_safe_* при неудаче
+ * лишь ЗАПИСЫВАЮТ фолт (первый выигрывает) и продолжают: дальнейшие
+ * доступы тоже safe (фолтов больше нет), мусор в BUF отбрасывается
+ * прокси-путём доставки. Linux-сборка использует тот же механизм. */
 #include <math.h>
 
 typedef struct {
@@ -117,23 +117,17 @@ static byte *mem_addr(estate_t *st, opnd_t op)
  * реальному адресу уже в кэше (rewrite.c): фолт в кэше DR транслирует
  * в app-PC инструкции — SEH/сигналы работают как нативно. Inline-путь
  * прозрачен изначально (там реальные инструкции).                 */
-#ifdef _MSC_VER
-# define PASS_TLS __declspec(thread)
-#else
-# define PASS_TLS __thread
-#endif
-static PASS_TLS jmp_buf g_emu_jmp;
 static int emu_generic_impl(emu_desc_t *d);
 
 static void emu_fault_record(estate_t *st, byte *addr, int is_write)
 {
     /* §7.3: слоты в BUF (r10-относительные), а не в RAW (gs): в контексте
-     * доставки сигнала gs-база ненадёжна, а r10-носитель жив до (7). */
-    if (st->buf != NULL) {
+     * доставки сигнала gs-база ненадёжна, а r10-носитель жив до (7).
+     * Записывается ПЕРВЫЙ фолт (BUF_TG==0); без longjmp — см. шапку. */
+    if (st->buf != NULL && *(uint64_t *)(st->buf + BUF_TG) == 0) {
         *(uint64_t *)(st->buf + BUF_TG) = 1u | ((uint64_t)(is_write & 1) << 1);
         *(uint64_t *)(st->buf + BUF_FAULT) = (uint64_t)(uintptr_t)addr;
     }
-    longjmp(g_emu_jmp, 1);
 }
 
 static void emu_safe_read(estate_t *st, void *src, void *dst, size_t n)
@@ -1427,19 +1421,14 @@ int emu_generic(emu_desc_t *d)
             *(uint64_t *)(buf0 + BUF_R10) = (uint64_t)mc0.r10;
         }
     }
-    if (setjmp(g_emu_jmp) != 0) {
-        /* фолт записан — эмуляция прервана, доставит прокси */
-        static volatile int exclog = -1;
-        if (exclog == -1)
-            exclog = (getenv("PASS_EXCLOG") != NULL) ? 1 : 0;
-        if (exclog)
-            dr_fprintf(STDERR, "[EMUFLT] opc=%d addr=" PIFX " w=%d\n",
-                       d->opc,
-                       (ptr_uint_t)*(uint64_t *)(buf0 + BUF_FAULT),
-                       (int)(*(uint64_t *)(buf0 + BUF_TG) >> 1));
-        return 1;
-    }
-    return emu_generic_impl(d);
+    int rc = emu_generic_impl(d);
+    if (getenv("PASS_EXCLOG") != NULL && buf0 != NULL &&
+        *(uint64_t *)(buf0 + BUF_TG) != 0)
+        dr_fprintf(STDERR, "[EMUFLT] opc=%d addr=" PIFX " w=%d\n",
+                   d->opc,
+                   (ptr_uint_t)*(uint64_t *)(buf0 + BUF_FAULT),
+                   (int)(*(uint64_t *)(buf0 + BUF_TG) >> 1));
+    return rc;
 }
 
 int emu_generic_impl(emu_desc_t *d)
