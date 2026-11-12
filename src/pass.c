@@ -165,12 +165,11 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     }
 #else
     {
-        const char *sv = getenv("PASS_SEGVDUMP");
-        if (sv != NULL) {
-            extern void pass_veh_install(void *, size_t);
-            /* размер .text: грубо 0x30000 (клиент ~150К кода) */
-            pass_veh_install((void *)dr_get_client_base(id), 0x30000);
-        }
+        /* §7.3: VEH без env-гейта — getenv в инжектируемом процессе
+         * ненадёжен (diag: PASS_SEGVDUMP/PASS_EXCLOG не доходили);
+         * фильтр дешёвый (2 сравнения), лог только для rip в клиенте */
+        extern void pass_veh_install(void *, size_t);
+        pass_veh_install((void *)dr_get_client_base(id), 0x30000);
     }
 #endif
 
