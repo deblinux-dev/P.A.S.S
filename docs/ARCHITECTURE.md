@@ -391,6 +391,24 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    прочитанный байт (throwaway); хендлер, чинящий память и
    возобновляющий исполнение, получит результат без повторного
    прогона инструкции.
+   ДИАГНОСТИКА BUN-WINDOWS (v0.3, продолжение): краш репортёра DR
+   (PC 0x71082a06 = vsnprintf-код) МАСКИРУЕТ fault#1: VEH/exception-
+   event молчат (internal crash классифицируется до клиентских
+   колбэков), релизный DR не логирует (loglevel — только DEBUG),
+   debug-DR за 2700с не доходит до точки. Точка краша локализована
+   по трассе: ПЕРВЫЙ эмулированный BB bun = NaN-гвард конверсии
+   double→int (vcmplesd+vcmpnltsd+vandps+vucomisd+jp). ФИКС 1:
+   vcmps* убраны из inline-карты (создание legacy OP_cmpsd через
+   instr_create_1dst_2src роняло эмиссию; репродукторы bbC/bbE;
+   generic корректен: bbG native=pass). ФИКС 2: vaddsd (%r10,%rax,8)
+   — R10 В MEM-ОПЕРАНДЕ — inline-пути отклоняют r10-инструкции
+   (opnd_uses_r10), диспетчер ведёт в generic (репродуктор idxbb).
+   fp=false-эксперимент ОПРОВЕРГНУТ: клиент собран с -msse2 (memcpy
+   → movups!), fp=true обязателен. СТАТУС bun×core2×Windows: краш
+   в репортёре сохраняется (PC константен; прогресс виден только по
+   трассе рерайтов); fault#1 Windows-специфичен (Linux с тем же BB
+   зелёный). Требуется: debug-DR локально на Windows с многочасовым
+   бюджетом, либо issue в DynamoRIO с данными §7.3.
    CI ПОСЛЕ ФИКСОВ (run #37, 5b96b6f): MSVC-сборка починена
    (/alternatename+_ReturnAddress для трассировщика — __asm__ и
    __builtin_return_address — GNU-расширения). КРАШ 0x7250c УШЁЛ:
