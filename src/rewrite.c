@@ -288,6 +288,11 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
      * эмулятор скомпилирован с -mno-sse и xmm не портит, а fxsave+
      * fninit+fxrstor на каждый чистый вызов съедали ~60% стоимости
      * (bun.exe на core2: спин в OLL-обёртке DR, §6.24). */
+    /* §7.3: fp остаётся условным — клиент собран с -msse2 (memcpy и
+     * структурные копии в emu_generic инлайнятся в movups/movq!) и
+     * ПОРТИТ xmm без fpstate-спасения (проверено: fp=false ломает
+     * faulttrap/sigtest/selftest локально). Врменный комментарий
+     * «-mno-sse» в старом коде был ошибочен.                        */
     bool fp = (d->xmm_src | d->xmm_dst) != 0;
     dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
                          OPND_CREATE_INTPTR((ptr_int_t)d));
