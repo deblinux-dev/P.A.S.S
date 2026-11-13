@@ -184,6 +184,15 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
      * при неожиданном попадании — trap-fallback вместо краша на dsts[0] */
     if (instr_num_dsts(i) == 0)
         return 0;
+    /* §7.3: r10 в операндах — только generic (кэш держит в r10 носитель) */
+    {
+        int nsrc = instr_num_srcs(i);
+        if (opnd_uses_r10(instr_get_dst(i, 0)))
+            return 0;
+        for (int k = 0; k < nsrc; k++)
+            if (opnd_uses_r10(instr_get_src(i, k)))
+                return 0;
+    }
     opnd_t d0 = instr_get_dst(i, 0);
     int nsrc = instr_num_srcs(i);
     opnd_t s1 = instr_get_src(i, 0);
@@ -370,6 +379,15 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     /* защитный guard: см. rewrite_128 */
     if (instr_num_dsts(i) == 0)
         return 0;
+    /* §7.3: r10 в операндах — только generic (см. rewrite_128) */
+    {
+        int nsrc = instr_num_srcs(i);
+        if (opnd_uses_r10(instr_get_dst(i, 0)))
+            return 0;
+        for (int k = 0; k < nsrc; k++)
+            if (opnd_uses_r10(instr_get_src(i, k)))
+                return 0;
+    }
     opnd_t d0 = instr_get_dst(i, 0);
     int nsrc = instr_num_srcs(i);
     opnd_t s1 = instr_get_src(i, 0);

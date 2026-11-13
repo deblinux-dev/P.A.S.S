@@ -219,6 +219,7 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in);
 opnd_t mem_off16(opnd_t mem, int disp_add, opnd_size_t sz); /* копия mem-операнда со сдвигом */
 opnd_t buf_opnd(uint off, opnd_size_t sz);                  /* [r10 + off]        */
 opnd_t raw_opnd(uint off, opnd_size_t sz);                  /* [gs: raw_off+off]  */
+int  opnd_uses_r10(opnd_t o);                               /* §7.3: r10 в операнде? */
 void   carrier_begin(void *dc, instrlist_t *bb, instr_t *at); /* r10 ← база BUF  */
 void   carrier_end(void *dc, instrlist_t *bb, instr_t *at, uint32_t gpr_dst);
 void   zero_yhi(void *dc, instrlist_t *bb, instr_t *at, int xmm_idx); /* RAW_YHI[x] = 0 */

@@ -62,6 +62,22 @@ opnd_t buf_opnd(uint off, opnd_size_t sz)
 }
 
 /* [gs: g_tls_raw_off + off] */
+/* §7.3: r10 в кэше = носитель BUF; inline-рерайты инструкций с r10 в
+ * операндах (рег или mem base/index) исполнятся с НЕВЕРНЫМ r10 —
+ * такие инструкции отклоняются в generic-путь (он спилит r10 в
+ * BUF_GPR(10) через (4b) и прочитает корректно).                  */
+int opnd_uses_r10(opnd_t o)
+{
+    if (opnd_is_reg(o) && opnd_get_reg(o) == DR_REG_R10)
+        return 1;
+    if (opnd_is_memory_reference(o)) {
+        reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+        if (b == DR_REG_R10 || ix == DR_REG_R10)
+            return 1;
+    }
+    return 0;
+}
+
 opnd_t raw_opnd(uint off, opnd_size_t sz)
 {
     return opnd_create_far_base_disp(g_tls_seg, DR_REG_NULL, DR_REG_NULL, 0,
@@ -670,6 +686,19 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
     if (g_cfg.enable_inline && !g_disable_special &&
         run_rewriter(dc, bb, i, try_rewrite_special))
         return;
+
+    /* §7.3: r10 в операндах — inline-пути отклонили (носитель BUF),
+     * generic спилит app-значение в BUF_GPR(10) и прочтёт корректно */
+    {
+        int uses_r10 = 0;
+        for (int k = 0; k < instr_num_dsts(i) && !uses_r10; k++)
+            uses_r10 = opnd_uses_r10(instr_get_dst(i, k));
+        for (int k = 0; k < instr_num_srcs(i) && !uses_r10; k++)
+            uses_r10 = opnd_uses_r10(instr_get_src(i, k));
+        if (uses_r10 && g_cfg.enable_generic &&
+            run_rewriter(dc, bb, i, rewrite_generic_instr))
+            return;
+    }
 
     report_unsupported(dc, i);
 }
