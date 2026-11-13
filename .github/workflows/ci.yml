@@ -391,9 +391,9 @@ jobs:
         run: |
           BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
           DRRUN="dynamorio/bin64/drrun.exe"
-          echo "старт debug-DR прогона..."
+          echo "старт debug-DR прогона (с логом DR)..."
           rc=0
-          timeout -k 5 2700 "$DRRUN" -debug -c pass_client.dll -target core2 -- "$BUN_X64" --version > dbg_out.txt 2> dbg_err.txt || rc=$?
+          timeout -k 5 2700 "$DRRUN" -debug -ops "-loglevel 1 -log_to_stderr" -c pass_client.dll -target core2 -- "$BUN_X64" --version > dbg_out.txt 2> dbg_err.txt || rc=$?
           echo "rc=$rc"
           echo "── stderr: последние 60 строк"
           tail -60 dbg_err.txt | sed 's/^/     /' || true
