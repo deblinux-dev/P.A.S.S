@@ -407,6 +407,13 @@ static const fma_ent_t fma_tab[] = {
     { 0, 0, 0, 0, 0 }
 };
 
+/* §7.3 fuzz: доступ к таблице FMA для перебора (src/fuzz.c) */
+const void *fma_tab_all(int *count)
+{
+    *count = (int)(sizeof(fma_tab) / sizeof(fma_tab[0])) - 1; /* без терминатора */
+    return (const void *)fma_tab;
+}
+
 /* mul-опкод по типу */
 static int mul_op(int packed, int is_pd)
 {
@@ -677,6 +684,9 @@ static int try_fma(void *dc, instrlist_t *bb, instr_t *i)
     opnd_t s2 = instr_get_src(i, 1);
     int is_ymm = (opnd_get_size(d0) == OPSZ_32);
     if (is_ymm) return 0;      /* 256-бит FMA — в generic (v0.1) */
+    /* §7.3 (fuzz): mem-dst FMA (vfmadd [mem], xmm, xmm) — в generic */
+    if (!opnd_is_reg(d0))
+        return 0;
     int di = xmm_idx(opnd_get_reg(d0));
     int dst_is_15 = (di == 15);
     int used15 = 0;

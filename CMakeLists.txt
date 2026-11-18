@@ -25,6 +25,7 @@ add_library(pass_client SHARED
     src/rewrite_special.c
     src/trap.c
     src/segv_dump.c
+    src/fuzz.c
     )
 
 configure_DynamoRIO_client(pass_client)

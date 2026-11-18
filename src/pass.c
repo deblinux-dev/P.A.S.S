@@ -66,6 +66,8 @@ static void parse_options(int argc, const char *argv[])
             g_no_proxy = 1;
         } else if (strcmp(a, "-stage") == 0 && k + 1 < argc) {
             g_stage_override = atoi(argv[++k]);
+        } else if (strcmp(a, "-fuzz") == 0) {
+            g_do_fuzz = 1;
         }
     }
 }
@@ -73,6 +75,7 @@ static void parse_options(int argc, const char *argv[])
 int g_no_veh = 0;        /* -noveh    */
 int g_no_proxy = 0;      /* -noproxy  */
 int g_stage_override = -1; /* -stage N */
+int g_do_fuzz = 0;       /* -fuzz: перебор карт рерайтера */
 
 /* Ленивая инициализация TLS: thread-init не вызывается для главного
  * потока (он уже под DR до регистрации события), поэтому первый
@@ -242,6 +245,13 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     cpuid_init();
     pass_rewrite_init();
+    /* §7.3: перебор карт рерайтера (ловушка UNENCODABLE без bun).
+     * ТОЛЬКО клиентская опция: getenv в инжектируемом процессе
+     * ненадёжен даже на Linux (возвращал мусор → ложный запуск).   */
+    if (g_do_fuzz) {
+        extern void pass_fuzz_run(void);
+        pass_fuzz_run();
+    }
     if (g_cfg.enable_trap)
         trap_init();
 

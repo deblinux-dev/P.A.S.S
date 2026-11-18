@@ -182,6 +182,7 @@ extern int g_no_spoof;
 extern int g_no_veh;          /* -noveh: без VEH-логгера (бисекция)      */
 extern int g_no_proxy;        /* -noproxy: без прокси фолта (бисекция)   */
 extern int g_stage_override;  /* -stage N: переопределяет PASS_STAGE     */
+extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */
 featset_t exposed_features(void);
 void emu_cpuid(void);                                   /* clean call */
 void rewrite_cpuid(void *dc, instrlist_t *bb, instr_t *where);
@@ -237,6 +238,10 @@ typedef struct {
 
 enum { VF_NDS = 0, VF_ND2, VF_SHIFT, VF_DIR, VF_SPECIAL };
 const vex_map_ent_t *vex_map_lookup(int opc);
+/* §7.3 fuzz */
+const vex_map_ent_t *vex_map_all(int *count);
+const void *fma_tab_all(int *count);   /* fma_ent_t* — тип объявлен ниже */
+void pass_fuzz_run(void);
 int  try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i);
 int  try_rewrite_special(void *dc, instrlist_t *bb, instr_t *i);
 int  special_req_ok(int opc);   /* есть ли вообще обработчик */

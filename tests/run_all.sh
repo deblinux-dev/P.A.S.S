@@ -30,7 +30,7 @@ done
 run_pass() { "$DRRUN" -c "$CLIENT" -target core2 "$@" ; }
 
 echo "── asm-тесты (код выхода 0 = успех и нативно, и под core2)"
-for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4; do
+for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam; do
     [ -x "$t" ] || continue
     if "./$t" >/dev/null 2>&1 && run_pass -- "./$t" >/dev/null 2>&1; then
         ok "$t"

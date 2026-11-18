@@ -82,8 +82,12 @@ static const vex_map_ent_t vex_map[] = {
     E(vmaxss, maxss, VF_NDS, F_AVX), E(vmaxsd, maxsd, VF_NDS, F_AVX),
     /* §7.3: vcmps* убраны из inline-карты — создание legacy OP_cmpsd
      * через instr_create_1dst_2src даёт некодируемую инструкцию
-     * (краш эмиссии, bbC/bbE репродукторы); generic-путь корректен */
-    /* E(vcmpss, cmpss, VF_NDS, F_AVX), E(vcmpsd, cmpsd, VF_NDS, F_AVX),
+     * (краш эмиссии, bbC/bbE репродукторы); generic-путь корректен.
+     * NB: закрывающий звёздочка-слэш был пропущен — вместе с vcmps*
+     * из карты выпадала вся скалярная семья (vsqrt/vrcp/vcvt*) —
+     * молча в generic с bd0b846. Восстановлено; скалярная семья теперь
+     * кодируема (1dst_1src-ветка, §7.3 fuzz).                       */
+    /* E(vcmpss, cmpss, VF_NDS, F_AVX), E(vcmpsd, cmpsd, VF_NDS, F_AVX), */
     E(vsqrtss, sqrtss, VF_NDS, F_AVX), E(vsqrtsd, sqrtsd, VF_NDS, F_AVX),
     E(vrsqrtss, rsqrtss, VF_NDS, F_AVX), E(vrcpss, rcpss, VF_NDS, F_AVX),
     E(vcvtsi2ss, cvtsi2ss, VF_NDS, F_AVX), E(vcvtsi2sd, cvtsi2sd, VF_NDS, F_AVX),
@@ -123,6 +127,13 @@ static const vex_map_ent_t vex_map[] = {
     E(vldmxcsr, ldmxcsr, VF_DIR, F_AVX), E(vstmxcsr, stmxcsr, VF_DIR, F_AVX),
     { 0, 0, 0, F_AVX }
 };
+
+/* §7.3 fuzz: доступ к карте для перебора (src/fuzz.c) */
+const vex_map_ent_t *vex_map_all(int *count)
+{
+    *count = (int)(sizeof(vex_map) / sizeof(vex_map[0]));
+    return vex_map;
+}
 #undef E
 
 const vex_map_ent_t *vex_map_lookup(int opc)
@@ -183,6 +194,24 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
     /* защитный guard: 0-dst формы сюда доходить не должны (см. rewrite_0dst);
      * при неожиданном попадании — trap-fallback вместо краша на dsts[0] */
     if (instr_num_dsts(i) == 0)
+        return 0;
+    /* §7.3 (fuzz): mem-dst — только generic, КРОМЕ перемещений: DIR —
+     * store'ы vmovaps/vmovd/vmovq (кодируемы, валидны с v0.1), а также
+     * 2-формы vmovss/vmovsd (store, stub 1d1s). Арифметика NDS/ND2/SHIFT
+     * с mem-dst (unpcklps em], xmm, xmm) inline не умеет — в generic. */
+    if (!opnd_is_reg(instr_get_dst(i, 0)) &&
+        !(e->form == VF_DIR ||
+          e->vex_op == OP_vmovss || e->vex_op == OP_vmovsd))
+        return 0;
+    /* §7.3 (fuzz): imm-семья (cmpps/cmppd/shufps/shufpd/pblendw/palignr)
+     * без imm — синтетика, inline-путь не строит — в generic. ВАЖНО: до
+     * любых staging-вставок (иначе — смещённый xmm15 и мусор в слотах). */
+    if (e->form == VF_NDS &&
+        (e->legacy_op == OP_cmpps || e->legacy_op == OP_cmppd ||
+         e->legacy_op == OP_shufps || e->legacy_op == OP_shufpd ||
+         e->legacy_op == OP_pblendw || e->legacy_op == OP_palignr) &&
+        !(instr_num_srcs(i) >= 3 &&
+          opnd_is_immed_int(instr_get_src(i, 2))))
         return 0;
     /* §7.3: r10 в операндах — только generic (кэш держит в r10 носитель) */
     {
@@ -245,6 +274,17 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         }
         s2eff = raw_opnd(RAW_T0, ssz);
     }
+
+    /* §7.3 (fuzz): DR-каноническая форма legacy unpcklps/unpcklpd —
+     * mem-операнд OPSZ_8 (ISA читает младшие 8 байт каждого операнда,
+     * DR это и кодирует: unpckh* при этом читает СТАРШИЕ 8 — у них
+     * канон 16Б). Слот стадирован на 16Б целиком — клампаем операнд
+     * до 8Б: gs16-форма 1d2s(unpcklps, x, gs16, x) некодируема
+     * (fault#1, третий слой: фаззер op644=vunpcklps mem-src).      */
+    if ((e->legacy_op == OP_unpcklps || e->legacy_op == OP_unpcklpd) &&
+        opnd_is_memory_reference(s2eff) &&
+        opnd_get_size(s2eff) == OPSZ_16)
+        opnd_set_size(&s2eff, OPSZ_8);
 
     switch (e->form) {
     case VF_DIR:
@@ -313,12 +353,23 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         }
         break;
     case VF_ND2:
-        if (opnd_is_immed_int(s2))
+        if (opnd_is_immed_int(s2)) {
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, d0, s1eff, s2));
-        else
+        } else {
+            /* §7.3 (fuzz): 3-формы cvt*2si (AVX-слияние): конвертируемый
+             * операнд — src[1] (s2), s1 — merge; у GPR-приёмника верхние
+             * биты результата обнуляются по VEX — merge не участвует.
+             * Прежний код брал s1 (для 3-форм — merge) — конвертировал
+             * не тот операнд. Для 1-форм s2==s1 — поведение то же.     */
+            opnd_t vsrc = s2;
+            if (opnd_is_memory_reference(s2)) {
+                stage_mem(dc, bb, i, s2, RAW_T0, &used15);
+                vsrc = raw_opnd(RAW_T0, opnd_get_size(s2));
+            }
             pass_ins(dc, bb, i, instr_create_1dst_1src(
-                dc, e->legacy_op, d0, s1eff));
+                dc, e->legacy_op, d0, vsrc));
+        }
         break;
     case VF_SHIFT:
         /* DR моделирует VEX imm-сдвиги как (dst, imm, src): imm в src[0],
@@ -356,11 +407,33 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
             pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
             pass_ins(dc, bb, i, instr_create_1dst_1src(
                 dc, e->legacy_op, xmm16(d0), s2eff));
+        } else if (e->legacy_op == OP_sqrtss || e->legacy_op == OP_sqrtsd ||
+                   e->legacy_op == OP_rcpss || e->legacy_op == OP_rsqrtss ||
+                   e->legacy_op == OP_cvtss2sd || e->legacy_op == OP_cvtsd2ss) {
+            /* §7.3 (fuzz): скалярная семья — legacy в DR = 1dst_1src
+             * (1d2s(d,s,d) некодируем: фаззер op328/op332/...). Слияние
+             * через movaps, скалярная операция поверх младших байтов
+             * dst: VEX-семантика «верх — от s1, низ — op(s2)».        */
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
+            pass_ins(dc, bb, i, instr_create_1dst_1src(
+                dc, e->legacy_op, d0, s2eff));
+        } else if (e->legacy_op == OP_cmpps || e->legacy_op == OP_cmppd ||
+                   e->legacy_op == OP_shufps || e->legacy_op == OP_shufpd ||
+                   e->legacy_op == OP_pblendw || e->legacy_op == OP_palignr) {
+            /* §7.3 (fuzz): imm-семья — legacy в DR = 1dst_3src(d, src,
+             * imm, dst) (1d2s некодируем; run #94 ловил vpblendw 256).
+             * Слияние movaps, затем (d, s2eff, imm, d). 2-форма vcmpps
+             * декодируется как (d, merge-dup, src, imm) — has_imm сработает,
+             * movaps(d0, d0) — no-op. Без imm отсечено сверху (см. гард). */
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
+            pass_ins(dc, bb, i, instr_create_1dst_3src(
+                dc, e->legacy_op, d0, s2eff, imm, d0));
         } else if (has_imm) {
             pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, d0, s2eff, imm));
         } else {
+            /* классическая NDS-арифметика: 1dst_2src(d, src, d) */
             pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, d0, s2eff, d0));
@@ -404,6 +477,18 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     /* защитный guard: см. rewrite_128 */
     if (instr_num_dsts(i) == 0)
         return 0;
+    /* §7.3 (fuzz): mem-dst — только generic, КРОМЕ DIR-store'ов
+     * (vmovaps/vmovnt* ymm — валидны с v0.1; vmovss/sd ymm-форм нет) */
+    if (!opnd_is_reg(instr_get_dst(i, 0)) && e->form != VF_DIR)
+        return 0;
+    /* §7.3 (fuzz): imm-семья без imm — синтетика, в generic ДО staging */
+    if (e->form == VF_NDS &&
+        (e->legacy_op == OP_cmpps || e->legacy_op == OP_cmppd ||
+         e->legacy_op == OP_shufps || e->legacy_op == OP_shufpd ||
+         e->legacy_op == OP_pblendw || e->legacy_op == OP_palignr) &&
+        !(instr_num_srcs(i) >= 3 &&
+          opnd_is_immed_int(instr_get_src(i, 2))))
+        return 0;
     /* §7.3: r10 в операндах — только generic (см. rewrite_128) */
     {
         int nsrc = instr_num_srcs(i);
@@ -418,7 +503,8 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     opnd_t s1 = instr_get_src(i, 0);
     opnd_t s2 = (nsrc >= 2) ? instr_get_src(i, 1) : s1;
     opnd_t imm = (nsrc >= 3) ? instr_get_src(i, 2) : OPND_CREATE_INT32(0);
-    int has_imm = (nsrc >= 3) && opnd_is_immed_int(instr_get_src(i, 2));
+    /* has_imm: imm-семья отсекается верхним гардом — imm здесь только
+     * у неё; у остальных NDS 256 imm в src[2] невозможен.           */
     int dst_is_reg = opnd_is_reg(d0);
     int di = dst_is_reg ? xmm_idx(opnd_get_reg(d0)) : -1;
     int dst_is_15 = dst_is_reg && (di == 15);
@@ -567,6 +653,18 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
         s2hi = xw; s2lo = xw;
     }
 
+    /* §7.3 (fuzz): legacy unpcklps/unpcklpd — mem-операнд OPSZ_8
+     * (DR-канон, ISA читает младшие 8 байт каждого операнда).
+     * Слоты стадированы на 16Б — клампаем операнды до 8Б (см. 128). */
+    if (e->legacy_op == OP_unpcklps || e->legacy_op == OP_unpcklpd) {
+        if (opnd_is_memory_reference(s2hi) &&
+            opnd_get_size(s2hi) == OPSZ_16)
+            opnd_set_size(&s2hi, OPSZ_8);
+        if (opnd_is_memory_reference(s2lo) &&
+            opnd_get_size(s2lo) == OPSZ_16)
+            opnd_set_size(&s2lo, OPSZ_8);
+    }
+
     /* ── HI: xw ← hi(s1); op; [YHI(dst)] ← xw ── */
     if (s1_is_reg)
         pass_ins(dc, bb, i, INSTR_CREATE_movups(
@@ -575,10 +673,15 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
         pass_ins(dc, bb, i, INSTR_CREATE_movups(
             dc, xw, mem_off16(s1, 16, OPSZ_16)));
     if (e->form == VF_NDS) {
-        if (has_imm)
-            pass_ins(dc, bb, i, instr_create_1dst_2src(
-                dc, e->legacy_op, xw, s2hi, imm));
-        else
+        if (e->legacy_op == OP_cmpps || e->legacy_op == OP_cmppd ||
+            e->legacy_op == OP_shufps || e->legacy_op == OP_shufpd ||
+            e->legacy_op == OP_pblendw || e->legacy_op == OP_palignr) {
+            /* §7.3 (fuzz): imm-семья — legacy = 1dst_3src(d, src, imm,
+             * dst); run #94 ловил vpblendw 256. Без imm — отсечено
+             * верхним гардом (до staging).                          */
+            pass_ins(dc, bb, i, instr_create_1dst_3src(
+                dc, e->legacy_op, xw, s2hi, imm, xw));
+        } else
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, xw, s2hi, xw));
     } else if (e->form == VF_SHIFT) {
@@ -598,9 +701,11 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     /* ── LO: xw ← lo(s1); op (результат остаётся в xmm-dst) ── */
     pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s1lo));
     if (e->form == VF_NDS) {
-        if (has_imm)
-            pass_ins(dc, bb, i, instr_create_1dst_2src(
-                dc, e->legacy_op, xw, s2lo, imm));
+        if (e->legacy_op == OP_cmpps || e->legacy_op == OP_cmppd ||
+            e->legacy_op == OP_shufps || e->legacy_op == OP_shufpd ||
+            e->legacy_op == OP_pblendw || e->legacy_op == OP_palignr)
+            pass_ins(dc, bb, i, instr_create_1dst_3src(
+                dc, e->legacy_op, xw, s2lo, imm, xw));
         else
             pass_ins(dc, bb, i, instr_create_1dst_2src(
                 dc, e->legacy_op, xw, s2lo, xw));
