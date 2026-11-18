@@ -255,7 +255,7 @@ jobs:
       - name: Bun под P.A.S.S. и под чистым DR (10 кейсов)
         # Итог — в лог, Step Summary и аннотации. Каждый кейс: TERM через 75с
         # (можно перекрыть env TMO), принудительный KILL ещё через 5с.
-        timeout-minutes: 45
+        timeout-minutes: 60
         run: |
           BUN_X64="$(find bun-x64 -name bun.exe | head -1)"
           BUN_BASE="$(find bun-baseline -name bun.exe | head -1)"
@@ -319,6 +319,16 @@ jobs:
           echo "==== 5f/17 бисекция fault#1: -inline 0 ====";           run_case "pass -inline 0 -target core2 -- bun --version" ./pass.exe -inline 0 -target core2 -- "$BUN_X64" --version
           echo "==== 5g/17 бисекция fault#1: -expose_emulated 0 ====";  run_case "pass -expose_emulated 0 -target core2 -- bun --version (CPUID — честный Core 2, без эмулируемых фич)" ./pass.exe -expose_emulated 0 -target core2 -- "$BUN_X64" --version
           echo "==== 5h/17 бисекция fault#1: -stage 1 (контроль) ===="; run_case "pass -stage 1 -target core2 -- bun --version (клиент инертен — якорь)" ./pass.exe -stage 1 -target core2 -- "$BUN_X64" --version
+          # раунд 2: translation-фикс (все стабы получают app-PC) + гранулярные гейты
+          echo "==== 5i/26 РАУНД-2: translation-фикс, базовый режим ===="; run_case "pass -target core2 -- bun -e 'console.log(6*7)' (translation-фикс, реальный JS)" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          echo "==== 5j/26 РАУНД-2: generic-only на реальном JS ====";        run_case "pass -inline 0 -target core2 -- bun -e 'console.log(6*7)' (fallback-режим)" ./pass.exe -inline 0 -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          echo "==== 5k/26 РАУНД-2: -ops -no_traces ====";                    TMO=200 run_case "drrun -ops -no_traces -c pass_client.dll -target core2 -- bun --version" "$DRRUN" -ops "-no_traces" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 5l/26 гранулярный: -no256 ====";   run_case "pass -no256 -target core2 -- bun --version" ./pass.exe -no256 -target core2 -- "$BUN_X64" --version
+          echo "==== 5m/26 гранулярный: -no128 ====";   run_case "pass -no128 -target core2 -- bun --version" ./pass.exe -no128 -target core2 -- "$BUN_X64" --version
+          echo "==== 5n/26 гранулярный: -nospecial ===="; run_case "pass -nospecial -target core2 -- bun --version" ./pass.exe -nospecial -target core2 -- "$BUN_X64" --version
+          echo "==== 5o/26 гранулярный: -nobcast ===="; run_case "pass -nobcast -target core2 -- bun --version" ./pass.exe -nobcast -target core2 -- "$BUN_X64" --version
+          echo "==== 5p/26 гранулярный: -nomsk ====";   run_case "pass -nomsk -target core2 -- bun --version" ./pass.exe -nomsk -target core2 -- "$BUN_X64" --version
+          echo "==== 5q/26 гранулярный: -novz ====";    run_case "pass -novz -target core2 -- bun --version" ./pass.exe -novz -target core2 -- "$BUN_X64" --version
           echo "==== 6/10 verbose-диагностика ====";   PASS_EXCLOG=1 PASS_SEGVDUMP=1 run_case "pass -verbose 3 -target core2 -- bun --version (поток исключений)" ./pass.exe -verbose 3 -target core2 -- "$BUN_X64" --version
           [ -f modmap.txt ] && { echo "── карта модулей:"; cat modmap.txt; } || true
           echo "==== 7/10 кириллица ====";             run_case "pass -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"

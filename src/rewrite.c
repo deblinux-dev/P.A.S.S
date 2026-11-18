@@ -30,6 +30,14 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
     }
     if (uses_tls && !uses_app_mem)
         instr_set_meta(in);
+    /* §7.3 fault#1: КОСОСИНУС контракта DR-клиента — translation НИ
+     * на одной вставленной инструкции не выставлялся (кроме прокси).
+     * Фолт/релокация на app-инструкции стаба (staged-загрузки mem-
+     * операндов, финальная legacy-инструкция) давала мусорный app-PC;
+     * на Windows это кончилось encode-to-NULL в instr_encode_arch.
+     * Каждая инструкция стаба реализует заменяемую `at` — её app-PC
+     * и есть правильная трансляция. */
+    instr_set_translation(in, instr_get_app_pc(at));
     instrlist_preinsert(bb, at, in);
 }
 
@@ -407,6 +415,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         if (!(d->xmm_dst & (1u << k))) continue;
         instr_t *ni = INSTR_CREATE_movups(
             dc, opnd_create_reg(DR_REG_XMM0 + k), buf_opnd(BUF_XMM(k), OPSZ_16));
+        instr_set_translation(ni, instr_get_app_pc(i));
         instrlist_postinsert(bb, cur, ni);
         cur = ni;
     }
@@ -416,6 +425,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         if (k == gpr_idx(DR_REG_RAX) || k == gpr_idx(DR_REG_R10)) continue;
         instr_t *ni = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX + k), buf_opnd(BUF_GPR(k), OPSZ_8));
+        instr_set_translation(ni, instr_get_app_pc(i));
         instrlist_postinsert(bb, cur, ni);
         cur = ni;
     }
@@ -449,6 +459,9 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
                                           buf_opnd(BUF_FLAGS, OPSZ_8));
         instr_t *n2 = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
         instr_t *n3 = INSTR_CREATE_popf(dc);
+        instr_set_translation(n1, instr_get_app_pc(i));
+        instr_set_translation(n2, instr_get_app_pc(i));
+        instr_set_translation(n3, instr_get_app_pc(i));
         instrlist_postinsert(bb, cur, n1); cur = n1;
         instrlist_postinsert(bb, cur, n2); cur = n2;
         instrlist_postinsert(bb, cur, n3); cur = n3;
@@ -458,6 +471,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     {
         instr_t *ni = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
                                           buf_opnd(BUF_GPR(0), OPSZ_8));
+        instr_set_translation(ni, instr_get_app_pc(i));
         instrlist_postinsert(bb, cur, ni);
         cur = ni;
     }
@@ -608,6 +622,7 @@ static int rewrite_xgetbv_w(void *dc, instrlist_t *bb, instr_t *i)
 static int rewrite_nop_w(void *dc, instrlist_t *bb, instr_t *i)
 {
     instr_t *nop = INSTR_CREATE_nop(dc);
+    instr_set_translation(nop, instr_get_app_pc(i));
     instrlist_preinsert(bb, i, nop);
     instrlist_remove(bb, i);
     instr_destroy(dc, i);

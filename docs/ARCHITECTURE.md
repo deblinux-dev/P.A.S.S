@@ -463,6 +463,28 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    (CPUID честного Core 2 → диспетчеры bun уходят на SSE2-пути),
    -stage 1 (контроль). MinGW-джоба: в SRCS добавлен segv_dump.c
    (undefined reference to pass_veh_install).
+   ВЕРДИКТ БИСЕКЦИИ (run #90, 18a0807): -noveh → HANG (VEH невиновен);
+   -noproxy → HANG (прокси невиновен); -trap 0 → HANG; -generic 0 →
+   HANG; **-inline 0 → OK — bun печатает 1.4.4** (generic-only режим
+   (~800 emu), чистый выход, вся обвязка — clean calls, прокси, trap,
+   CPUID-спуф, VEH — работает); -expose_emulated 0 → FAIL rc=134 (bun
+   сам abort'ится — требует popcnt/SSE4.2, честный Core 2 CPUID для
+   bun непригоден); -stage 1 → OK (якорь). Вывод: краш приходит
+   ТОЛЬКО через inline-стабы. НОВАЯ УЛИКА в регистрах дампа #90:
+   eflags=0x0000024300010206 — верхняя половина RFLAGS = 0x243 =
+   старшие биты указателей кучи процесса (esp/edi = 0x00000243f4...) —
+   popf загружал 64-битный образ флагов с мусором в битах 63:32
+   (в run #88/89 верхняя половина была 0 — мусор адресно-зависим).
+   КОРЕНЬ (гипотеза, translation-фикс): контракт DR-клиента требует
+   instr_set_translation на КАЖДОЙ вставленной инструкции; pass_ins
+   НЕ ставил translation никому (кроме прокси) — все стабы (inline
+   И generic) имели app-инструкции без трансляции: фолт/релокация
+   на них даёт мусорный app-PC. ФИКС: pass_ins ставит translation =
+   app-PC заменяемой инструкции всем вставкам; (6)-ресторы и nop —
+   явно. Проверка локально: Linux 18/18. РАУНД 2 CI: базовый режим
+   (translation-фикс) на реальном JS, generic-only fallback-режим на
+   JS, -ops -no_traces (теория релокации трасс), гранулярные гейты
+   -no256/-no128/-nospecial/-nobcast/-nomsk/-novz.
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)
