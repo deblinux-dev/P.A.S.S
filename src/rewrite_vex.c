@@ -227,10 +227,23 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
     if ((e->form == VF_NDS || e->form == VF_SHIFT) &&
         opnd_is_reg(s2) && opnd_is_reg(d0) &&
         opnd_get_reg(s2) == opnd_get_reg(d0)) {
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(
-            dc, raw_opnd(RAW_T0, OPSZ_16),
-            opnd_create_reg(opnd_get_reg(s2))));
-        s2eff = raw_opnd(RAW_T0, OPSZ_16);
+        opnd_size_t ssz = opnd_get_size(s2);
+        if (ssz == OPSZ_8) {
+            /* sd/ss-формы (vfmadd231sd и пр.): ровно 8 байт — movsd.
+             * Прежний movups 16Б-слота с xmm0[8byte] — НЕКОДИРУЕМО
+             * (fault#1, вторая семья бага #10, run #93: vfmadd231sd
+             * %xmm2, <rel>, %xmm0 -> %xmm0). opnd_create_reg_ex не
+             * резолвится приватным лоадером — через opnd_set_size. */
+            opnd_t s8 = opnd_create_reg(opnd_get_reg(s2));
+            opnd_set_size(&s8, OPSZ_8);
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(
+                dc, raw_opnd(RAW_T0, OPSZ_8), s8));
+        } else {
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_T0, OPSZ_16),
+                opnd_create_reg(opnd_get_reg(s2))));
+        }
+        s2eff = raw_opnd(RAW_T0, ssz);
     }
 
     switch (e->form) {
@@ -308,10 +321,22 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
                 dc, e->legacy_op, d0, s1eff));
         break;
     case VF_SHIFT:
-        /* movaps dst, s1 ; op dst, count */
-        pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
-        pass_ins(dc, bb, i, instr_create_1dst_2src(
-            dc, e->legacy_op, d0, s2eff, d0));
+        /* DR моделирует VEX imm-сдвиги как (dst, imm, src): imm в src[0],
+         * вектор в src[1] — vpsrlq $0x34 %xmm0 -> %xmm3 (run #93, fault#1:
+         * прежний код брал s1=imm в movaps → movaps xmm3, $0x34 —
+         * некодируемо — и сдвигал по регистру вместо imm). */
+        if (opnd_is_immed_int(s1) && opnd_is_reg(s2)) {
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s2)));
+            /* легаси imm-сдвиг в DR = 1dst_2src(dst, imm, dst) — 1src
+             * некодируем (та же конвенция, что у скалярных SSE) */
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, e->legacy_op, xmm16(d0), s1, xmm16(d0)));
+        } else {
+            /* форма со счётчиком в xmm: (dst, вектор, счётчик) */
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, e->legacy_op, d0, s2eff, d0));
+        }
         break;
     case VF_NDS:
     default:

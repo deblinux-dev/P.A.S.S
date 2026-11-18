@@ -58,7 +58,8 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
             has_rip_rel = opnd_is_near_rel_addr(instr_get_src(in, q));
         if (!has_rip_rel && instr_encode(dc, in, encbuf) == NULL) {
             /* однострочный формат: хвост 200Б в CI должен поймать всё */
-            dr_fprintf(STDERR, "[P.A.S.S.] UNENCODABLE <<< ");
+            dr_fprintf(STDERR, "[P.A.S.S.] UNENCODABLE new-opc=%d(0x%x) <<< ",
+                       instr_get_opcode(in), instr_get_opcode(in));
             opnd_disassemble(dc, instr_get_dst(in, 0), STDERR);
             dr_fprintf(STDERR, " , ");
             if (instr_num_srcs(in) > 0)

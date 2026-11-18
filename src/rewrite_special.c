@@ -10,6 +10,16 @@
 #include "pass.h"
 
 #define X15 DR_REG_XMM15
+/* §7.3 fault#1: xmm-операнд с явным размером (8 для скалярных ss/sd, 16
+ * для packed). opnd_create_reg_ex/partial не резолвятся приватным
+ * лоадером DR у клиента (<ERROR: using undefined symbol!>) — через
+ * opnd_set_size (он в клиенте уже используется и резолвится).      */
+static inline opnd_t xmm_reg_sz(reg_id_t r, opnd_size_t sz)
+{
+    opnd_t o = opnd_create_reg(r);
+    opnd_set_size(&o, sz);
+    return o;
+}
 
 static int opnd_is_xmmreg(opnd_t o)
 {
@@ -675,106 +685,122 @@ static int try_fma(void *dc, instrlist_t *bb, instr_t *i)
     int aop = add_op(e->packed, e->is_pd);
     int sop = sub_op(e->packed, e->is_pd);
 
-    /* 132/213: dst = dst*s1 ± s2  →  mul dst, s1 ; add/sub dst, s2
-       231:      dst = s1*s2 ± dst  →  нужен спил старого dst          */
+    /* §7.3 fault#1 (run #93, ловушка UNENCODABLE): РАЗМЕРНАЯ ДИСЦИПЛИНА.
+     * ss/sd-формы оперируют 8 байтами: ВСЕ xmm-операнды — xmm_reg_sz(8),
+     * слоты RAW — OPSZ_8, перемещения — movsd. Прежний код:
+     * (а) INSTR_CREATE_mov_st(gs:RAW_T0, d0=xmm0[8]) = OP_mov с xmm —
+     *     НЕКОДИРУЕМО (на bun Windows оставлял pc=NULL → fault#1);
+     * (б) movups с xmm[8]/mem[8] — некодируемо для ss/sd.
+     * xmm_reg_sz через opnd_set_size: opnd_create_reg_ex/partial не
+     * резолвятся приватным лоадером DR у клиента.                     */
+    opnd_size_t sz = e->packed ? OPSZ_16 : OPSZ_8;
+    opnd_t X15s = xmm_reg_sz(X15, sz);
+    opnd_t d0s = xmm_reg_sz(opnd_get_reg(d0), sz);
+
+    /* спил старого dst в RAW_T0 (231-формы и 132/213-алиасинг) */
+    if (e->packed)
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, raw_opnd(RAW_T0, OPSZ_16),
+            opnd_create_reg(DR_REG_XMM0 + di)));
+    else
+        pass_ins(dc, bb, i, INSTR_CREATE_movsd(
+            dc, raw_opnd(RAW_T0, OPSZ_8), d0s));
+
     if (e->form == 2) {
-        /* сохранить старый dst (полный 16Б) */
-        pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
-            dc, raw_opnd(RAW_T0, OPSZ_16), d0));
+        /* 231: dst = s1*s2 ± dst_old */
         if (!dst_is_15) {
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
             used15 = 1;
         }
-        /* произведение в xmm15 */
         if (opnd_is_memory_reference(s1)) {
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, opnd_create_reg(X15), s1));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, opnd_create_reg(X15), s2, opnd_create_reg(X15)));
+            if (e->packed)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, X15s, s1));
+            else
+                pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, X15s, s1));
         } else {
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, opnd_create_reg(X15), s1));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, opnd_create_reg(X15), s2, opnd_create_reg(X15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, X15s,
+                xmm_reg_sz(opnd_get_reg(s1), sz)));
         }
+        pass_ins(dc, bb, i, instr_create_1dst_2src(
+            dc, mop, X15s,
+            opnd_is_reg(s2) ? xmm_reg_sz(opnd_get_reg(s2), sz) : s2,
+            X15s));
         switch (e->kind) {
-        case 0: /* + dst */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, opnd_create_reg(X15), raw_opnd(RAW_T0, OPSZ_16)));
+        case 0: /* fmadd231: dst = prod + old → movsd d0, prod ; addsd d0, [old] */
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, d0s, X15s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, aop, d0s, raw_opnd(RAW_T0, sz), d0s));
             break;
-        case 1: /* − dst : dst = prod − old */
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, raw_opnd(RAW_T0, OPSZ_16), d0));
+        case 1: /* fmsub231: dst = prod − old → movsd d0, prod ; subsd d0, [old] */
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, d0s, X15s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, sop, d0s, raw_opnd(RAW_T0, sz), d0s));
             break;
-        case 2: /* fnmadd231: dst = −(prod) + dst_old = dst_old − prod */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, raw_opnd(RAW_T0, OPSZ_16), opnd_create_reg(X15)));
+        case 2: /* fnmadd231: dst = −prod + old = old − prod
+                   → movsd d0, [old] ; subsd d0, prod */
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, d0s, raw_opnd(RAW_T0, sz)));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, sop, d0s, X15s, d0s));
             break;
-        case 3: /* fnmsub231: dst = −(prod) − dst_old = −(prod + dst_old) */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, opnd_create_reg(X15), raw_opnd(RAW_T0, OPSZ_16)));
-            /* инвертировать знак: xor с маской — маска в BUF_SIGN? без r10:
-               используем xmm15: загрузим константу из client .rodata нельзя
-               без abs-адреса; применяем 0-x trick: neg нет для packed.
-               Решение: xorps с константой в RAW_T1, записанной заранее…     */
-            /* упрощённо: dst = 0 − dst */
-            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, opnd_create_reg(X15), opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, d0, opnd_create_reg(X15)));
+        case 3: /* fnmsub231: dst = −(prod + old)
+                   → addsd X15, [old] ; pxor d0, d0 ; subsd d0, X15 */
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, aop, X15s, raw_opnd(RAW_T0, sz), X15s));
+            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, d0s, d0s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, sop, d0s, X15s, d0s));
             break;
         }
         if (used15)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
     } else {
-        /* БАГФИКС §6.14: у 132-формы множитель — (dst, s2), слагаемое s1!
-         * 213: dst = src1×dst + src2 → mul d0, s1 ; ±d0, s2
-         * 132: dst = dst×src2 + src1 → mul d0, s2 ; ±d0, s1            */
-        opnd_t mp = (e->form == 0) ? s2 : s1;   /* партнёр по умножению */
-        opnd_t ap = (e->form == 0) ? s1 : s2;   /* слагаемое            */
-        /* §7.3: алиасинг слагаемого == dst (132: s1==dst, 213: s2==dst):
-         * mul записывает в dst ДО потребления слагаемого — старое значение
-         * ap терялось (dst*mp + dst превращалось в 2*(dst*mp)). Стадируем
-         * старый dst в RAW_T0 до mul; в 132/213-ветке T0 свободен
-         * (RAW_T1 занят только в cases 2/3 под произведение).          */
+        /* БАГФИКС §6.14: 213: mul d0, s1 ; ±d0, s2; 132: mul d0, s2 ; ±d0, s1 */
+        opnd_t mp = (e->form == 0) ? s2 : s1;
+        opnd_t ap = (e->form == 0) ? s1 : s2;
+        /* §7.3: алиасинг слагаемого == dst — стадируем старый dst в RAW_T0
+         * до mul (спил выше, до переключателя форм).                    */
         opnd_t apeff = ap;
         if (opnd_is_reg(ap) && opnd_is_reg(d0) &&
-            opnd_get_reg(ap) == opnd_get_reg(d0)) {
-            pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
-                dc, raw_opnd(RAW_T0, OPSZ_16), d0));
-            apeff = raw_opnd(RAW_T0, OPSZ_16);
-        }
+            opnd_get_reg(ap) == opnd_get_reg(d0))
+            apeff = raw_opnd(RAW_T0, sz);
+        else if (opnd_is_reg(ap))
+            apeff = xmm_reg_sz(opnd_get_reg(ap), sz);
+        if (opnd_is_reg(mp))
+            mp = xmm_reg_sz(opnd_get_reg(mp), sz);
         switch (e->kind) {
         case 0: /* fmadd: mul ; add */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, apeff, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0s, mp, d0s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0s, apeff, d0s));
             break;
         case 1: /* fmsub: mul ; sub */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, apeff, d0));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0s, mp, d0s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0s, apeff, d0s));
             break;
-        case 2: /* fnmadd: −(dst*mp) + ap → mul ; инверсия знака ; add */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
-            /* инверсия знака всех элементов: pxor с 0x80-маской невозможна без
-               константы — используем neg-трик: pxor xmm15,xmm15 ; subps dst, x15
-               меняет порядок: нам нужно s2 − dst: subps d0, s2 даёт dst−s2 ✗.
-               Приём: xorps знаковых битов через временный 0: вычесть из нуля:
-               t=0; t=sub(t,dst) → −dst; затем add dst? — нужен второй темп.
-               Проще: pxor x15,x15; subps x15 ← 0−dst (−dst); затем
-               movaps d0? — спойлер: 3 темпа. Используем RAW_T0:
-               сохранённый старый dst не нужен, это 132/213.                  */
+        case 2: /* fnmadd: −(dst*mp) + ap → mul ; 0−dst ; add */
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0s, mp, d0s));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
             used15 = 1;
-            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, opnd_create_reg(X15), opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, raw_opnd(RAW_T1, OPSZ_16), d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, opnd_create_reg(X15), raw_opnd(RAW_T1, OPSZ_16), opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0, apeff, d0));
+            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, X15s, X15s));
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, raw_opnd(RAW_T1, sz), d0s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, sop, X15s, raw_opnd(RAW_T1, sz), X15s));
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, d0s, X15s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, aop, d0s, apeff, d0s));
             break;
-        case 3: /* fnmsub: −(dst*s1) − s2 → mul ; xor sign ; sub */
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0, mp, d0));
+        case 3: /* fnmsub: −(dst*s1) − s2 → mul ; 0−dst ; sub */
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, mop, d0s, mp, d0s));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
             used15 = 1;
-            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, opnd_create_reg(X15), opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, raw_opnd(RAW_T1, OPSZ_16), d0));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, opnd_create_reg(X15), raw_opnd(RAW_T1, OPSZ_16), opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0, apeff, d0));
+            pass_ins(dc, bb, i, INSTR_CREATE_pxor(dc, X15s, X15s));
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, raw_opnd(RAW_T1, sz), d0s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, sop, X15s, raw_opnd(RAW_T1, sz), X15s));
+            pass_ins(dc, bb, i, INSTR_CREATE_movsd(dc, d0s, X15s));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(dc, sop, d0s, apeff, d0s));
             break;
         }
         if (used15)
