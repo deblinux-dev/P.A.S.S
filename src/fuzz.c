@@ -10,6 +10,11 @@
  * порядок операндов для данного опкода), молча пропускаются: рерайтер
  * всегда видит только декодированные канонические инструкции.        */
 #include "pass.h"
+
+#ifndef WINDOWS
+/* §7.3: фаззер — Linux-dev-инструмент: сигнальный sigsetjmp POSIX,
+ * на Windows (MSVC/MinGW) сборка не линкуется — оставляем заглушку;
+ * страховка кодируемости на Windows — ловушка UNENCODABLE в pass_ins. */
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
@@ -211,3 +216,10 @@ void pass_fuzz_run(void)
     dr_flush_file(STDERR);
     dr_exit_process(fz_failures > 125 ? 125 : fz_failures);
 }
+
+#else  /* WINDOWS */
+void pass_fuzz_run(void)
+{
+    /* не вызывается (запуск только клиентской опцией -fuzz на Linux) */
+}
+#endif
