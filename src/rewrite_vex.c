@@ -514,6 +514,62 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     int s2_is_reg = opnd_is_reg(s2);
     int s2i = s2_is_reg ? xmm_idx(opnd_get_reg(s2)) : -1;
 
+    /* §7.3 (run #96, ловушка UNENCODABLE): DR моделирует VEX imm-
+     * сдвиги как (dst, imm, src) — вектор в s2 (тот же порядок, что
+     * фикс 128-пути run #93: vpsrlq $imm). Скелет ниже грузит hi(s1)
+     * ДО разбора формы — с imm в s1 это movups xmm, $imm (ловушка:
+     * «vpsrld $0x10 %ymm0 -> %ymm0», bun-старт). Ранний путь SHIFT-imm:
+     * hi/lo половины ВЕКТОРА из s2, счётчик — imm. Синтетика (s2 тоже
+     * imm) не кодируется как VEX — фаззер пропускает.               */
+    if (e->form == VF_SHIFT && opnd_is_immed_int(s1) &&
+        (s2_is_reg || opnd_is_memory_reference(s2))) {
+        opnd_t xw = opnd_create_reg(DR_REG_XMM0 + di);
+        opnd_t vec_lo, vec_hi;
+        if (s2_is_reg && s2i == di) {
+            /* §7.3: алиасинг dst == src — HI-секция идёт через xw
+             * (= xmm-dst = lo-источник!) и затирает lo до чтения.
+             * Стадируем ОБЕ половины до любых записей.             */
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+            used15 = 1;
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(DR_REG_XMM15),
+                opnd_create_reg(DR_REG_XMM0 + s2i)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_T0, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(DR_REG_XMM15),
+                raw_opnd(RAW_YHI(s2i), OPSZ_16)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_T1, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+            vec_lo = raw_opnd(RAW_T0, OPSZ_16);
+            vec_hi = raw_opnd(RAW_T1, OPSZ_16);
+        } else if (s2_is_reg) {
+            vec_lo = opnd_create_reg(DR_REG_XMM0 + s2i);
+            vec_hi = raw_opnd(RAW_YHI(s2i), OPSZ_16);
+        } else {
+            stage_mem(dc, bb, i, s2, RAW_T0, &used15);
+            vec_lo = raw_opnd(RAW_T0, OPSZ_16);
+            stage_mem(dc, bb, i, mem_off16(s2, 16, OPSZ_16), RAW_T1, &used15);
+            vec_hi = raw_opnd(RAW_T1, OPSZ_16);
+        }
+        /* HI: xw ← hi(s2); сдвиг по imm; [YHI(dst)] ← xw.
+         * NB: слияния нет — imm-сдвиг без merge (VEX 2-форма:
+         * весь результат из s2); алиасинг dst==s2 стадирован выше. */
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, vec_hi));
+        pass_ins(dc, bb, i, instr_create_1dst_2src(
+            dc, e->legacy_op, xw, s1, xw));
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, raw_opnd(RAW_YHI(di), OPSZ_16), xw));
+        /* LO: xw ← lo(s2); сдвиг; результат остаётся в xmm-dst */
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, vec_lo));
+        pass_ins(dc, bb, i, instr_create_1dst_2src(
+            dc, e->legacy_op, xw, s1, xw));
+        restore15(dc, bb, i, used15, dst_is_15);
+        remove_orig(dc, bb, i);
+        return 1;
+    }
+
     /* ── VF_DIR: перемещения 256 бит ── */
     if (e->form == VF_DIR) {
         if (dst_is_reg && s1_is_reg) {
