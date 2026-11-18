@@ -327,6 +327,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
      * (r10 = адрес фолта / прочитанный байт). Прокси идёт ПОСЛЕ
      * clean call — вне DR-umbrella — rax кlobber'ится осознанно
      * (восстанавливается в (6)), флаги чинит безусловный (6)-рестор. */
+    if (!g_no_proxy)
     {
         instr_t *l_end = INSTR_CREATE_label(dc);
         instr_t *l_read = INSTR_CREATE_label(dc);

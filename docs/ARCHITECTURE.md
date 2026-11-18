@@ -427,6 +427,42 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    указатели в clean-call'е (передать r10 аргументом emu_generic и
    сверить со st.buf); (2) либо перейти на drmgr-резервированные
    слоты без собственного carrier-механизма.
+   РАЗБОР fault#1 ПО ИСХОДНИКАМ DR 11.91.20763 (v0.3, 0891802+):
+   прежняя атрибуция PC 0x82a06 «vsnprintf-код» и «vmm_heap_alloc» —
+   ОШИБОЧНА (misread границ функций по objdump-хвосту). Дизасм cronbuild-11.91.20763:
+   функция, содержащая 0x82a06 — instr_encode_arch (encode.c): секция
+   записи префиксов, switch по сегментному регистру (ES 0x26/CS
+   0x2e/SS 0x36/DS 0x3e/FS 0x64/GS 0x65), crash-PC = «movb $0x65,
+   (%rsi)» — запись GS-ПРЕФИКСА. Прыжковая таблица по значениям
+   сегментных регов DR (0x95..0x9a) подтверждает: кейсы переключают
+   DR_REG_ES..DR_REG_GS. Регистры из репорта: esi=0 → ПЕРВЫЙ байт
+   инструкции пишется по адресу 0 (буфер кодирования = NULL);
+   ExceptionInformation = {1 (WRITE), 0} — write-AV по NULL.
+   GS-префикс в BB под core2 есть ТОЛЬКО у наших raw-TLS инструкций
+   (обнуление тени «mov $0 → gs:0x1e00..0x1e0c», рестора app-r10
+   «mov gs:0x1fc8 → %r10», спил carrier). Источник NULL-буфера по
+   исходникам: instr_length() на свежесозданной (ещё не закодированной)
+   инструкции → private_instr_encode → heap_reachable_alloc(dc,
+   MAX_INSTR_LENGTH); все «громкие» OOM-пути завершают процесс через
+   report_low_on_memory (не возвращают NULL) — тихий NULL возможен
+   только в release (ASSERT вырезаны) на пути units→common_heap_alloc.
+   Каждый generic-стаб порождает ~десяток свежих gs-инструкций, и на
+   каждую DR гоняет private_instr_encode (alloc+free) — bun×core2
+   создаёт их сотнями в секунду. Verbose-хвост run #88/89: последний
+   BB перед смертью — хвост generic-эмуляции (push/popf флагов,
+   «mov 0x1c8(%r10)→%rax», «mov gs:0x1fc8→%r10»), краш сразу после
+   первого эмулированного BB. ДИАГНОСТИКА v2: VEH-логгер переписан —
+   (а) кольцо последних 32 AV/#UD {code,rip,acc} в статической памяти
+   (голые записи, безопасно в VEH); (б) при AV внутри dynamorio.dll
+   с адресом <0x10000 (сигнатура encode-to-NULL) — дамп всего кольца
+   через WriteFile НАПРЯМУЮ (dr_fprintf идёт через vsnprintf-машину —
+   сам участок fault#1). Клиентские опции-гейты (env в инжектируемом
+   процессе ненадёжен): -noveh (без VEH), -noproxy (без прокси фолта),
+   -stage N (без bb-события). CI-матрица бисекции fault#1: -noveh,
+   -noproxy, -trap 0, -generic 0, -inline 0, -expose_emulated 0
+   (CPUID честного Core 2 → диспетчеры bun уходят на SSE2-пути),
+   -stage 1 (контроль). MinGW-джоба: в SRCS добавлен segv_dump.c
+   (undefined reference to pass_veh_install).
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)

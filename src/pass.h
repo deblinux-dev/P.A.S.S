@@ -179,6 +179,9 @@ int       pass_is_generic_opc(int opc);   /* опкод эмулируется g
 /* ─────────────────────── cpuid_hook.c ────────────────────── */
 void cpuid_init(void);
 extern int g_no_spoof;
+extern int g_no_veh;          /* -noveh: без VEH-логгера (бисекция)      */
+extern int g_no_proxy;        /* -noproxy: без прокси фолта (бисекция)   */
+extern int g_stage_override;  /* -stage N: переопределяет PASS_STAGE     */
 featset_t exposed_features(void);
 void emu_cpuid(void);                                   /* clean call */
 void rewrite_cpuid(void *dc, instrlist_t *bb, instr_t *where);

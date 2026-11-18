@@ -60,9 +60,19 @@ static void parse_options(int argc, const char *argv[])
             extern int g_disable_msk; g_disable_msk = 1;
         } else if (strcmp(a, "-novz") == 0) {
             extern int g_disable_vz; g_disable_vz = 1;
+        } else if (strcmp(a, "-noveh") == 0) {
+            g_no_veh = 1;
+        } else if (strcmp(a, "-noproxy") == 0) {
+            g_no_proxy = 1;
+        } else if (strcmp(a, "-stage") == 0 && k + 1 < argc) {
+            g_stage_override = atoi(argv[++k]);
         }
     }
 }
+
+int g_no_veh = 0;        /* -noveh    */
+int g_no_proxy = 0;      /* -noproxy  */
+int g_stage_override = -1; /* -stage N */
 
 /* Ленивая инициализация TLS: thread-init не вызывается для главного
  * потока (он уже под DR до регистрации события), поэтому первый
@@ -187,6 +197,10 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
     dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2003\n");
 
+    /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    parse_options(argc, argv);
+
 #ifdef LINUX
     /* временная диагностика: перехват SIGSEGV для скана стека краша —
      * только при PASS_SEGVDUMP=1 (иначе подменяет обработчик DR)     */
@@ -201,14 +215,14 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     {
         /* §7.3: VEH без env-гейта — getenv в инжектируемом процессе
          * ненадёжен (diag: PASS_SEGVDUMP/PASS_EXCLOG не доходили);
-         * фильтр дешёвый (2 сравнения), лог только для rip в клиенте */
+         * фильтр дешёвый, лог через WriteFile напрямую (не dr_fprintf —
+         * vsnprintf-машинария DR — сам участок fault#1).
+         * -noveh — бисекция fault#1 без VEH-перехватчика.            */
         extern void pass_veh_install(void *, size_t);
-        pass_veh_install((void *)dr_get_client_base(id), 0x30000);
+        if (!g_no_veh)
+            pass_veh_install((void *)dr_get_client_base(id), 0x30000);
     }
 #endif
-
-    memset(&g_cfg, 0, sizeof(g_cfg));
-    parse_options(argc, argv);
 
     features_init();
     g_cfg.profile = profile_from_name(g_cfg.target_name);
@@ -233,12 +247,15 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     drmgr_register_thread_init_event(pass_thread_init);
     drmgr_register_thread_exit_event(pass_thread_exit);
-    /* PASS_STAGE: 1 = без bb-события (диагностика) */
+    /* PASS_STAGE: 1 = без bb-события (диагностика). env в инжектируемом
+     * процессе ненадёжен — дублируем клиентской опцией -stage N.     */
     int stage = 2;
     {
         const char *st = getenv("PASS_STAGE");
         if (st != NULL) stage = atoi(st);
     }
+    if (g_stage_override >= 0)
+        stage = g_stage_override;
     if (stage >= 2)
         drmgr_register_bb_app2app_event(pass_bb_event, NULL);
     drmgr_register_exit_event(pass_exit);

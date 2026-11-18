@@ -84,34 +84,123 @@ void pass_segv_dump_install(void)
 }
 #endif /* LINUX */
 
-/* ════════ Windows: VEH-лог исключений в клиентском модуле ════════
- * §7.3: фатальный фолт при bun происходит в КОДЕ КЛИЕНТА (RVA
- * 0x245eb), DR классифицирует его как internal crash и исключение
- * до dr_exception_event не доходит. VEH с первым приоритетом видит
- * КАЖДОЕ исключение до DR-хендлера; логируем только те, чей rip
- * внутри клиентского модуля (остальные — служебные DR, их тысячи). */
+/* ════════ Windows: VEH-лог исключений (§7.3 охота fault#1) ════════
+ * Два слоя:
+ *  (1) КОЛЬЦО: каждое AV (0xC0000005) и #UD (0xC000001D) пишет
+ *      {code, rip, access} в статическое кольцо 32 слотов — голая
+ *      запись памяти, без DR API, без printf, безопасно в VEH.
+ *  (2) ДАМП: если AV с rip ВНУТРИ dynamorio.dll бьёт по адресу
+ *      < 0x10000 (near-NULL — сигнатура фатального encode-to-NULL,
+ *      fault#1), печатаем всё кольцо через WriteFile НАПРЯМУЮ:
+ *      dr_fprintf идёт через vsnprintf-машинарию DR — сам участок
+ *      краша. Никаких DR-вызовов в printing-пути.
+ *  Плюс прежнее: лог фолтов с rip в клиенте (до 24 строк, budget). */
 #ifdef WINDOWS
 #include <windows.h>
 
+typedef struct {
+    unsigned long long rip;
+    unsigned long long acc;
+    unsigned int       code;
+} veh_ent_t;
+
+static veh_ent_t veh_ring[32];
+static volatile long veh_ring_next;
+static volatile long veh_ring_cnt;
+static volatile long veh_dumped;   /* фатальный дамп — один раз */
+static volatile long veh_budget;   /* живых строк напечатано */
 static void *veh_client_lo, *veh_client_hi;
+static void *veh_dr_lo, *veh_dr_hi;
+static HANDLE veh_errh;
+
+static void veh_write(const char *s, unsigned len)
+{
+    DWORD wr = 0;
+    if (veh_errh != NULL && veh_errh != INVALID_HANDLE_VALUE)
+        WriteFile(veh_errh, s, len, &wr, NULL);
+}
+
+static void veh_hex(char **p, unsigned long long v)
+{
+    static const char d[] = "0123456789abcdef";
+    char *o = *p;
+    int k;
+    for (k = 60; k >= 0; k -= 4)
+        *o++ = d[(v >> k) & 0xF];
+    *p = o;
+}
+
+static void veh_line(const char *tag, unsigned int code,
+                     unsigned long long rip, unsigned long long acc)
+{
+    char buf[128];
+    char *p = buf;
+    size_t sl = strlen(tag);
+    memcpy(p, tag, sl); p += sl;
+    memcpy(p, " code=", 6); p += 6;
+    veh_hex(&p, code);
+    memcpy(p, " rip=", 5); p += 5;
+    veh_hex(&p, rip);
+    memcpy(p, " acc=", 5); p += 5;
+    veh_hex(&p, acc);
+    *p++ = '\r'; *p++ = '\n';
+    veh_write(buf, (unsigned)(p - buf));
+}
+
+static void veh_dump_ring(const char *why)
+{
+    size_t sl = strlen(why);
+    veh_write(why, (unsigned)sl);
+    {
+        long n = veh_ring_cnt, base;
+        long i;
+        if (n > 32) n = 32;
+        base = (veh_ring_next - n + 32) % 32;
+        for (i = 0; i < n; i++) {
+            veh_ent_t *e = &veh_ring[(base + i) % 32];
+            veh_line("[VEHR]", e->code, e->rip, e->acc);
+        }
+        veh_line("[VEHR]", 0, (unsigned long long)n, 0);
+    }
+}
 
 static long NTAPI veh_log(PEXCEPTION_POINTERS ep)
 {
     if (ep == NULL || ep->ExceptionRecord == NULL ||
         ep->ContextRecord == NULL)
         return EXCEPTION_CONTINUE_SEARCH;
-    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
-    if (rip < (uintptr_t)veh_client_lo || rip >= (uintptr_t)veh_client_hi)
-        return EXCEPTION_CONTINUE_SEARCH;
-    dr_fprintf(STDERR, "[VEH] code=0x%08x rip-rva=" PIFX " access=" PIFX
-               " rsp=" PIFX "\n",
-               (unsigned)ep->ExceptionRecord->ExceptionCode,
-               rip - (uintptr_t)veh_client_lo,
-               (ep->ExceptionRecord->ExceptionCode == 0xC0000005 &&
-                ep->ExceptionRecord->NumberParameters >= 2)
-                   ? (ptr_uint_t)ep->ExceptionRecord->ExceptionInformation[1]
-                   : 0,
-               (ptr_uint_t)ep->ContextRecord->Rsp);
+    unsigned int code = (unsigned int)ep->ExceptionRecord->ExceptionCode;
+    unsigned long long rip = (unsigned long long)ep->ContextRecord->Rip;
+    unsigned long long acc = 0;
+    int is_av = (code == 0xC0000005);
+    if (is_av && ep->ExceptionRecord->NumberParameters >= 2)
+        acc = (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1];
+
+    /* (1) кольцо: только AV и #UD */
+    if (is_av || code == 0xC000001D) {
+        long slot = veh_ring_next;
+        veh_ring[slot].rip  = rip;
+        veh_ring[slot].acc  = acc;
+        veh_ring[slot].code = code;
+        veh_ring_next = (slot + 1) % 32;
+        if (veh_ring_cnt < 32) veh_ring_cnt++;
+    }
+
+    /* (2) фатальный паттерн: AV внутри dynamorio.dll по near-NULL */
+    if (is_av && veh_dr_lo != NULL && rip >= (unsigned long long)(uintptr_t)veh_dr_lo &&
+        rip < (unsigned long long)(uintptr_t)veh_dr_hi && acc < 0x10000 &&
+        veh_dumped == 0) {
+        veh_dumped = 1;
+        veh_dump_ring("[VEH-FATAL] near-NULL AV inside dynamorio.dll — ring of last AVs/#UD:\r\n");
+    }
+
+    /* (3) прежний лог: rip в клиентском модуле, бюджет 24 строки */
+    if (rip >= (unsigned long long)(uintptr_t)veh_client_lo &&
+        rip < (unsigned long long)(uintptr_t)veh_client_hi &&
+        veh_budget < 24) {
+        veh_budget++;
+        veh_line("[VEH]", code, rip - (unsigned long long)(uintptr_t)veh_client_lo, acc);
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -119,8 +208,29 @@ void pass_veh_install(void *client_base, size_t client_size)
 {
     veh_client_lo = client_base;
     veh_client_hi = (char *)client_base + client_size;
+    HMODULE drm = GetModuleHandleA("dynamorio.dll");
+    if (drm != NULL) {
+        veh_dr_lo = (void *)drm;
+        /* размер не критичен: верхнюю границу берём с запасом 64МБ */
+        veh_dr_hi = (char *)drm + 0x4000000;
+    }
+    veh_errh = GetStdHandle(STD_ERROR_HANDLE);
+    if (veh_errh == INVALID_HANDLE_VALUE || veh_errh == NULL) {
+        /* stderr может быть не открыт — пишем хоть куда-то? нет: без дампа */
+        veh_errh = NULL;
+    }
     AddVectoredExceptionHandler(1, veh_log);
-    dr_fprintf(STDERR, "[P.A.S.S.] VEH installed: client " PIFX ".." PIFX "\n",
-               (ptr_uint_t)veh_client_lo, (ptr_uint_t)veh_client_hi);
+    {
+        char msg[160];
+        char *p = msg;
+        memcpy(p, "[P.A.S.S.] VEH installed: client ", 33); p += 33;
+        veh_hex(&p, (unsigned long long)(uintptr_t)veh_client_lo);
+        memcpy(p, "..", 2); p += 2;
+        veh_hex(&p, (unsigned long long)(uintptr_t)veh_client_hi);
+        memcpy(p, " dr=", 4); p += 4;
+        veh_hex(&p, (unsigned long long)(uintptr_t)veh_dr_lo);
+        *p++ = '\r'; *p++ = '\n';
+        veh_write(msg, (unsigned)(p - msg));
+    }
 }
 #endif
