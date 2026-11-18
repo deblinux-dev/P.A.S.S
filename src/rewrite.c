@@ -57,26 +57,16 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
         for (uint q = 0; q < instr_num_srcs(in) && !has_rip_rel; q++)
             has_rip_rel = opnd_is_near_rel_addr(instr_get_src(in, q));
         if (!has_rip_rel && instr_encode(dc, in, encbuf) == NULL) {
-            dr_fprintf(STDERR,
-                       "[P.A.S.S.] UNENCODABLE: opc=%d (0x%x) @ app " PIFX
-                       " — стаб бы оставил pc=NULL и портил слот кэша; "
-                       "громкая остановка (класс бага #10)\n",
-                       instr_get_opcode(in), instr_get_opcode(in),
-                       (ptr_uint_t)instr_get_app_pc(at));
-            instr_disassemble(dc, in, STDERR);
-            dr_fprintf(STDERR, "\n  ndst=%u nsrc=%u meta=%d\n",
-                       (uint)instr_num_dsts(in), (uint)instr_num_srcs(in),
-                       instr_is_meta(in) ? 1 : 0);
-            for (uint q = 0; q < instr_num_dsts(in); q++) {
-                dr_fprintf(STDERR, "  dst%u: ", q);
-                opnd_disassemble(dc, instr_get_dst(in, q), STDERR);
-                dr_fprintf(STDERR, "\n");
-            }
-            for (uint q = 0; q < instr_num_srcs(in); q++) {
-                dr_fprintf(STDERR, "  src%u: ", q);
-                opnd_disassemble(dc, instr_get_src(in, q), STDERR);
-                dr_fprintf(STDERR, "\n");
-            }
+            /* однострочный формат: хвост 200Б в CI должен поймать всё */
+            dr_fprintf(STDERR, "[P.A.S.S.] UNENCODABLE <<< ");
+            opnd_disassemble(dc, instr_get_dst(in, 0), STDERR);
+            dr_fprintf(STDERR, " , ");
+            if (instr_num_srcs(in) > 0)
+                opnd_disassemble(dc, instr_get_src(in, 0), STDERR);
+            dr_fprintf(STDERR, " <<< orig-opc=%d app=" PIFX " <<< ",
+                       instr_get_opcode(at), (ptr_uint_t)instr_get_app_pc(at));
+            instr_disassemble(dc, at, STDERR);
+            dr_fprintf(STDERR, " >>> END\n");
             dr_flush_file(STDERR);
             dr_abort();
         }
