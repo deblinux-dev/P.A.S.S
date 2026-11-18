@@ -532,6 +532,32 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    и CI). NB: hash_xmm в asm-тестах затирает %rax (pushfq/pop) —
    кейсы со ссылкой через %rax обязаны перезагружать lea (t_fam
    кейс 7 — урок).
+   РАУНД CI #96/#97 (95963bf/9fbac91): ловушка UNENCODABLE мгновенно
+   назвала следующую семью — vpsrld $0x10 %ymm0 -> %ymm0 (bun-старт,
+   ВСЕ кейсы rc=127 за 1 с вместо 45 мин на прогон): DR моделирует
+   VEX imm-сдвиги как (dst, imm, src) — в 256-пути вектор в s2, а
+   скелет грузит hi(s1) → movups xmm, $imm. ФИКС: ранний путь
+   SHIFT-imm (hi/lo половины из s2); алиасинг dst==src — стадия
+   ОБЕИХ половин до записей (HI-секция идёт через xmm-dst = lo-источник
+   — затирала lo; поймано diff-тестом локально). Тест t_sh256
+   (vpsrld/vpsrldq/vpslldq/vpsrlw imm, алиасинг/без), батарея 21/21.
+   fuzz.c: гард WINDOWS (sigsetjmp POSIX, MSVC-сборка — заглушка).
+   ИТОГ #97: pass -target core2 -- bun --version → OK (1s); ВСЯ
+   матрица гейтов OK (-noveh/-noproxy/-trap 0/-generic 0/-inline 0/
+   -no256/-no128/-nospecial/-nomsk/-novz, -disable_traces,
+   max_bb_instrs 64, stack_size 256K, bun(baseline) --version → OK);
+   брекетинг TMO 8..64s — краша нет, 1.4.4 печатается. fault#1 МЁРТВ.
+   ОСТАВШИЕСЯ ОТКРЫТЫЕ: (а) исполнение JS (bun -e 'console.log(6*7)')
+   → rc=3 в ОБОИХ режимах (inline и -inline 0) — не наш краш (это
+   код выхода самого bun), локальная BMI-проверка (tzcnt/popcnt/
+   pdep/pext/shlx/lzcnt/andn/blsi, 70 кейсов) — MATCH; топ generic
+   в JS-кейсе: tzcnt=1430, popcnt=515, shlx=292, pdep=146 — поверх-
+   ностных подозрений нет, нужен следующий хант (сравнение полного
+   stdout/stderr bun -e под pass vs нативно); (б) гейт -nobcast →
+   паника аллокатора bun («memory allocation of 548690662395429
+   bytes failed») — generic-путь broadcast-семьи имеет дыру, base
+   (inline) путь корректен; (в) -expose_emulated 0 → rc=134 —
+   ожидаемо (bun требует popcnt/SSE4.2, честный Core 2 непригоден).
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)
