@@ -322,7 +322,7 @@ jobs:
           # раунд 2: translation-фикс (все стабы получают app-PC) + гранулярные гейты
           echo "==== 5i/26 РАУНД-2: translation-фикс, базовый режим ===="; run_case "pass -target core2 -- bun -e 'console.log(6*7)' (translation-фикс, реальный JS)" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log(6*7)"
           echo "==== 5j/26 РАУНД-2: generic-only на реальном JS ====";        run_case "pass -inline 0 -target core2 -- bun -e 'console.log(6*7)' (fallback-режим)" ./pass.exe -inline 0 -target core2 -- "$BUN_X64" -e "console.log(6*7)"
-          echo "==== 5k/26 РАУНД-2: -ops -no_traces ====";                    TMO=200 run_case "drrun -ops -no_traces -c pass_client.dll -target core2 -- bun --version" "$DRRUN" -ops "-no_traces" -c pass_client.dll -target core2 -- "$BUN_X64" --version
+          echo "==== 5k/26 РАУНД-2: -ops -disable_traces ====";                    TMO=200 run_case "drrun -ops -disable_traces -c pass_client.dll -target core2 -- bun --version" "$DRRUN" -ops "-disable_traces" -c pass_client.dll -target core2 -- "$BUN_X64" --version
           echo "==== 5l/26 гранулярный: -no256 ====";   run_case "pass -no256 -target core2 -- bun --version" ./pass.exe -no256 -target core2 -- "$BUN_X64" --version
           echo "==== 5m/26 гранулярный: -no128 ====";   run_case "pass -no128 -target core2 -- bun --version" ./pass.exe -no128 -target core2 -- "$BUN_X64" --version
           echo "==== 5n/26 гранулярный: -nospecial ===="; run_case "pass -nospecial -target core2 -- bun --version" ./pass.exe -nospecial -target core2 -- "$BUN_X64" --version

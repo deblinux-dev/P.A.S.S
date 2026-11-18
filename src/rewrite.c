@@ -38,6 +38,49 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
      * Каждая инструкция стаба реализует заменяемую `at` — её app-PC
      * и есть правильная трансляция. */
     instr_set_translation(in, instr_get_app_pc(at));
+    /* §7.3 fault#1 КОРЕНЬ: emit.c делает instr_encode_to_copy и
+     * ASSERT(pc != NULL) — в релизе проверка ВЫРЕЗАНА. Некодируемая
+     * инструкция в стабе (2-я семья бага #10 после vcmpsd) оставляет
+     * pc=NULL, и СЛЕДУЮЩАЯ инструкция стаба — наша gs-TLS staging —
+     * кодируется по NULL (crash: write-AV @0, «movb $0x65,(%rsi)» =
+     * GS-префикс, rsi=0 — первый байт gs-инструкции). Контроль на
+     * месте создания: некодируемая инструкция = ГРОМКАЯ остановка
+     * с именем опкода (фиксится таблицей, как vcmpsd в #10). */
+    if (!instr_is_label(in) && !instr_raw_bits_valid(in)) {
+        byte encbuf[32];
+        /* rip-rel операнды пропускаем: DR манглит их в абсолют (mangle_rel_addr)
+         * до эмиссии, энкодер их не видит; честный тест даст ложный фолт
+         * (disp32 из кэша не достаёт до app-данных — нормально). */
+        int has_rip_rel = 0;
+        for (uint q = 0; q < instr_num_dsts(in) && !has_rip_rel; q++)
+            has_rip_rel = opnd_is_near_rel_addr(instr_get_dst(in, q));
+        for (uint q = 0; q < instr_num_srcs(in) && !has_rip_rel; q++)
+            has_rip_rel = opnd_is_near_rel_addr(instr_get_src(in, q));
+        if (!has_rip_rel && instr_encode(dc, in, encbuf) == NULL) {
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] UNENCODABLE: opc=%d (0x%x) @ app " PIFX
+                       " — стаб бы оставил pc=NULL и портил слот кэша; "
+                       "громкая остановка (класс бага #10)\n",
+                       instr_get_opcode(in), instr_get_opcode(in),
+                       (ptr_uint_t)instr_get_app_pc(at));
+            instr_disassemble(dc, in, STDERR);
+            dr_fprintf(STDERR, "\n  ndst=%u nsrc=%u meta=%d\n",
+                       (uint)instr_num_dsts(in), (uint)instr_num_srcs(in),
+                       instr_is_meta(in) ? 1 : 0);
+            for (uint q = 0; q < instr_num_dsts(in); q++) {
+                dr_fprintf(STDERR, "  dst%u: ", q);
+                opnd_disassemble(dc, instr_get_dst(in, q), STDERR);
+                dr_fprintf(STDERR, "\n");
+            }
+            for (uint q = 0; q < instr_num_srcs(in); q++) {
+                dr_fprintf(STDERR, "  src%u: ", q);
+                opnd_disassemble(dc, instr_get_src(in, q), STDERR);
+                dr_fprintf(STDERR, "\n");
+            }
+            dr_flush_file(STDERR);
+            dr_abort();
+        }
+    }
     instrlist_preinsert(bb, at, in);
 }
 
