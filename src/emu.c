@@ -1460,30 +1460,45 @@ static void permil_op(estate_t *st, emu_desc_t *d)
 }
 
 /* ══════════════════ строковые SSE4.2 ══════════════════
- * §7.4 раунд #111: полная семантика по SDM §4.1, выверенная НАТУРНОЙ
- * пробой (probe_istr/probe2/probe3/probe4: 180 кейсов t_istr.S native
- * vs pass). Ключевые правила:
+ * §7.4 раунд #112: точная семантика SDM §4.1 (Vol. 2B) — псевдокод
+ * Table 4-3/4-4/4-7, подтверждён против железа probe5 + t_istr.S
+ * (native vs pass, включая masked-полярности и VEX-формы). Раунд #111
+ * ошибочно выводил «RAW-матч ISTR» из проб с само-сравнением — на деле
+ * всё описывается per-pair форсингом валидности (Table 4-7).
+ * Ключевые правила:
  *  - SRC1 (modrm.reg) = множество для equal-any / пары для ranges /
  *    needle для equal-ordered; SRC2 (modrm.rm) = ИНДЕКСИРУЕМАЯ строка —
- *    индекс IntRes1 всегда идёт по элементам SRC2;
- *  - ESTRx: длины из EAX/EDX (абсолютное значение, насыщение до ne,
- *    0 = пустая строка); ISTRx: неявные NUL-терминированные длины ОБЕИХ
- *    строк (первый нулевой элемент режет валидность);
- *  - IntRes1[i] = (valid1[i] && valid2[i]) ? agg : 0;
- *  - полярность (imm8[4]): IntRes2 = IntRes1 XOR 1 по ВСЕМ элементам
- *    (включая невалидные — натурно: estri la=0 neg → ECX=0);
- *  - masked (imm8[5]): невалидные элементы SRC2 → IntRes2[i] = 0
- *    (натурно: msk-neg la=16 lb=0 → ECX=16; la=0 lb=16 → ECX=0);
- *  - equal-ordered: конец SRC2 (i+j >= len2) → остаток needle считается
- *    совпадением (tail-правило, натурно: "MNO\0" в хвосте → ECX=12);
- *  - ranges: пары валидны только целиком (2k+1 < len1), lo > hi —
- *    мёртвая пара, знак по imm8[1];
- *  - ECX = первый/последний (imm8[6]) установленный бит IntRes2, нет
- *    бит → ne (16/8); XMM0 (strm): бит-маска (imm6=0): byte → 2Б,
- *    word → 1Б, хвост нулями; unit-маска (imm6=1): FF/FFFF на элемент;
- *  - флаги: CF = IntRes2 != 0; OF = IntRes2[0]; ZF = len2 < ne;
- *    SF = len1 < ne (для ISTRx эквивалентно «есть NUL» — NUL и есть
- *    терминатор); AF = PF = 0.                                     */
+ *    IntRes1 идёт по элементам SRC2;
+ *  - валидность: элемент валиден СТРОГО ДО первого NUL (ISTRx — сам NUL
+ *    невалиден, SDM: «lower index than the least significant null») или
+ *    до |EAX|/|EDX| с насыщением до ne (ESTRx);
+ *  - BoolRes[j,i] = SRC2[j] ? SRC1[i], форсинг ПО ПАРЕ (Table 4-7):
+ *    any/ranges — любая невалидность пары → false (потому F..P не
+ *    матчат диапазон (E,Z) при NUL в SRC2 — натурно подтверждено);
+ *    equal-each — (inv,inv) → true, иначе → false (на этом построен
+ *    NUL-трюк pcmpistri $0x3a: строка на себя даёт all-ones за EOS);
+ *    equal-ordered — невалидный needle (SRC1) → true (wildcard), иначе
+ *    невалидный SRC2 → false;
+ *  - IntRes1 (Table 4-3): any = OR по всем SRC1[i]; ranges = OR по
+ *    чётным парам (SRC2[j] >= SRC1[i] && SRC2[j] <= SRC1[i+1], знак по
+ *    imm8[1], пара валидна только целиком); each = BoolRes[i,i];
+ *    ordered = all-ones, AND по BoolRes[j+i,i] для i+j < ne;
+ *  - полярность (imm8[5:4], Table 4-4): +: IntRes2 = IntRes1;
+ *    -: ~IntRes1 по ВСЕМ битам; masked+ == positive (!); masked-:
+ *    ~IntRes1 только на валидных SRC2, невалидные — как есть;
+ *  - выход (Table 4-5): stri — ECX = индекс младшего/старшего (imm8[6])
+ *    бита IntRes2, нет битов → ne; strm imm8[6]=0 — битовая маска
+ *    IntRes2 в младших битах XMM0 (byte → 16 бит, word → 8), хвост
+ *    нулями; imm8[6]=1 — byte/word маска (бит → FF/FFFF элемента);
+ *  - флаги: CF = IntRes2 != 0; OF = IntRes2[0]; AF = PF = 0;
+ *    ESTRx: ZF = |EDX| < ne, SF = |EAX| < ne (сырые, до насыщения);
+ *    ISTRx: ZF = есть NUL в SRC2, SF = есть NUL в SRC1.             */
+static int64_t istr_sext(uint64_t v, int sz, int sgn)
+{
+    if (!sgn)
+        return (int64_t)v;
+    return (sz == 2) ? (int64_t)(int16_t)v : (int64_t)(int8_t)v;
+}
 static void string_op(estate_t *st, emu_desc_t *d, int is_estr, int is_stri)
 {
     uint8_t tmpa[16], tmpb[16];
@@ -1494,17 +1509,17 @@ static void string_op(estate_t *st, emu_desc_t *d, int is_estr, int is_stri)
 
     int sz = (imm & 1) ? 2 : 1;
     int ne = 16 / sz;
-    int sgn = (int)(imm & 2);
+    int sgn = (int)((imm >> 1) & 1);
     int agg = (int)((imm >> 2) & 3);
-    int neg = (int)((imm >> 4) & 1);
-    int msk = (int)((imm >> 5) & 1);
+    int pol = (int)((imm >> 4) & 3);   /* 0:+ 1:- 2:masked+ 3:masked- */
     int msb = (int)((imm >> 6) & 1);
 
-    /* валидные длины */
-    int len1, len2;
+    /* длины: ESTRx — |EAX|/|EDX| с насыщением до ne (сырые abs — для
+     * флагов ZF/SF); ISTRx — индекс первого NUL (сам NUL невалиден) */
+    uint64_t abs1 = ne, abs2 = ne;
+    int len1 = ne, len2 = ne;
     if (is_estr) {
-        /* длина: абсолютное значение EAX/EDX с насыщением до ne;
-         * размер регистра — по IR (EAX 4Б, RAX при REX.W 8Б) */
+        /* размер регистра — по IR (EAX 4Б, RAX при REX.W 8Б) */
         uint64_t r1 = 0, r2 = 0;
         if (d->nsrc >= 4 && opnd_is_reg(d->srcs[3])) {
             r1 = *EG(st, gpr_idx(opnd_get_reg(d->srcs[3])));
@@ -1517,13 +1532,12 @@ static void string_op(estate_t *st, emu_desc_t *d, int is_estr, int is_stri)
             else if (opnd_get_size(d->srcs[4]) == OPSZ_2) r2 &= 0xFFFFull;
         }
         int64_t l1 = (int64_t)r1, l2 = (int64_t)r2;
-        if (l1 < 0) l1 = -l1;
-        if (l2 < 0) l2 = -l2;
-        len1 = (l1 > ne) ? ne : (int)l1;
-        len2 = (l2 > ne) ? ne : (int)l2;
+        abs1 = (l1 < 0) ? (uint64_t)(-l1) : (uint64_t)l1;
+        abs2 = (l2 < 0) ? (uint64_t)(-l2) : (uint64_t)l2;
+        len1 = (abs1 > (uint64_t)ne) ? ne : (int)abs1;
+        len2 = (abs2 > (uint64_t)ne) ? ne : (int)abs2;
     } else {
         /* ISTRx: неявные NUL-терминированные длины обеих строк */
-        len1 = ne; len2 = ne;
         for (int i = 0; i < ne; i++) {
             int nul = (sz == 1) ? (a[i] == 0) : (ld16(a + i*2) == 0);
             if (nul) { len1 = i; break; }
@@ -1532,94 +1546,136 @@ static void string_op(estate_t *st, emu_desc_t *d, int is_estr, int is_stri)
             int nul = (sz == 1) ? (b[i] == 0) : (ld16(b + i*2) == 0);
             if (nul) { len2 = i; break; }
         }
+        abs1 = (uint64_t)len1; abs2 = (uint64_t)len2;
     }
 
-    /* IntRes1: агрегация по элементам SRC2 */
-    int res[16];
+    uint64_t E1[16], E2[16];
+    int v1[16], v2[16];
     for (int i = 0; i < ne; i++) {
-        res[i] = 0;
-        if (i >= len2) continue;               /* SRC2[i] невалиден */
-        uint64_t bv = (sz == 1) ? b[i] : ld16(b + i*2);
-        switch (agg) {
-        case 0:                                /* equal any: b[i] ∈ a[j] */
-            for (int j = 0; j < len1; j++) {
-                uint64_t av = (sz == 1) ? a[j] : ld16(a + j*2);
-                if (av == bv) { res[i] = 1; break; }
-            }
-            break;
-        case 1:                                /* ranges: пары из SRC1 */
-            for (int k = 0; k + 1 < len1; k += 2) {
-                uint64_t lo = (sz == 1) ? a[k]   : ld16(a + k*2);
-                uint64_t hi = (sz == 1) ? a[k+1] : ld16(a + (k+1)*2);
-                if (sgn) {
-                    int64_t slo = (sz == 1) ? (int8_t)lo : (int16_t)lo;
-                    int64_t shi = (sz == 1) ? (int8_t)hi : (int16_t)hi;
-                    int64_t sv  = (sz == 1) ? (int8_t)bv : (int16_t)bv;
-                    if (slo <= sv && sv <= shi) { res[i] = 1; break; }
-                } else {
-                    if (lo <= bv && bv <= hi) { res[i] = 1; break; }
+        E1[i] = (sz == 1) ? a[i] : ld16(a + i*2);
+        E2[i] = (sz == 1) ? b[i] : ld16(b + i*2);
+        v1[i] = i < len1;
+        v2[i] = i < len2;
+    }
+
+    if (g_cfg.verbose >= 3) {
+        dr_fprintf(STDERR, "[ISTR] opc=%d imm=%02x len1=%d len2=%d A=", d->opc, imm, len1, len2);
+        for (int q = 0; q < 16; q++) dr_fprintf(STDERR, "%02x", a[q]);
+        dr_fprintf(STDERR, " B=");
+        for (int q = 0; q < 16; q++) dr_fprintf(STDERR, "%02x", b[q]);
+        dr_fprintf(STDERR, "\n");
+    }
+
+    /* BoolRes[j][i]: SRC2[j] против SRC1[i], форсинг по валидности
+     * ПАРЫ (SDM Table 4-7) */
+    int BR[16][16];
+    for (int j = 0; j < ne; j++) {
+        for (int i = 0; i < ne; i++) {
+            int r;
+            if (!v1[i] || !v2[j]) {
+                switch (agg) {
+                case 2: r = (!v1[i] && !v2[j]); break; /* each: inv,inv → T */
+                case 3: r = !v1[i]; break;             /* ordered: wildcard needle */
+                default: r = 0; break;                 /* any/ranges: F */
                 }
+            } else {
+                int64_t x = istr_sext(E2[j], sz, sgn);
+                int64_t y = istr_sext(E1[i], sz, sgn);
+                if (agg == 1)
+                    r = (i & 1) ? (x <= y) : (x >= y); /* чётный: >=, нечётный: <= */
+                else
+                    r = (x == y);
             }
-            break;
-        case 2:                                /* equal each */
-            if (i < len1) {
-                uint64_t av = (sz == 1) ? a[i] : ld16(a + i*2);
-                res[i] = (av == bv);
-            }
-            break;
-        case 3:                                /* equal ordered: needle SRC1 */
-            res[i] = 1;
-            for (int j = 0; j < len1; j++) {
-                int bi = i + j;
-                if (bi >= ne || bi >= len2) break;   /* конец SRC2 = match */
-                uint64_t av = (sz == 1) ? a[j] : ld16(a + j*2);
-                uint64_t bv2 = (sz == 1) ? b[bi] : ld16(b + bi*2);
-                if (av != bv2) { res[i] = 0; break; }
-            }
-            break;
+            BR[j][i] = r;
         }
     }
 
-    /* IntRes2: полярность (по всем), masked — невалидные SRC2 → 0 */
-    for (int i = 0; i < ne; i++) {
-        int v = (i < len2) ? res[i] : 0;
-        res[i] = neg ? (v ^ 1) : v;
-        if (msk && i >= len2) res[i] = 0;
+    /* IntRes1 (SDM Table 4-3) */
+    int R1[16];
+    switch (agg) {
+    case 0:                                    /* equal any: OR по всем i */
+        for (int j = 0; j < ne; j++) {
+            int acc = 0;
+            for (int i = 0; i < ne; i++) acc |= BR[j][i];
+            R1[j] = acc;
+        }
+        break;
+    case 1:                                    /* ranges: чётные пары целиком */
+        for (int j = 0; j < ne; j++) {
+            int acc = 0;
+            for (int k = 0; k + 1 < ne; k += 2)
+                acc |= (BR[j][k] && BR[j][k+1]);
+            R1[j] = acc;
+        }
+        break;
+    case 2:                                    /* equal each: диагональ */
+        for (int i = 0; i < ne; i++) R1[i] = BR[i][i];
+        break;
+    default:                                   /* equal ordered: needle SRC1 */
+        for (int j = 0; j < ne; j++) {
+            int acc = 1;
+            for (int i = 0; i + j < ne; i++) acc &= BR[j+i][i];
+            R1[j] = acc;
+        }
+        break;
     }
 
-    int any = 0;
-    for (int i = 0; i < ne; i++) if (res[i]) any = 1;
+    if (g_cfg.verbose >= 3) {
+        dr_fprintf(STDERR, "[ISTR] R1=");
+        for (int i = 0; i < ne; i++) dr_fprintf(STDERR, "%d", R1[i]);
+        dr_fprintf(STDERR, "\n");
+    }
+
+    /* IntRes2: полярность (SDM Table 4-4) */
+    int R2[16];
+    for (int i = 0; i < ne; i++) {
+        switch (pol) {
+        case 1: R2[i] = R1[i] ^ 1; break;                   /* все биты */
+        case 3: R2[i] = v2[i] ? (R1[i] ^ 1) : R1[i]; break; /* только валидные */
+        default: R2[i] = R1[i]; break;                      /* + и masked+ */
+        }
+    }
+
+    int anyb = 0;
+    for (int i = 0; i < ne; i++) if (R2[i]) anyb = 1;
+
+    if (g_cfg.verbose >= 3) {
+        dr_fprintf(STDERR, "[ISTR] R2=");
+        for (int i = 0; i < ne; i++) dr_fprintf(STDERR, "%d", R2[i]);
+        dr_fprintf(STDERR, "\n");
+    }
 
     uint32_t fl = 0;
-    if (any) fl |= FCF;
-    if (res[0]) fl |= FOF;
-    if (len2 < ne) fl |= FZF;
-    if (len1 < ne) fl |= FSF;
+    if (anyb) fl |= FCF;
+    if (R2[0]) fl |= FOF;
+    if (abs2 < (uint64_t)ne) fl |= FZF;  /* ISTR: NUL в SRC2; ESTR: |EDX|<ne */
+    if (abs1 < (uint64_t)ne) fl |= FSF;  /* ISTR: NUL в SRC1; ESTR: |EAX|<ne */
 
     if (is_stri) {
         int idx = ne;
         if (msb) {
             for (int i = ne - 1; i >= 0; i--)
-                if (res[i]) { idx = i; break; }
+                if (R2[i]) { idx = i; break; }
         } else {
             for (int i = 0; i < ne; i++)
-                if (res[i]) { idx = i; break; }
+                if (R2[i]) { idx = i; break; }
         }
+        if (g_cfg.verbose >= 3)
+            dr_fprintf(STDERR, "[ISTR] -> ECX=%d\n", idx);
         *EG(st, 1) = (uint64_t)(uint32_t)idx;  /* ECX, нулевое расширение */
     } else {
         /* XMM0 = выходная маска */
         uint8_t r[16];
         memset(r, 0, 16);
-        if (msb) {                             /* unit-маска */
+        if (msb) {                             /* byte/word unit-маска */
             for (int i = 0; i < ne; i++) {
-                if (sz == 1) r[i] = res[i] ? 0xFF : 0x00;
-                else st16(r + i*2, res[i] ? 0xFFFF : 0x0000);
+                if (!R2[i]) continue;
+                if (sz == 1) r[i] = 0xFF;
+                else st16(r + i*2, 0xFFFF);
             }
-        } else {                               /* бит-маска: byte → 2Б, word → 1Б */
-            int nbytes = (sz == 1) ? 2 : 1;
+        } else {                               /* битовая маска IntRes2 */
             for (int i = 0; i < ne; i++)
-                if (res[i]) r[i / 8] |= (uint8_t)(1u << (i % 8));
-            (void)nbytes;
+                if (R2[i]) r[i / 8] |= (uint8_t)(1u << (i % 8));
         }
         memcpy(EX(st, 0), r, 16);
     }

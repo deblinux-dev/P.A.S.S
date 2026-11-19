@@ -64,6 +64,8 @@
 | Windows: клиент собирается MSVC, trap через exception event, лаунчер pass.exe | ✅ сборка проверяется в CI |
 | **bun 1.4.4 (Windows x64) под `-target core2`: исполнение JS полностью — `bun -e 'console.log(6*7)'` → «42», кириллица, baseline-сборка, файловый режим, `--print`, лестница подсистем (VM-инициализация, арифметика JSC, встроенные объекты, event loop), вся матрица emu_mask (в т.ч. чистый SSE)** | ✅ CI (ARCHITECTURE §7.3, раунды #93–#106) |
 | Легаси-формы SSE4.1/4.2/AES/PCLMUL в generic-emu: ptest (0dst_2src), blendv-маска XMM0, неявный источник V=DST у destructive/imm-форм, imm в середине списка операндов [W,imm,V], биты blend/insertps, mpsadbw (8 SAD, скользящее окно), aesdec/aesdeclast (InvSubBytes), aeskeygenassist (X1/X3) | ✅ 9 фиксов (A–I) раунда #106, t_s41 — 49 кейсов бит-в-бит с нативом |
+| **Строковые SSE4.2 (pcmpestri/strm, pcmpistri/strm + VEX) — точная семантика SDM §4.1 (Table 4-3/4-4/4-7)**: per-pair форсинг валидности BoolRes, все 4 полярности (masked+ ≡ positive, masked− — XOR только валидных), NUL невалиден (ISTR), wildcard-needle ordered, ZF/SF/CF/OF, выходные маски XMM0 | ✅ раунды #111–#112 — t_istr.S, 230 кейсов × (ECX+EFLAGS+XMM0) бит-в-бит с нативом; #112 закрыл strcspn-регресс glibc из CI #111 |
+| **Аудит покрытия VEX-опкодов**: системный класс «не в карте → left-native (мусор тени / SIGILL на Core 2)» закрыт — vpsubusb/w, vpmulhuw, дупы vmovs*dup, полуходы vmovlps/hps/lpd/hpd, cvt-ширины (vcvtdq2pd/vcvtpd2dq/vcvttpd2dq), vpermilps/pd, vmaskmovps/pd (load+store), ~40 VEX-алиасов SSE4.1/4.2/AES | ✅ раунд #111 — t_vx41 (83 кейса, 6 блоков) бит-в-бит с нативом |
 | GitHub Actions: сборка + тесты Linux/Windows, релизы по тегу | ✅ |
 
 ### Известные ограничения v0.2
@@ -80,9 +82,10 @@
 * **Диагностические гейты на JS** (не продуктовый путь): `-nospecial` —
   hang после парсинга; `-nomsk` — 256-битный vpmovmskb остаётся left-native
   и читает верх реального ymm (мусор инварианта тени); `-expose_emulated 0`
-  (честный Core 2 CPUID) — bun сам abort (требует SSE4.2; string-опы
-  pcmpistri/pcmpestri пока остаются на trap-fallback, маршрутизация
-  в emu — следующий раунд).
+  (честный Core 2 CPUID) — bun сам abort (требует SSE4.2 в CPUID, это
+  чек стартапа, не инструкция).
+* **F16C** (vcvtps2ph/vcvtph2ps) — VEX-опкоды, emu-реализация не готова
+  (округление half-float по MXCSR) — следующий раунд.
 * **Системные требования** — DynamoRIO 11.x, 64-бит.
 
 ## Сборка
@@ -148,9 +151,10 @@ pass.exe -target core2 -- my_avx2_app.exe args...
 
 `bash tests/run_all.sh` — полный регрессионный прогон (используется в CI):
 asm-юнит-тесты на чистом `_start`+syscall, дифф-тесты «native vs pass побайтно»
-(printf-батарея, строковая батарея, матрица LZCNT/TZCNT с флагами), статические
-приложения и KAT-батарея selftest (BMI2/BMI1/AES/PCLMUL/CRC32C/SSE4.x/AVX2/FMA
-против скалярных эталонов на чистом C).
+(printf-батарея, строковая батарея, матрица LZCNT/TZCNT с флагами, строковые
+SSE4.2 t_istr — 230 кейсов ECX+EFLAGS+XMM0, VEX-алиасы t_vx41 — cvt/permil/
+maskmov), статические приложения и KAT-батарея selftest (BMI2/BMI1/AES/PCLMUL/
+CRC32C/SSE4.x/AVX2/FMA против скалярных эталонов на чистом C).
 
 ## Структура проекта
 

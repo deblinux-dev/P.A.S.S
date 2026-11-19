@@ -96,7 +96,9 @@ echo "── предохранитель trap-цикла (t_deadloop, ARCHITECT
 gcc -O1 "$DATA/t_deadloop.c" -o t_deadloop || bad "сборка t_deadloop"
 if [ -x t_deadloop ]; then
     rc=0
-    timeout 30 "$DRRUN" -c "$CLIENT" -target core2 -- ./t_deadloop >/dev/null 2>&1 || rc=$?
+    # абсолютный путь и к клиенту, и к приложению: DR не резолвит
+    # относительные пути после exec (локально давал rc=124-зависание)
+    timeout 30 "$DRRUN" -c "$CLIENT" -target core2 -- "$TMP/t_deadloop" >/dev/null 2>&1 || rc=$?
     if [ "$rc" = "86" ]; then
         ok "t_deadloop (громкая остановка trap-цикла, exit 86)"
     else
