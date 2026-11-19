@@ -359,6 +359,15 @@ jobs:
           TMO=60 run_case "pass -stage 1 -- bun -e 'console.log(6*7)' (клиент ИНЕРТЕН — якорь рерайта)" ./pass.exe -stage 1 -target core2 -- "$BUN_X64" -e "console.log(6*7)"
           TMO=90 run_case "pass -inline 0 -generic 0 -- bun -e '0' (только VMOV/trap — рерайт почти пуст)" ./pass.exe -inline 0 -generic 0 -target core2 -- "$BUN_X64" -e "0"
           TMO=90 run_case "pass -inline 0 -nospecial -nomsk -novz -- bun -e '0' (только generic-emu)" ./pass.exe -inline 0 -nospecial -nomsk -novz -target core2 -- "$BUN_X64" -e "0"
+          echo "==== JS-охота §7.3: бисекция по emu_mask (пути диспетчера bun) ===="
+          # база = SSE41|SSE42|POPCNT|MOVBE + эмулируемые (0x7FFC)
+          TMO=60 run_case "bun -e -emu_mask 0x7FFC (контроль = default)" ./pass.exe -emu_mask 7FFC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x7FDC (без AES: RNG bun в обход AES-CTR)" ./pass.exe -emu_mask 7FDC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x7EFC (без AVX2: только 128-бит пути)" ./pass.exe -emu_mask 7EFC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x3C7C (без AVX/AVX2/FMA/F16C: чистый SSE)" ./pass.exe -emu_mask 3C7C -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x73FC (без BMI1/BMI2: без tzcnt/pdep/shlx)" ./pass.exe -emu_mask 73FC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x5FFC (без LZCNT)" ./pass.exe -emu_mask 5FFC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x7F9C (без AES+PCLMUL)" ./pass.exe -emu_mask 7F9C -target core2 -- "$BUN_X64" -e "console.log(6*7)"
 
           echo "" >> "$RES"
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"
