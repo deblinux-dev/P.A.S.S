@@ -140,7 +140,11 @@ extern uint32_t g_stat_bbs;
                                           (bit0=фолт, bit1=запись)   */
 #define BUF_FAULT   448u               /* адрес недоступной памяти   */
 #define BUF_R10     456u               /* app-значение r10 (обёртка) */
-#define BUF_SIZE    464u
+#define BUF_RC      464u               /* §7.3: код возврата emu_generic.
+                                          rax после clean call ненадёжен
+                                          (DR-эпилог с fp=1 его затирает),
+                                          гард стаба читает СЛОТ.     */
+#define BUF_SIZE    472u
 
 /* Индексы регистров (xmm_idx принимает и XMM, и YMM; gpr_idx
  * нормализует любой ширинный GPR — EAX/AX/AL → RAX)               */
@@ -205,6 +209,7 @@ typedef struct {
 } emu_desc_t;
 
 int  emu_generic(emu_desc_t *d);            /* clean call, 1 = обработано */
+void emu_stub_unsupported(emu_desc_t *d);   /* гард тихого пропуска (§7.3) */
 void emu_vzeroupper(void);                  /* clean call */
 void emu_vzeroall(void);                    /* clean call */
 

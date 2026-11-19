@@ -41,12 +41,19 @@ done
 
 echo "── дифф-тесты (побайтно native vs pass)"
 gcc -O1 -msse4.1 "$DATA/t_r10.c" -o t_r10 || bad "сборка t_r10"
-for t in t_lztz t_r10; do
+for t in t_lztz t_r10 t_bcast; do
     [ -x "$t" ] || continue
     "./$t" > n.bin 2>/dev/null
     run_pass -- "./$t" > p.bin 2>/dev/null
     if cmp -s n.bin p.bin; then ok "$t"; else bad "$t (вывод различается)"; fi
 done
+
+echo "── broadcast: generic-путь (§7.3: -nobcast → emu, не left-native)"
+if [ -x t_bcast ]; then
+    "./t_bcast" > n2.bin 2>/dev/null
+    "$DRRUN" -c "$CLIENT" -nobcast -target core2 -- ./t_bcast > p2.bin 2>/dev/null
+    if cmp -s n2.bin p2.bin; then ok "t_bcast -nobcast (generic-путь broadcast)"; else bad "t_bcast -nobcast"; fi
+fi
 
 echo "── сборка C-тестов"
 CFLAGS="-O2 -msse4.2 -mavx2 -mbmi -mbmi2 -mlzcnt -mmovbe -maes -mpclmul -mfma"

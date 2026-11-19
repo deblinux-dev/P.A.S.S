@@ -355,6 +355,35 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
                          OPND_CREATE_INTPTR((ptr_int_t)d));
 
+    /* (5*) §7.3: гард «тихого пропуска». Исходная инструкция УДАЛЕНА
+     * (8), поэтому emu_generic == 0 (необработанный опкод добрался до
+     * стаба) = операция молча пропущена: последующие чтения видят
+     * мусор shadow → паника аллокатора (класс -nobcast). ud2 здесь
+     * нельзя: SIGILL из середины стаба уйдёт в trap-fallback с
+     * КОНТЕКСТОМ НОСИТЕЛЯ (r10 = база BUF, хвост стаба пропущен).
+     * Громкая остановка с именем опкода — та же философия, что у
+     * ловушки UNENCODABLE в pass_ins.                              */
+    {
+        /* rax после clean call с fp=1 затёрт DR-эпилогом — читаем
+         * BUF_RC (кладёт обёртка emu_generic); r10 ещё держит базу
+         * BUF — (5b)/(6)/(7) идут ниже.                                 */
+        instr_t *s_mov = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_RC, OPSZ_8));
+        instr_t *s_tst = INSTR_CREATE_test(
+            dc, opnd_create_reg(DR_REG_RAX), opnd_create_reg(DR_REG_RAX));
+        instr_t *s_lab = INSTR_CREATE_label(dc);
+        instr_t *s_jnz = INSTR_CREATE_jcc(dc, OP_jnz, opnd_create_instr(s_lab));
+        instr_set_translation(s_mov, instr_get_app_pc(i));
+        instr_set_translation(s_tst, instr_get_app_pc(i));
+        instr_set_translation(s_jnz, instr_get_app_pc(i));
+        instrlist_preinsert(bb, i, s_mov);
+        instrlist_preinsert(bb, i, s_tst);
+        instrlist_preinsert(bb, i, s_jnz);
+        dr_insert_clean_call(dc, bb, i, (void *)emu_stub_unsupported,
+                             false, 1, OPND_CREATE_INTPTR((ptr_int_t)d));
+        instrlist_preinsert(bb, i, s_lab);
+    }
+
     /* (5b) §7.3: прокси фолта. Если эмуляция столкнулась с недоступной
      * памятью приложения (emu_safe_read/write: BUF_TG != 0), здесь, в
      * кэше, исполняется НАСТОЯЩИЙ 1-байтовый доступ по записанному
@@ -738,7 +767,7 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
         return;
 
     /* §7.3: r10 в операндах — inline-пути отклонили (носитель BUF),
-     * generic спилит app-значение в BUF_GPR(10) и прочтёт корректно */
+     * generic спилит app-значение в BUF_GPR(10) и прочитает корректно */
     {
         int uses_r10 = 0;
         for (int k = 0; k < instr_num_dsts(i) && !uses_r10; k++)
@@ -749,6 +778,19 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
             run_rewriter(dc, bb, i, rewrite_generic_instr))
             return;
     }
+
+    /* §7.3: broadcast-семья при отказе inline-путей (-nobcast и др.) —
+     * в generic-стаб, НЕ left-native: нативное исполнение пишёт
+     * старшую половину результата в РЕАЛЬНЫЙ ymm, минуя RAW_YHI-shadow
+     * (инвариант клиента: hi живёт в TLS) — последующие стабы читают
+     * мусор (паника аллокатора bun под -nobcast, run #96/#97).      */
+    if ((opc == OP_vbroadcastss || opc == OP_vbroadcastsd ||
+         opc == OP_vbroadcastf128 || opc == OP_vbroadcasti128 ||
+         opc == OP_vpbroadcastb || opc == OP_vpbroadcastw ||
+         opc == OP_vpbroadcastd || opc == OP_vpbroadcastq) &&
+        g_cfg.enable_generic &&
+        run_rewriter(dc, bb, i, rewrite_generic_instr))
+        return;
 
     report_unsupported(dc, i);
 }

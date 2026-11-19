@@ -154,6 +154,27 @@ static void pass_exit(void)
             dr_fprintf(STDERR, "%s=%u ", opc_name(top[t]), g_stat_generic[top[t]]);
         dr_fprintf(STDERR, "\n");
     }
+    /* §7.3: топ-5 НЕобработанных опкодов (left-native/trap-класс).
+     * Пусто в здоровом прогоне; ненулевой — прямое имя виновника
+     * класса «молчаливый пропуск → мусор → паника аллокатора».     */
+    if (unsup_total > 0) {
+        int utop[5] = { -1, -1, -1, -1, -1 };
+        for (int t = 0; t < 5; t++) {
+            int best = -1;
+            for (int k = 0; k < OPC_MAX; k++) {
+                if (g_stat_unsupported[k] == 0) continue;
+                bool taken = false;
+                for (int q = 0; q < t; q++) if (utop[q] == k) taken = true;
+                if (!taken && (best < 0 || g_stat_unsupported[k] > g_stat_unsupported[best]))
+                    best = k;
+            }
+            utop[t] = best;
+        }
+        dr_fprintf(STDERR, "  top unsupported: ");
+        for (int t = 0; t < 5 && utop[t] >= 0; t++)
+            dr_fprintf(STDERR, "%s=%u ", opc_name(utop[t]), g_stat_unsupported[utop[t]]);
+        dr_fprintf(STDERR, "\n");
+    }
     dr_fprintf(STDERR, "[P.A.S.S.] ─────────────────────────────────────────\n\n");
 }
 

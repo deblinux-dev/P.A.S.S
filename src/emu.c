@@ -1394,6 +1394,23 @@ static int fma_is_pd(int opc)
         memcpy(EX(&st, di_), D_, 16);                                       \
     } while (0)
 
+/* §7.3: гард «тихого пропуска» — страховой путь generic-стаба
+ * (rewrite.c, после clean call). Возврат 0 в стабе = операция
+ * удалена, но не эмулирована: тихая порча shadow. Здесь она
+ * невозможна по построению (таблицы в lockstep), но класс слишком
+ * дорог (паника аллокатора bun) — громкая остановка с именем
+ * опкода, как у ловушки UNENCODABLE.                             */
+void emu_stub_unsupported(emu_desc_t *d)
+{
+    dr_fprintf(STDERR,
+               "[P.A.S.S.] СТАБ: emu вернула 0 (opc=%d, "
+               "необработанный опкод добрался до generic-стаба) — "
+               "громкая остановка (гард тихого пропуска §7.3)\n",
+               d->opc);
+    dr_flush_file(STDERR);
+    dr_abort();
+}
+
 int emu_generic(emu_desc_t *d)
 {
     /* §7.3: обёртка прозрачности фолтов — emu_safe_read/write при
@@ -1422,6 +1439,16 @@ int emu_generic(emu_desc_t *d)
         }
     }
     int rc = emu_generic_impl(d);
+    /* §7.3: код возврата — в BUF_RC. rax после clean call с fp=1
+     * затирается DR-эпилогом (call dr-хелпера после fxrstor), поэтому
+     * гард стаба (rewrite.c, 5*) читает СЛОТ, а не rax. TLS к этому
+     * моменту уже создан (pass_ensure_tls внутри impl).            */
+    {
+        void *dc1 = dr_get_current_drcontext();
+        uint8_t *buf1 = (uint8_t *)drmgr_get_tls_field(dc1, g_tls_idx_buf);
+        if (buf1 != NULL)
+            *(uint64_t *)(buf1 + BUF_RC) = (uint64_t)(unsigned)rc;
+    }
     if (getenv("PASS_EXCLOG") != NULL && buf0 != NULL &&
         *(uint64_t *)(buf0 + BUF_TG) != 0)
         dr_fprintf(STDERR, "[EMUFLT] opc=%d addr=" PIFX " w=%d\n",
@@ -1629,6 +1656,61 @@ int emu_generic_impl(emu_desc_t *d)
         const uint8_t *sv = EX(&st, xmm_idx(opnd_get_reg(d->srcs[0])));
         uint32_t v = ld32(sv + (imm & 3) * 4);
         put_gpr_val(&st, d->dsts[0], v);
+        break;
+    }
+    /* ── broadcast-семья: generic-путь (-nobcast / отказ inline) ──
+     * §7.3: при -nobcast инструкция оставалась НАТИВНОЙ: результат
+     * старшей половины писался в РЕАЛЬНЫЙ ymm (не в RAW_YHI-shadow,
+     * который читают последующие стабы) → мусор в векторе → паника
+     * аллокатора bun. Семантика SDM: broadcast младшего элемента
+     * (mem-источник — точный размер, reg — элемент 0 lo-половины);
+     * VEX.128 — верх в ноль, VEX.256 — дубль в hi.               */
+    case OP_vbroadcastss: case OP_vbroadcastsd:
+    case OP_vbroadcastf128: case OP_vbroadcasti128:
+    case OP_vpbroadcastb: case OP_vpbroadcastw:
+    case OP_vpbroadcastd: case OP_vpbroadcastq: {
+        opnd_t s0 = d->srcs[0];
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        uint8_t D[32], elem[8] = {0};
+        int esz;
+        if (g_cfg.verbose >= 3)
+            dr_fprintf(STDERR, "[P.A.S.S.][BC] opc=%d nsrc=%d mem=%d vex=%d is_ymm=%d\n",
+                       d->opc, d->nsrc, opnd_is_memory_reference(s0),
+                       d->is_vex, d->is_ymm);
+        switch (d->opc) {
+        case OP_vbroadcastss: case OP_vpbroadcastd: esz = 4; break;
+        case OP_vbroadcastsd: case OP_vpbroadcastq: esz = 8; break;
+        case OP_vpbroadcastw: esz = 2; break;
+        default: esz = 1; break;                       /* vpbroadcastb */
+        }
+        if (d->opc == OP_vbroadcastf128 || d->opc == OP_vbroadcasti128) {
+            /* только ymm-форма с m128 (SDM): иначе — в trap громко */
+            if (!d->is_ymm || !opnd_is_memory_reference(s0)) {
+                if (g_cfg.verbose >= 3)
+                    dr_fprintf(STDERR, "[P.A.S.S.][BC] f128/i128 отказ: is_ymm=%d mem=%d\n",
+                               d->is_ymm, opnd_is_memory_reference(s0));
+                return 0;
+            }
+            emu_safe_read(&st, mem_addr(&st, s0), D, 16);
+            memcpy(D + 16, D, 16);
+        } else {
+            if (opnd_is_memory_reference(s0)) {
+                emu_safe_read(&st, mem_addr(&st, s0), elem, esz);
+            } else if (is_vec_reg(s0)) {
+                memcpy(elem, EX(&st, xmm_idx(opnd_get_reg(s0))), esz);
+            } else {
+                if (g_cfg.verbose >= 3)
+                    dr_fprintf(STDERR, "[P.A.S.S.][BC] патология: src не mem и не vec-reg\n");
+                return 0;   /* патологическая форма — trap-fallback */
+            }
+            int n = 16 / esz;                  /* элементов в 16Б половине */
+            for (int q = 0; q < n; q++) memcpy(D + q * esz, elem, esz);
+            if (d->is_ymm)
+                for (int q = 0; q < n; q++) memcpy(D + 16 + q * esz, elem, esz);
+        }
+        memcpy(EX(&st, di), D, 16);
+        if (d->is_ymm) memcpy(EY(&st, di), D + 16, 16);
+        else memset(EY(&st, di), 0, 16);               /* VEX.128: верх 0 */
         break;
     }
     case OP_pextrb: case OP_pextrw: case OP_pextrd:

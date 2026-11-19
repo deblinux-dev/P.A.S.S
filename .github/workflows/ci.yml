@@ -290,6 +290,10 @@ jobs:
               tail -30 bun_err.txt | sed 's/^/     /' || true
             elif [ -n "$err" ]; then
               echo "   stderr: $err"
+              # §7.3: полный хвост stderr на FAIL — баннер клиента в
+              # самом конце, виновник (паника/UNENCODABLE/СТАБ) ВЫШЕ
+              tail -c 4000 bun_err.txt | sed 's/^/     /' || true
+              echo "   stdout (полный): $(cat bun_out.txt 2>/dev/null)"
             fi
             echo "::$ann::$name → $verdict"
           }
@@ -335,6 +339,15 @@ jobs:
           echo "==== 8/10 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) --version" ./pass.exe -target core2 -- "$BUN_BASE" --version
           echo "==== 9/10 baseline-сборка ====";       run_case "pass -target core2 -- bun(baseline) -e 'Hello!'" ./pass.exe -target core2 -- "$BUN_BASE" -e "console.log('Hello from P.A.S.S. baseline!')"
           echo "==== 10/10 hello-ascii ====";          run_case "pass -target core2 -- bun -e 'Hello from P.A.S.S.!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Hello from P.A.S.S.!')"
+          echo "==== JS-охота §7.3: лестница подсистем ===="
+          TMO=60 run_case "bun -e '0' (чистая инициализация VM)" ./pass.exe -target core2 -- "$BUN_X64" -e "0"
+          TMO=60 run_case "bun -e '1+1' (арифметика JSC)" ./pass.exe -target core2 -- "$BUN_X64" -e "1+1"
+          TMO=60 run_case "bun -e 'new Date().getTime()' (встроенные объекты)" ./pass.exe -target core2 -- "$BUN_X64" -e "new Date().getTime()"
+          TMO=60 run_case "bun -e 'Promise.resolve(1).then(v=>console.log(v))' (event loop)" ./pass.exe -target core2 -- "$BUN_X64" -e "Promise.resolve(1).then(v=>console.log(v))"
+          echo "==== JS-охота §7.3: матрица JS × гейты ===="
+          for G in -no256 -no128 -nospecial -nomsk -novz -noveh -noproxy; do
+            TMO=60 run_case "bun -e 'console.log(6*7)' $G" ./pass.exe $G -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          done
 
           echo "" >> "$RES"
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"

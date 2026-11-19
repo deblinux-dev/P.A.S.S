@@ -465,14 +465,20 @@ static int try_broadcast(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movss(dc, xw, s0));
         else
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, sw));
-        pass_ins(dc, bb, i, instr_create_1dst_2src(
-            dc, OP_shufps, xw, xw, OPND_CREATE_INT8(0)));
+        /* §7.3: DR-канон SHUFPS/SHUFPD — 1dst_3src(d, src, imm, d)
+         * (дублированный неявный источник; Intel dst читается).
+         * 1dst_2src — некодируемая инструкция: UNENCODABLE-ловушка
+         * → dr_abort → rc=3 bun -e (JS-путь исполняет broadcast,
+         * --version — нет; это и есть «загадочный» rc=3 run #97).
+         * enctest17: 1dst_3src → OK [0f c6 c9 00].                */
+        pass_ins(dc, bb, i, INSTR_CREATE_shufps(
+            dc, xw, xw, OPND_CREATE_INT8(0)));
         break;
     case OP_vbroadcastsd:
         if (si >= 0) {
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, sw));
-            pass_ins(dc, bb, i, instr_create_1dst_2src(
-                dc, OP_shufpd, xw, xw, OPND_CREATE_INT8(0)));
+            pass_ins(dc, bb, i, INSTR_CREATE_shufpd(
+                dc, xw, xw, OPND_CREATE_INT8(0)));
         } else {
             pass_ins(dc, bb, i, INSTR_CREATE_movddup(dc, xw, s0));
         }
