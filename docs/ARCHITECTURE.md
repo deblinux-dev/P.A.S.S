@@ -547,17 +547,59 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    -no256/-no128/-nospecial/-nomsk/-novz, -disable_traces,
    max_bb_instrs 64, stack_size 256K, bun(baseline) --version → OK);
    брекетинг TMO 8..64s — краша нет, 1.4.4 печатается. fault#1 МЁРТВ.
-   ОСТАВШИЕСЯ ОТКРЫТЫЕ: (а) исполнение JS (bun -e 'console.log(6*7)')
-   → rc=3 в ОБОИХ режимах (inline и -inline 0) — не наш краш (это
-   код выхода самого bun), локальная BMI-проверка (tzcnt/popcnt/
-   pdep/pext/shlx/lzcnt/andn/blsi, 70 кейсов) — MATCH; топ generic
-   в JS-кейсе: tzcnt=1430, popcnt=515, shlx=292, pdep=146 — поверх-
-   ностных подозрений нет, нужен следующий хант (сравнение полного
-   stdout/stderr bun -e под pass vs нативно); (б) гейт -nobcast →
-   паника аллокатора bun («memory allocation of 548690662395429
-   bytes failed») — generic-путь broadcast-семьи имеет дыру, base
-   (inline) путь корректен; (в) -expose_emulated 0 → rc=134 —
-   ожидаемо (bun требует popcnt/SSE4.2, честный Core 2 непригоден).
+   РАУНД #98 (4f8bdab): ОБЕ загадки #97 ПОБЕЖДЕНЫ, и обе оказались
+   ОДНИМ классом — «инструкция в стабе, которую DR не может
+   закодировать / не эмулирует».
+   (а) rc=3 bun -e (JS): не «код выхода самого bun» — ЭТО НАШ
+       dr_abort. try_broadcast строил SHUFPS/SHUFPD через
+       instr_create_1dst_2src; DR-канон этих опкодов — 1dst_3src
+       (d, src, imm, d): Intel читает dst (дублированный неявный
+       источник). Энкодер → NULL → ловушка UNENCODABLE (pass_ins)
+       → dr_abort → rc=3 (CRT abort на Windows). bun --version не
+       исполняет ни одной формы broadcast, bun -e (JS-путь) исполняет
+       vbroadcastss/vbroadcastsd — поэтому --version жил, JS умирал
+       за 0.5 с с пустым stdout. Диагноз: enctest16/17 (standalone
+       DR-энкодер): 1dst_2src → NULL, 1dst_3src → OK [0f c6 c9 00],
+       movss/movddup/movq с rel_addr → NULL — артефакт стенда (в
+       клиенте rip-rel пропускается проверкой), base-disp → OK.
+       ФИКС: INSTR_CREATE_shufps/shufpd. Локальный t_bcast подтверждает
+       abort ДО фикса (rc=255, UNENCODABLE op#376) и MATCH после.
+   (б) -nobcast → паника аллокатора («memory allocation of
+       548694957362724 bytes failed»): гипотеза «дыра generic-пути»
+       была НЕВЕРНА — generic broadcast не вызывался вообще. Отказавший
+       inline оставлял инструкцию НАТИВНОЙ: она писала старшую половину
+       результата в РЕАЛЬНЫЙ ymm, минуя RAW_YHI-shadow (инвариант
+       клиента: hi живёт в TLS) — последующие стабы читали мусор →
+       мусорный указатель → Rust/Zig «memory allocation of N bytes
+       failed» → abort. N меняется между прогонами (ASLR) — pointer.
+       ФИКС двойной: (1) broadcast-семья (8 опкодов) реализована в
+       emu_generic_impl (mem-источник — точный размер m8/m16/m32/m64,
+       reg — элемент 0 lo-половины; VEX.128 — верх в ноль, VEX.256 —
+       дубль; первый вариант цикла fill писал 4 элемента вместо
+       16/esz — пойман тем же t_bcast, кейсы vpbroadcastb/w); (2)
+       диспетчер ведёт отказавший broadcast в generic-стаб (до
+       report_unsupported), а не в left-native.
+   (в) СТРУКТУРНЫЙ ГАРД «тихого пропуска»: emu_generic==0 в generic-
+       стабе = операция УЖЕ удалена из BB → молчаливая порча shadow.
+       После (5) ставится test/jnz + clean call emu_stub_unsupported:
+       громкая остановка с именем опкода (философия ловушки
+       UNENCODABLE). ud2 не годится: SIGILL из середины стаба уйдёт в
+       trap-fallback с КОНТЕКСТОМ НОСИТЕЛЯ (r10 = база BUF). Нюанс,
+       вскрытый гардом: rax после clean call с fp=1 затёрт DR-эпилогом
+       (call dr-хелпера после fxrstor) — код возврата переносится в
+       BUF_RC (слот TLS), гард читает слот через r10-носитель.
+   (г) exit-баннер печатает топ-5 unsupported (было только top generic)
+       — ненулевой = прямое имя виновника класса.
+   (д) t_bcast.S — 18 кейсов broadcast-семьи (mem/reg источники ×
+       xmm/ymm приёмники × алиасинг dst==src), хеш lo+hi+eflags,
+       байт-дифф против native. Включён в run_all (inline-путь) и
+       отдельной секцией под -nobcast (generic-путь). Батарея 23/23;
+       MATCH в default / -nobcast / -inline 0.
+   ОЖИДАНИЕ #98: bun -e 'console.log(6*7)' → rc=0, stdout «42» на
+   Windows (run #98+); кейсы кириллица/baseline/hello — rc=0.
+   ОСТАВШИЕСЯ ОТКРЫТЫЕ: (в) -expose_emulated 0 → rc=134 — ожидаемо
+   (bun требует popcnt/SSE4.2, честный Core 2 непригоден). Linux:
+   bun под DR виснет на старте (§7.2, чистый DR тоже — вне клиента).
 4. FMA — двойное округление (mul→add); точный режим — v0.3.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)

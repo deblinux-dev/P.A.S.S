@@ -15,7 +15,7 @@
 | Перемещения | vmovaps/upd/apd/upd, vmovd/q, vmovss/sd (2- и 3-оп.), vmovntp*, vlddqu, vld/stmxcsr | inline (VF_DIR; 256 — split) |
 | Сравнения с imm | vcmpps/pd/ss/sd | inline |
 | Конверсии | vcvtsi2ss/sd, vcvtss2sd, vcvtsd2ss | inline; vcvtps2pd (ymm←xmm), vcvtpd2ps | generic |
-| Broadcast | vbroadcastss/sd/f128/i128, vpbroadcastb/w/d/q (reg и mem) | inline |
+| Broadcast | vbroadcastss/sd/f128/i128, vpbroadcastb/w/d/q (reg и mem) | inline (стабы 1dst_3src — §7.3) и generic (emu, -nobcast); t_bcast 18 кейсов × default/-nobcast/-inline 0 |
 | Комбинирование половин | vinsertf/i128, vextractf/i128 | inline |
 | Маскирование бит | vpmovmskb, vmovmskps/pd (128 и 256) | inline (lo\|hi<<n через shadow, флаги сохраняются) |
 | Состояние | vzeroupper, vzeroall | inline (64 mov-imm; +pxor-цепочка) |

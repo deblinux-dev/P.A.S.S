@@ -1713,6 +1713,82 @@ int emu_generic_impl(emu_desc_t *d)
         else memset(EY(&st, di), 0, 16);               /* VEX.128: верх 0 */
         break;
     }
+    /* ── скалярная SSE-арифметика (VEX, fallback r10-форм) ──
+     * §7.3 run #98: bun/JSC (r10-операнды JIT) уводит vaddsd и др.
+     * в generic через r10-ветку диспетчера; emu их не умел → молча
+     * пропускал (#97: op#686=10 в --version — bun выживал случайно,
+     * rc=3 в JS). Inline-карта покрывает обычные формы; здесь —
+     * только fallback. DR-канон VEX NDS: srcs[0]=V (Hx), srcs[1]=W
+     * (reg/mem). dst = {результат elem0, СТАРШАЯ часть из V};
+     * VEX.128 скаляр — верх ymm в ноль.
+     * ТОЧНОСТЬ: клиент -mno-sse → x87. ss-семья: 64-битный
+     * промежуточный хазард безопасен (2p+2=50 ≤ 64) — корректное
+     * округление. sd add/sub: p+2 ≤ 64 — точны. sd mul/div: 2p+2=108
+     * > 64 — теоретическое двойное округление ~2^-60 (документировано,
+     * приоритет v0.3 — SSE-математика). min/max: семантика SSE (NaN
+     * и равенство → ВТОРОЙ источник). sqrt: IEEE-точно.             */
+    case OP_vaddss: case OP_vaddsd:
+    case OP_vsubss: case OP_vsubsd:
+    case OP_vmulss: case OP_vmulsd:
+    case OP_vdivss: case OP_vdivsd:
+    case OP_vminss: case OP_vminsd:
+    case OP_vmaxss: case OP_vmaxsd:
+    case OP_vsqrtss: case OP_vsqrtsd: {
+        if (d->nsrc < 2 || !is_vec_reg(d->srcs[0])) return 0;
+        int vi = xmm_idx(opnd_get_reg(d->srcs[0]));
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        int esz = (d->opc == OP_vaddsd || d->opc == OP_vsubsd ||
+                   d->opc == OP_vmulsd || d->opc == OP_vdivsd ||
+                   d->opc == OP_vminsd || d->opc == OP_vmaxsd ||
+                   d->opc == OP_vsqrtsd) ? 8 : 4;
+        const uint8_t *V = EX(&st, vi);
+        uint8_t W[16];
+        if (opnd_is_memory_reference(d->srcs[1])) {
+            emu_safe_read(&st, mem_addr(&st, d->srcs[1]), W, esz);
+        } else if (is_vec_reg(d->srcs[1])) {
+            memcpy(W, EX(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), esz);
+        } else {
+            return 0;                     /* GPR-формы vcvtsi2* — не сюда */
+        }
+        uint8_t D[16];
+        memcpy(D, V, 16);                 /* merge: старшая часть из V */
+        if (esz == 8) {
+            double a, b, o;
+            memcpy(&a, V, 8);
+            memcpy(&b, W, 8);
+            switch (d->opc) {
+            case OP_vaddsd: o = a + b; break;
+            case OP_vsubsd: o = a - b; break;
+            case OP_vmulsd: o = a * b; break;
+            case OP_vdivsd: o = a / b; break;
+            case OP_vsqrtsd: o = sqrt(b); break;
+            case OP_vminsd:
+                o = (isnan(a) || isnan(b)) ? b : (a < b ? a : b); break;
+            default: /* vmaxsd */
+                o = (isnan(a) || isnan(b)) ? b : (a > b ? a : b); break;
+            }
+            memcpy(D, &o, 8);
+        } else {
+            float a, b, o;
+            memcpy(&a, V, 4);
+            memcpy(&b, W, 4);
+            switch (d->opc) {
+            case OP_vaddss: o = (float)(a + b); break;
+            case OP_vsubss: o = (float)(a - b); break;
+            case OP_vmulss: o = (float)(a * b); break;
+            case OP_vdivss: o = (float)(a / b); break;
+            case OP_vsqrtss: o = (float)sqrt((double)b); break;
+            case OP_vminss:
+                o = (isnan(a) || isnan(b)) ? b : (a < b ? a : b); break;
+            default: /* vmaxss */
+                o = (isnan(a) || isnan(b)) ? b : (a > b ? a : b); break;
+            }
+            memcpy(D, &o, 4);
+        }
+        memcpy(EX(&st, di), D, 16);
+        memset(EY(&st, di), 0, 16);       /* VEX.128 скаляр — верх 0 */
+        break;
+    }
     case OP_pextrb: case OP_pextrw: case OP_pextrd:
     case OP_vpextrb: case OP_vpextrw: case OP_vpextrd: {   /* vpextrq = vpextrd */
         const uint8_t *sv = EX(&st, xmm_idx(opnd_get_reg(d->srcs[0])));
