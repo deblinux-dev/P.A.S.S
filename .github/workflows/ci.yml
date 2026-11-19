@@ -354,6 +354,11 @@ jobs:
           printf 'console.log(6*7)\n' > jsfile.js
           TMO=60 run_case "bun jsfile.js (файловый режим)" ./pass.exe -target core2 -- "$BUN_X64" jsfile.js
           TMO=60 run_case "bun --print '6*7'" ./pass.exe -target core2 -- "$BUN_X64" --print "6*7"
+          echo "==== JS-охота §7.3: бисекция механизма ===="
+          TMO=60 run_case "drrun БЕЗ клиента -- bun -e 'console.log(6*7)' (контроль: DR сам по себе)" "$DRRUN" -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "pass -stage 1 -- bun -e 'console.log(6*7)' (клиент ИНЕРТЕН — якорь рерайта)" ./pass.exe -stage 1 -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=90 run_case "pass -inline 0 -generic 0 -- bun -e '0' (только VMOV/trap — рерайт почти пуст)" ./pass.exe -inline 0 -generic 0 -target core2 -- "$BUN_X64" -e "0"
+          TMO=90 run_case "pass -inline 0 -nospecial -nomsk -novz -- bun -e '0' (только generic-emu)" ./pass.exe -inline 0 -nospecial -nomsk -novz -target core2 -- "$BUN_X64" -e "0"
 
           echo "" >> "$RES"
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"
