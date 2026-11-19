@@ -368,6 +368,9 @@ jobs:
           TMO=60 run_case "bun -e -emu_mask 0x73FC (без BMI1/BMI2: без tzcnt/pdep/shlx)" ./pass.exe -emu_mask 73FC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
           TMO=60 run_case "bun -e -emu_mask 0x5FFC (без LZCNT)" ./pass.exe -emu_mask 5FFC -target core2 -- "$BUN_X64" -e "console.log(6*7)"
           TMO=60 run_case "bun -e -emu_mask 0x7F9C (без AES+PCLMUL)" ./pass.exe -emu_mask 7F9C -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          TMO=60 run_case "bun -e -emu_mask 0x18 (минимум: SSE42+POPCNT — без SSE41/MOVBE)" ./pass.exe -emu_mask 18 -target core2 -- "$BUN_X64" -e "console.log(6*7)"
+          echo "==== JS-охота §7.3: трейс рерайта ===="
+          TMO=120 run_case "bun -e '0' -verbose 2 (все generic/отказы поопкодной) " ./pass.exe -verbose 2 -target core2 -- "$BUN_X64" -e "0"
 
           echo "" >> "$RES"
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"
