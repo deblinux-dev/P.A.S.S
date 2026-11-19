@@ -62,7 +62,8 @@
 | Динамические бинари + printf-батарея + строковая батарея | ✅ побитно совпадают с нативом |
 | Broadcast-семья целиком (vbroadcastss/sd/f128/i128, vpbroadcastb/w/d/q): inline и generic-пути, алиасинг, VEX.128-обнуление верха | ✅ бит-в-бит с нативом (t_bcast, 18 кейсов × 3 режима) |
 | Windows: клиент собирается MSVC, trap через exception event, лаунчер pass.exe | ✅ сборка проверяется в CI |
-| **bun 1.4.4 (Windows x64) под `-target core2`: `--version` и исполнение JS (`bun -e 'console.log(6*7)'` → «42»), кириллица, baseline-сборка, полная матрица диагностических гейтов** | ✅ CI (ARCHITECTURE §7.3, раунды #93–#98) |
+| **bun 1.4.4 (Windows x64) под `-target core2`: исполнение JS полностью — `bun -e 'console.log(6*7)'` → «42», кириллица, baseline-сборка, файловый режим, `--print`, лестница подсистем (VM-инициализация, арифметика JSC, встроенные объекты, event loop), вся матрица emu_mask (в т.ч. чистый SSE)** | ✅ CI (ARCHITECTURE §7.3, раунды #93–#106) |
+| Легаси-формы SSE4.1/4.2/AES/PCLMUL в generic-emu: ptest (0dst_2src), blendv-маска XMM0, неявный источник V=DST у destructive/imm-форм, imm в середине списка операндов [W,imm,V], биты blend/insertps, mpsadbw (8 SAD, скользящее окно), aesdec/aesdeclast (InvSubBytes), aeskeygenassist (X1/X3) | ✅ 9 фиксов (A–I) раунда #106, t_s41 — 49 кейсов бит-в-бит с нативом |
 | GitHub Actions: сборка + тесты Linux/Windows, релизы по тегу | ✅ |
 
 ### Известные ограничения v0.2
@@ -76,6 +77,12 @@
   не транслируется в штатный SIGSEGV приложения.
 * **Linux + bun** — bun виснет на старте под DR и без клиента (§7.2,
   несовместимость DR и bun на Linux, вне клиента); на Windows совместим.
+* **Диагностические гейты на JS** (не продуктовый путь): `-nospecial` —
+  hang после парсинга; `-nomsk` — 256-битный vpmovmskb остаётся left-native
+  и читает верх реального ymm (мусор инварианта тени); `-expose_emulated 0`
+  (честный Core 2 CPUID) — bun сам abort (требует SSE4.2; string-опы
+  pcmpistri/pcmpestri пока остаются на trap-fallback, маршрутизация
+  в emu — следующий раунд).
 * **Системные требования** — DynamoRIO 11.x, 64-бит.
 
 ## Сборка
