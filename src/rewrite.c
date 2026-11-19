@@ -312,8 +312,16 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             dc, buf_opnd(BUF_FLAGS, OPSZ_8)));
     }
 
-    /* (3) спилы xmm */
-    uint32_t xmmall = d->xmm_src | d->xmm_dst;
+    /* (3) спилы xmm.
+     * §7.3 run #106 (B): uses_xmm0 (неявная маска XMM0 у pcmpestri/
+     * pcmpestrm/blendv-семьи) обязан попадать в спил — раньше в xmmall
+     * входили только ЯВНЫЕ операнды, а у pcmpestri XMM0 в IR-модели
+     * НЕ ПРИСУТСТВУЕТ (dst=ECX, srcs=[A,B,imm,EAX,EDX]) → emu читал
+     * мусор из BUF_XMM(0) вместо маски → порча строковых результатов
+     * в bun (simdutf/JSC). Для legacy blendv/pblendvb XMM0 в IR явный
+     * (srcs[1]) — там спил и раньше работал, uses_xmm0 закрывает
+     * остальные случаи и trap-путь.                                    */
+    uint32_t xmmall = d->xmm_src | d->xmm_dst | (d->uses_xmm0 ? 1u : 0u);
     for (int k = 0; k < 16; k++) {
         if (!(xmmall & (1u << k))) continue;
         pass_ins(dc, bb, i, INSTR_CREATE_movups(

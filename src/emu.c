@@ -150,6 +150,36 @@ static int is_xmm_reg(opnd_t o)
            opnd_get_reg(o) <= DR_REG_XMM15;
 }
 
+/* §7.3 run #106 (C): легаси-формы, где неявный первый источник V = DST.
+ * DR-модели (проверено standalone-декодером, см. commit):
+ *   1dst_2src [W(rm), V(dst)] — pcmpgtq/pcmpeqq/pmulld/pmuldq/packusdw/
+ *                              семейство pmin/pmax/aesenc; blendps/pd —
+ *                              декодер НЕ добавляет неявный V (макрос
+ *                              1dst_3src от декодера отличается!)
+ *   1dst_3src [W, imm, V]     — palignr/dpps/dppd/mpsadbw/roundss/
+ *                              roundsd/pclmulqdq
+ * Для всех них fn(r, S1, S2) ждёт (V, W): S1 = D, S2 = srcs[0].
+ * Прочие легаси-формы блочного кейса — W-класс (fn читает только S1=W:
+ * roundps/pd, pmovsx|zx-, phminposuw, aeskeygenassist, aesimc).      */
+static int legacy_vw(int opc)
+{
+    switch (opc) {
+    case OP_pcmpgtq: case OP_pcmpeqq: case OP_pmulld: case OP_pmuldq:
+    case OP_packusdw:
+    case OP_pminub: case OP_pmaxub: case OP_pminuw: case OP_pmaxuw:
+    case OP_pminud: case OP_pmaxud: case OP_pminsb: case OP_pmaxsb:
+    case OP_pminsw: case OP_pmaxsw: case OP_pminsd: case OP_pmaxsd:
+    case OP_aesenc: case OP_aesdec: case OP_aesenclast: case OP_aesdeclast:
+    case OP_blendps: case OP_blendpd:
+    case OP_palignr: case OP_dpps: case OP_dppd: case OP_mpsadbw:
+    case OP_roundss: case OP_roundsd: case OP_insertps:
+    case OP_pclmulqdq:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* векторный регистр (xmm ИЛИ ymm): до багфикса §6.15 YMM-операнды
  * здесь не распознавались — generic-операции над ymm читали нули */
 static int is_vec_reg(opnd_t o)
@@ -526,15 +556,19 @@ BLOCK1(b_phminposuw, {
 
 /* MPSADBW */
 BLOCK1(b_mpsadbw, {
+    /* §7.3 run #106 (F): эмпирия (native mpsadbw $0x44/данные t0/t1):
+     * 8 SAD-слов: слово j — скользящее ОКНО по V (байт-шаг!), против
+     * фиксированного 4-байтового блока W. offV = imm8[2]*4 (байт),
+     * offW = imm8[1:0]*4 (байт). Было 4 слова с dword-шагом по V. */
     int offA = ((imm >> 2) & 1) * 4;
     int offB = (imm & 3) * 4;
-    for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 8; j++) {
         unsigned s = 0;
         for (int k = 0; k < 4; k++) {
-            int a = s1[offA + i + k], b = s2[offB + k];
+            int a = s1[offA + j + k], b = s2[offB + k];
             s += (unsigned)(a > b ? a - b : b - a);
         }
-        st16(r + i*2, (uint16_t)s);
+        st16(r + j*2, (uint16_t)s);
     }
 })
 
@@ -596,6 +630,20 @@ BLOCK1(b_roundsd, {
     memcpy(r, &o, 8);
 })
 
+/* BLEND-семья: imm-биты = ПОЛ i на канал (эмпирия run #106: native
+ * blendps $0xA5 → lanes 0,2 из SRC; vblendps $0xA5 → то же; blendpd
+ * $0x0A → lane 1 из SRC). Было (1 << (4+i)) — биты 4-7 для ОБОИХ
+ * половин: 128-бит формы читали чужие биты imm. 256-битные формы:
+ * VPBLENDPS/VPBLENDD — hi-половина = старшие биты (imm >> 4),
+ * VBLENDPD — 4 канала, hi = imm >> 2 (все — тот же imm8).          */
+static void blend_imm_block(uint8_t *r, const uint8_t *s1, const uint8_t *s2,
+                            uint imm, int is_pd, int nlanes)
+{
+    int esz = is_pd ? 8 : 4;
+    for (int i = 0; i < nlanes; i++)
+        memcpy(r + i*esz, (imm & (1u << i)) ? s2 + i*esz : s1 + i*esz, esz);
+}
+
 /* DPPS/DPPD */
 BLOCK1(b_dpps, {
     float sum = 0.0f;
@@ -622,15 +670,7 @@ BLOCK1(b_dppd, {
         if (imm & (1 << i)) memcpy(r + i*8, &sum, 8);
 })
 
-/* BLENDPS/PD (imm) */
-BLOCK1(b_blendps, {
-    for (int i = 0; i < 4; i++)
-        memcpy(r + i*4, (imm & (1 << (4+i))) ? s2 + i*4 : s1 + i*4, 4);
-})
-BLOCK1(b_blendpd, {
-    for (int i = 0; i < 2; i++)
-        memcpy(r + i*8, (imm & (1 << (4+i))) ? s2 + i*8 : s1 + i*8, 8);
-})
+/* BLENDPS/PD (imm) — вытеснены blend_imm_block (§7.3 run #106 (D)) */
 /* BLENDVPS/PD: маска = m (xmm0), знак элемента маски */
 static void b_blendvps_m(uint8_t *d, const uint8_t *s1, const uint8_t *s2, const uint8_t *m)
 {
@@ -655,16 +695,17 @@ static void b_pblendvb_m(uint8_t *d, const uint8_t *s1, const uint8_t *s2, const
     memcpy(d, r, 16);
 }
 /* VPBLENDD (imm, dword) */
-BLOCK1(b_vpblendd, {
-    for (int i = 0; i < 4; i++)
-        memcpy(r + i*4, (imm & (1 << (4+i))) ? s2 + i*4 : s1 + i*4, 4);
-})
+/* VPBLENDD — вытеснен blend_imm_block (§7.3 run #106 (D)) */
 
 /* INSERTPS */
 BLOCK1(b_insertps, {
-    int zmask = (int)((imm >> 6) & 3);
+    /* §7.3 run #106 (G): эмпирия (native insertps $0x13, t0/t1 →
+     * [0, 0, V2, V3]): zmask = imm8[3:0] (4 бита!), dsel = imm8[5:4],
+     * ssel = imm8[7:6]; zmask перекрывает вставку. Было zmask=imm[7:6],
+     * ssel=imm[3:2].                                       */
+    int zmask = (int)(imm & 0xF);
     int dsel  = (int)((imm >> 4) & 3);
-    int ssel  = (int)((imm >> 2) & 3);
+    int ssel  = (int)((imm >> 6) & 3);
     uint32_t v = ld32(s2 + ssel*4);
     memset(r, 0, 16);
     for (int i = 0; i < 4; i++) {
@@ -732,6 +773,33 @@ static const uint8_t AES_SBOX[256] = {
     0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
     0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
 };
+
+/* §7.3 run #106 (H): обратная таблица — построена из AES_SBOX выше
+ * (инверсия перестановки), нужна AESDEC/AESDECLAST (InvSubBytes). */
+static const uint8_t AES_INV_SBOX[256] = {
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e,
+    0x81, 0xf3, 0xd7, 0xfb, 0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87,
+    0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb, 0x54, 0x7b, 0x94, 0x32,
+    0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49,
+    0x6d, 0x8b, 0xd1, 0x25, 0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16,
+    0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92, 0x6c, 0x70, 0x48, 0x50,
+    0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05,
+    0xb8, 0xb3, 0x45, 0x06, 0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02,
+    0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b, 0x3a, 0x91, 0x11, 0x41,
+    0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8,
+    0x1c, 0x75, 0xdf, 0x6e, 0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89,
+    0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b, 0xfc, 0x56, 0x3e, 0x4b,
+    0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59,
+    0x27, 0x80, 0xec, 0x5f, 0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d,
+    0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef, 0xa0, 0xe0, 0x3b, 0x4d,
+    0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63,
+    0x55, 0x21, 0x0c, 0x7d
+};
 static uint8_t xt(uint8_t a) { return (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1b : 0)); }
 static uint8_t gmul(uint8_t a, uint8_t b)
 {
@@ -794,14 +862,17 @@ static void aes_block(uint8_t *d, const uint8_t *s1, const uint8_t *s2, int opc)
         for (int i = 0; i < 16; i++) r[i] ^= s2[i];
         break;
     case OP_aesdec:
-        for (int i = 0; i < 16; i++) r[i] = AES_SBOX[r[i]]; /* упрощ.: INV_SBOX см. ниже */
+        /* §7.3 run #106 (H): эмпирия t_s41 — AESDEC ≠ AESDECLAST:
+         * AESDEC = InvShiftRows → InvSubBytes → InvMixColumns → XOR
+         * (InvMixColumns входит в круглую инструкцию, в DECLAST — нет). */
         inv_shift_rows(r);
+        for (int i = 0; i < 16; i++) r[i] = AES_INV_SBOX[r[i]];
         inv_mix_cols(r);
         for (int i = 0; i < 16; i++) r[i] ^= s2[i];
         break;
     case OP_aesdeclast:
-        for (int i = 0; i < 16; i++) r[i] = AES_SBOX[r[i]];
         inv_shift_rows(r);
+        for (int i = 0; i < 16; i++) r[i] = AES_INV_SBOX[r[i]];
         for (int i = 0; i < 16; i++) r[i] ^= s2[i];
         break;
     case OP_aesimc:
@@ -814,30 +885,30 @@ static void aes_block(uint8_t *d, const uint8_t *s1, const uint8_t *s2, int opc)
 }
 static void aes_keygen(uint8_t *d, const uint8_t *s, uint imm)
 {
-    static const uint8_t rcon_tab[10] = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36};
-    uint8_t rc = (imm & 0xF) < 10 ? rcon_tab[imm & 0xF] : 0;
+    /* §7.3 run #106 (I): семантика вскрыта нативным пробником
+     * (kgprobe, вход 01..10, imm=0 → 6b6fc530 6fc5306b d7ab76ca
+     * ab76cad7): выход строится из НЕЧЁТНЫХ dword'ов источника:
+     *   DEST[31:0]   = SubWord(X1)
+     *   DEST[63:32]  = SubWord(RotWord(X1)) XOR RCON (байт 0)
+     *   DEST[95:64]  = SubWord(X3)
+     *   DEST[127:96] = SubWord(RotWord(X3)) XOR RCON (байт 0)
+     * X1 = s[4:8], X3 = s[12:16], RotWord = байт-ротация влево,
+     * RCON = imm8 (imm=3 даёт XOR 0x03 в байте 0 — проверено). */
+    uint8_t rc = (uint8_t)imm;
     uint8_t r[16];
-    uint32_t x = ld32(s);
-    uint32_t xrot = (x >> 8) | (x << 24); /* RotWord */
-    uint32_t sub = ((uint32_t)AES_SBOX[xrot & 0xFF]) |
-                   ((uint32_t)AES_SBOX[(xrot >> 8) & 0xFF] << 8) |
-                   ((uint32_t)AES_SBOX[(xrot >> 16) & 0xFF] << 16) |
-                   ((uint32_t)AES_SBOX[(xrot >> 24) & 0xFF] << 24);
-    uint32_t x1 = sub ^ ((uint32_t)rc << 24);
-    uint32_t x2 = ((uint32_t)AES_SBOX[x & 0xFF]) |
-                  ((uint32_t)AES_SBOX[(x >> 8) & 0xFF] << 8) |
-                  ((uint32_t)AES_SBOX[(x >> 16) & 0xFF] << 16) |
-                  ((uint32_t)AES_SBOX[(x >> 24) & 0xFF] << 24);
-    uint64_t hi = ld64(s + 8);
-    uint32_t hrot = (uint32_t)((hi >> 32) ^ (hi << 32)); /* ROR 64 на 32 */
-    uint32_t x3 = ((uint32_t)AES_SBOX[hrot & 0xFF]) |
-                  ((uint32_t)AES_SBOX[(hrot >> 8) & 0xFF] << 8) |
-                  ((uint32_t)AES_SBOX[(hrot >> 16) & 0xFF] << 16) |
-                  ((uint32_t)AES_SBOX[(hrot >> 24) & 0xFF] << 24);
-    x3 ^= ((uint32_t)rc << 24);
-    st32(r, x1); st32(r + 4, x2); st32(r + 8, x1); st32(r + 12, x3);
+    for (int h = 0; h < 2; h++) {
+        const uint8_t *x = s + 4 + h * 8;      /* X1, X3 */
+        uint8_t *dst = r + h * 8;
+        dst[0] = AES_SBOX[x[0]]; dst[1] = AES_SBOX[x[1]];
+        dst[2] = AES_SBOX[x[2]]; dst[3] = AES_SBOX[x[3]];
+        dst[4] = AES_SBOX[x[1]] ^ rc;
+        dst[5] = AES_SBOX[x[2]];
+        dst[6] = AES_SBOX[x[3]];
+        dst[7] = AES_SBOX[x[0]];
+    }
     memcpy(d, r, 16);
 }
+
 
 /* ══════════════════ PCLMULQDQ ══════════════════ */
 /* 64×64 → 128-битное произведение без __int128 (MSVC x86 его не даёт):
@@ -1189,13 +1260,23 @@ static void string_sim(estate_t *st, emu_desc_t *d,
 
 static void string_op(estate_t *st, emu_desc_t *d, int is_estr, int is_stri)
 {
-    uint8_t tmpb[16];
-    const uint8_t *a = EX(st, xmm_idx(opnd_get_reg(d->dsts[0])));
-    const uint8_t *b = get_block16(st, d->srcs[0], tmpb);
+    /* §7.3 run #106 (A-2): DR-модели string-семьи (irmodel, decode):
+     *  pcmpestri/strm: 1dst_5src(dst=ECX/XMM0, [A, B, imm, EAX, EDX])
+     *  pcmpistri/strm: 1dst_3src(dst=ECX/XMM0, [A, B, imm])
+     * A = srcs[0], B = srcs[1], imm = srcs[2] — у ВСЕХ четырёх форм.
+     * Раньше a читался из dsts[0] (у pcmpestri это ECX → мусорный
+     * xmm-индекс!), b — из srcs[0] (т.е. A!), imm — из srcs[1] (т.е.
+     * B). Путь сегодня мёртв (string-опы left-native, §7.3 #101), но
+     * обязан быть корректным для trap-пути и будущей маршрутизации. */
+    uint8_t tmpa[16], tmpb[16];
+    const uint8_t *a = get_block16(st, d->srcs[0], tmpa);
+    const uint8_t *b = get_block16(st, d->srcs[1], tmpb);
     const uint8_t *maskA = NULL;
     uint imm;
-    if (d->nsrc >= 2 && opnd_is_immed_int(d->srcs[1])) imm = (uint)opnd_get_immed_int(d->srcs[1]);
-    else imm = 0;
+    if (d->nsrc >= 3 && opnd_is_immed_int(d->srcs[2]))
+        imm = (uint)opnd_get_immed_int(d->srcs[2]);
+    else
+        imm = 0;
     if (is_estr) maskA = EX(st, 0);
 
     strsim_t sim;
@@ -1727,8 +1808,18 @@ int emu_generic_impl(emu_desc_t *d)
         dr_fprintf(STDERR, "\n");
     }
     uint8_t t1[16], t2[16], imm = 0;
-    if (d->nsrc >= 1 && opnd_is_immed_int(d->srcs[d->nsrc - 1]))
-        imm = (uint8_t)opnd_get_immed_int(d->srcs[d->nsrc - 1]);
+    /* §7.3 run #106 (E): imm может стоять НЕ последним в srcs! DR
+     * декодирует легаси-формы palignr/dpps/dppd/mpsadbw/roundss/sd/
+     * pclmulqdq/blendps/pd как [W, imm, V] — imm в СЕРЕДИНЕ. Старое
+     * чтение srcs[nsrc-1] давало imm=0 (например blendps: все каналы
+     * из dst). Сканируем все srcs от конца к началу.                  */
+    for (int k = d->nsrc - 1; k >= 0; k--) {
+        if (k >= 4) continue;
+        if (opnd_is_immed_int(d->srcs[k])) {
+            imm = (uint8_t)opnd_get_immed_int(d->srcs[k]);
+            break;
+        }
+    }
 
     switch (d->opc) {
     /* ── блочные 16Б/32Б ── */
@@ -1776,14 +1867,29 @@ int emu_generic_impl(emu_desc_t *d)
         void (*fn)(uint8_t *, const uint8_t *, const uint8_t *, uint) = NULL;
         uint8_t S1[32], S2[32], D[32];
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
-        /* источники: reg → EX+EY, mem → чтение 32/16/4Б по размеру операнда */
-        get_block32(&st, d->srcs[0], S1);
-        if (d->nsrc >= 2 && !opnd_is_immed_int(d->srcs[1]))
-            get_block32(&st, d->srcs[1], S2);
-        else
-            memset(S2, 0, 32);
         memcpy(D, EX(&st, di), 16);
         if (d->is_ymm) memcpy(D + 16, EY(&st, di), 16);
+        /* источники: reg → EX+EY, mem → чтение 32/16/4Б по размеру операнда.
+         * §7.3 run #106 (C): стейджинг различает VEX/легаси-модели:
+         *  VEX: канон srcs[0]=V(Hx), srcs[1]=W (imm-форма [V,W,imm]).
+         *  легаси V-формы (legacy_vw): V=DST, W=srcs[0] — раньше S1=
+         *  srcs[0]=W (правильно только для VEX): pcmpgtq перевёрнут,
+         *  packusdw перепутал половины, а imm-формы [W,imm,V] читали
+         *  S2 из нулей (blendps/palignr/dpps/mpsadbw/roundss/sd/
+         *  insertps/pclmulqdq).                                        */
+        if (d->is_vex) {
+            get_block32(&st, d->srcs[0], S1);
+            if (d->nsrc >= 2 && !opnd_is_immed_int(d->srcs[1]))
+                get_block32(&st, d->srcs[1], S2);
+            else
+                memset(S2, 0, 32);
+        } else if (legacy_vw(d->opc)) {
+            memcpy(S1, D, 32);                    /* V = dst (неявный источник) */
+            get_block32(&st, d->srcs[0], S2);     /* W = rm */
+        } else {
+            get_block32(&st, d->srcs[0], S1);     /* W-формы: fn читает S1 */
+            memset(S2, 0, 32);
+        }
 
         switch (d->opc) {
         case OP_pcmpgtq:  fn = b_pcmpgtq;  break;
@@ -1799,9 +1905,6 @@ int emu_generic_impl(emu_desc_t *d)
         case OP_roundsd:  fn = b_roundsd;  break;
         case OP_dpps:     fn = b_dpps;     break;
         case OP_dppd:     fn = b_dppd;     break;
-        case OP_blendps:  fn = b_blendps;  break;
-        case OP_blendpd:  fn = b_blendpd;  break;
-        case OP_vpblendd: fn = b_vpblendd; break;
         case OP_pminub: fn = b_pminub; break;
         case OP_pmaxub: fn = b_pmaxub; break;
         case OP_pminuw: fn = b_pminuw; break;
@@ -1896,20 +1999,30 @@ int emu_generic_impl(emu_desc_t *d)
         default: break;
         }
 
-        if (d->opc == OP_aesenc || d->opc == OP_aesdec ||
+        if (d->opc == OP_blendps || d->opc == OP_blendpd ||
+            d->opc == OP_vpblendd) {
+            /* §7.3 run #106 (D): см. blend_imm_block. imm-маска —
+             * младший ниббл на половину; hi-половина 256-битных форм:
+             * ps/d — imm>>4, pd — imm>>2.                        */
+            int is_pd = (d->opc == OP_blendpd);
+            int nl = is_pd ? 2 : 4;
+            blend_imm_block(D, S1, S2, imm, is_pd, nl);
+            if (d->is_ymm)
+                blend_imm_block(D + 16, S1 + 16, S2 + 16, imm >> nl,
+                                is_pd, nl);
+        } else if (d->opc == OP_aesenc || d->opc == OP_aesdec ||
             d->opc == OP_aesenclast || d->opc == OP_aesdeclast ||
             d->opc == OP_aesimc) {
-            /* §7.3 SWAP: порядок источников различается между формами!
-             * legacy (деструктивная 2-op): DR srcs = [Wdq(rm), Vdq(reg)]
-             *   → srcs[0] = КЛЮЧ (rm), srcs[1] = СОСТОЯНИЕ (reg).
-             * VEX (vaesenc, сюда ведёт и trap-fallback): srcs = [Hx, Wx]
-             *   → srcs[0] = СОСТОЯНИЕ, srcs[1] = КЛЮЧ.
-             * Без различения: legacy считал aesenc(ключ, сотс.), VEX —
-             * наоборот. KAT: selftest (vaesenc) и aestest (aesenc).    */
-            if (d->is_vex)
-                aes_block(D, S1, S2, d->opc);
-            else
-                aes_block(D, S2, S1, d->opc);
+            /* §7.3 run #106: SWAP больше не нужен — стейджинг (C) даёт
+             * S1=V(состояние), S2=W(ключ) для ОБОИХ форм:
+             *  legacy [W(key), V(state)] → S1=D=V, S2=srcs[0]=W;
+             *  VEX [V, W] → S1=srcs[0]=V, S2=srcs[1]=W.
+             * aes_block ждёт (state, key) — теперь единообразно.
+             * aesimc (unary, 1dst_1src): LEGACY_W/VEX S1=W — раньше
+             * legacy aesimc проходил через swap → aes_block(D, 0, W)
+             * → НУЛЕВОЙ результат. KAT: selftest (vaesenc), aestest,
+             * t_s41 (легаси aesenc/aesimc).                             */
+            aes_block(D, S1, S2, d->opc);
             if (d->is_ymm) aes_block(D + 16, S1 + 16, S2 + 16, d->opc);
         } else if (d->opc == OP_aeskeygenassist) {
             aes_keygen(D, S1, imm);
@@ -2244,11 +2357,16 @@ int emu_generic_impl(emu_desc_t *d)
     }
 
     /* ── PTEST / VTEST ── источник может быть памятью (y/xmm vs m256/m128)!
-     * Читаем через get_block32: reg → EX+EY, mem → чтение по размеру.     */
+     * Читаем через get_block32: reg → EX+EY, mem → чтение по размеру.
+     * §7.3 run #106 (A): DR-модель PTEST = 0dst_2src (INSTR_CREATE_ptest
+     * = instr_create_0dst_2src; проверено irmodel на decode) — операнды
+     * лежат в srcs[0]/srcs[1], а dsts[0] НЕ СУЩЕСТВУЕТ (ndst=0). Чтение
+     * dsts[0] возвращало мусорный opnd_t → xmm_idx() от мусорного reg →
+     * чтение чужого слота BUF → неверные флаги после ptest.           */
     case OP_ptest: {
         uint8_t s1b[32], s2v[32];
-        get_block32(&st, d->dsts[0], s1b);          /* dst — всегда reg */
-        get_block32(&st, d->srcs[1], s2v);          /* reg или память */
+        get_block32(&st, d->srcs[0], s1b);          /* 0dst_2src: s1 в srcs[0] */
+        get_block32(&st, d->srcs[1], s2v);          /* s2: reg или память */
         if (d->is_ymm) {
             int zf = 1, cf = 1;
             for (int i = 0; i < 32; i++) {
@@ -2263,26 +2381,41 @@ int emu_generic_impl(emu_desc_t *d)
     }
     case OP_vtestps: case OP_vtestpd: {
         uint8_t s1b[32], s2v[32];
-        get_block32(&st, d->dsts[0], s1b);
+        get_block32(&st, d->srcs[0], s1b);          /* 0dst_2src: см. (A) выше */
         get_block32(&st, d->srcs[1], s2v);
         vtest(&st, s1b, s2v, d->opc == OP_vtestpd);
         break;
     }
 
-    /* ── переменные blendv ── */
+    /* ── переменные blendv ──
+     * §7.3 run #106 (C-2): DR-модели форм РАЗЛИЧАЮТСЯ!
+     *  legacy blendvps/pd: 1dst_3src [W(rm), XMM0(маска), V(dst)] —
+     *      вектор-источник в srcs[0], маска — неявный XMM0.
+     *  VEX vblendvps/pd (без case-метки в диспетчер не доходит,
+     *      ветка для устойчивости): [V, W, mask].
+     * Раньше вектор читался из srcs[1] — у legacy это МАСКА XMM0:
+     * blend выбирал элементы из маски вместо источника.            */
     case OP_blendvps: case OP_blendvpd: {
-        /* src2 может быть памятью: берём полные 32Б через get_block32,
+        /* источник может быть памятью: берём полные 32Б через get_block32,
          * младшая половина — s2v, старшая — s2v+16 (для reg это EY(idx)). */
-        uint8_t s2v[32];
+        uint8_t s2v[32], m32[32];
         uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        get_block32(&st, d->srcs[1], s2v);
-        const uint8_t *m = EX(&st, 0);
+        const uint8_t *m;
+        if (d->is_vex) {
+            get_block32(&st, d->srcs[1], s2v);          /* W */
+            get_block32(&st, d->srcs[2], m32);          /* маска: reg→EX+EY, mem→32Б */
+            m = m32;
+        } else {
+            get_block32(&st, d->srcs[0], s2v);          /* legacy: W в srcs[0] */
+            m = EX(&st, 0);                             /* маска — XMM0 */
+        }
         if (d->opc == OP_blendvps) b_blendvps_m(dv, dv, s2v, m);
         else                        b_blendvpd_m(dv, dv, s2v, m);
         if (d->is_ymm) {
             int di = xmm_idx(opnd_get_reg(d->dsts[0]));
-            if (d->opc == OP_blendvps) b_blendvps_m(EY(&st, di), EY(&st, di), s2v + 16, EY(&st, 0));
-            else                        b_blendvpd_m(EY(&st, di), EY(&st, di), s2v + 16, EY(&st, 0));
+            const uint8_t *mhi = d->is_vex ? (m32 + 16) : EY(&st, 0);
+            if (d->opc == OP_blendvps) b_blendvps_m(EY(&st, di), EY(&st, di), s2v + 16, mhi);
+            else                        b_blendvpd_m(EY(&st, di), EY(&st, di), s2v + 16, mhi);
         } else if (d->is_vex) {
             int di = xmm_idx(opnd_get_reg(d->dsts[0]));
             memset(EY(&st, di), 0, 16);                     /* VEX.128 */
@@ -2291,7 +2424,11 @@ int emu_generic_impl(emu_desc_t *d)
     }
     case OP_pblendvb: {
         uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        const uint8_t *s2b = src2_block(&st, d, t2);
+        /* legacy pblendvb: [W(rm), XMM0(маска), V(dst)] — W в srcs[0]
+         * (раньше src2_block брал srcs[1] = маску!); VEX vpblendvb:
+         * [V, W, mask] — без case-метки не доходит, ветка для устойчивости */
+        const uint8_t *s2b = d->is_vex ? get_block16(&st, d->srcs[1], t2)
+                                       : get_block16(&st, d->srcs[0], t2);
         const uint8_t *m = EX(&st, 0);
         b_pblendvb_m(dv, dv, s2b, m);
         break;

@@ -41,7 +41,7 @@ done
 
 echo "── дифф-тесты (побайтно native vs pass)"
 gcc -O1 -msse4.1 "$DATA/t_r10.c" -o t_r10 || bad "сборка t_r10"
-for t in t_lztz t_r10 t_bcast; do
+for t in t_lztz t_r10 t_bcast t_s41; do
     [ -x "$t" ] || continue
     "./$t" > n.bin 2>/dev/null
     run_pass -- "./$t" > p.bin 2>/dev/null
