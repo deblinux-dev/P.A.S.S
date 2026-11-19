@@ -348,6 +348,12 @@ jobs:
           for G in -no256 -no128 -nospecial -nomsk -novz -noveh -noproxy; do
             TMO=60 run_case "bun -e 'console.log(6*7)' $G" ./pass.exe $G -target core2 -- "$BUN_X64" -e "console.log(6*7)"
           done
+          echo "==== JS-охота §7.3: CMPBUF — сверка спилов с контекстом ===="
+          PASS_CMPBUF=1 TMO=90 run_case "bun -e '0' + PASS_CMPBUF=1 (десинк носителя?)" ./pass.exe -target core2 -- "$BUN_X64" -e "0"
+          echo "==== JS-охота §7.3: режимы без -e ===="
+          printf 'console.log(6*7)\n' > jsfile.js
+          TMO=60 run_case "bun jsfile.js (файловый режим)" ./pass.exe -target core2 -- "$BUN_X64" jsfile.js
+          TMO=60 run_case "bun --print '6*7'" ./pass.exe -target core2 -- "$BUN_X64" --print "6*7"
 
           echo "" >> "$RES"
           echo "Ожидание по §7.2: на Linux чистый DR виснет на bun; на Windows (см. прогон) — совместим." >> "$RES"

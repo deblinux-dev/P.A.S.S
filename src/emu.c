@@ -342,22 +342,26 @@ IBLOCK(b_vpcmpgtb, int8_t,  16, o = (a > b) ? (uint8_t)0xFF : 0)
 IBLOCK(b_vpcmpgtw, int16_t,  8, o = (a > b) ? (uint16_t)0xFFFF : 0)
 IBLOCK(b_vpcmpgtd, int32_t,  4, o = (a > b) ? 0xFFFFFFFFu : 0)
 
-/* imm-сдвиги слов/двойных слов (VPSLL/RL W/D/Q imm, поканально в 256) */
-#define SHIFTI(name, T, cnt, shexpr) \
+/* imm-сдвиги слов/двойных слов (VPSLL/RL W/D/Q imm, поканально в 256).
+ * SDM: count > ширины элемента → результат 0 (не count & (w-1)!)     */
+#define SHIFTI(name, T, cnt, bits, lshift) \
 BLOCK1(name, { \
     for (int i = 0; i < cnt; i++) { \
         T a, o = 0; \
         memcpy(&a, s1 + i*sizeof(T), sizeof(T)); \
-        (void)a; shexpr; \
+        if (imm < bits) { \
+            if (lshift) o = (T)(a << imm); \
+            else o = (T)(a >> imm); \
+        } \
         memcpy(r + i*sizeof(T), &o, sizeof(T)); \
     } \
 })
-SHIFTI(b_vpsllw, uint16_t, 8, { int k = imm & 15; if (k) o = (uint16_t)(a << k); })
-SHIFTI(b_vpsrlw, uint16_t, 8, { int k = imm & 15; if (k) o = (uint16_t)(a >> k); })
-SHIFTI(b_vpslld, uint32_t, 4, { int k = imm & 31; if (k) o = (uint32_t)(a << k); })
-SHIFTI(b_vpsrld, uint32_t, 4, { int k = imm & 31; if (k) o = (uint32_t)(a >> k); })
-SHIFTI(b_vpsllq, uint64_t, 2, { int k = imm & 63; if (k) o = (uint64_t)(a << k); })
-SHIFTI(b_vpsrlq, uint64_t, 2, { int k = imm & 63; if (k) o = (uint64_t)(a >> k); })
+SHIFTI(b_vpsllw, uint16_t, 8, 16, 1)
+SHIFTI(b_vpsrlw, uint16_t, 8, 16, 0)
+SHIFTI(b_vpslld, uint32_t, 4, 32, 1)
+SHIFTI(b_vpsrld, uint32_t, 4, 32, 0)
+SHIFTI(b_vpsllq, uint64_t, 2, 64, 1)
+SHIFTI(b_vpsrlq, uint64_t, 2, 64, 0)
 /* байтовые сдвиги в 128-битной полосе (imm за границей — ноль) */
 BLOCK1(b_vpslldq, {
     int k = imm > 15 ? 16 : imm;
