@@ -342,6 +342,126 @@ IBLOCK(b_vpcmpgtb, int8_t,  16, o = (a > b) ? (uint8_t)0xFF : 0)
 IBLOCK(b_vpcmpgtw, int16_t,  8, o = (a > b) ? (uint16_t)0xFFFF : 0)
 IBLOCK(b_vpcmpgtd, int32_t,  4, o = (a > b) ? 0xFFFFFFFFu : 0)
 
+/* imm-сдвиги слов/двойных слов (VPSLL/RL W/D/Q imm, поканально в 256) */
+#define SHIFTI(name, T, cnt, shexpr) \
+BLOCK1(name, { \
+    for (int i = 0; i < cnt; i++) { \
+        T a, o = 0; \
+        memcpy(&a, s1 + i*sizeof(T), sizeof(T)); \
+        (void)a; shexpr; \
+        memcpy(r + i*sizeof(T), &o, sizeof(T)); \
+    } \
+})
+SHIFTI(b_vpsllw, uint16_t, 8, { int k = imm & 15; if (k) o = (uint16_t)(a << k); })
+SHIFTI(b_vpsrlw, uint16_t, 8, { int k = imm & 15; if (k) o = (uint16_t)(a >> k); })
+SHIFTI(b_vpslld, uint32_t, 4, { int k = imm & 31; if (k) o = (uint32_t)(a << k); })
+SHIFTI(b_vpsrld, uint32_t, 4, { int k = imm & 31; if (k) o = (uint32_t)(a >> k); })
+SHIFTI(b_vpsllq, uint64_t, 2, { int k = imm & 63; if (k) o = (uint64_t)(a << k); })
+SHIFTI(b_vpsrlq, uint64_t, 2, { int k = imm & 63; if (k) o = (uint64_t)(a >> k); })
+/* байтовые сдвиги в 128-битной полосе (imm за границей — ноль) */
+BLOCK1(b_vpslldq, {
+    int k = imm > 15 ? 16 : imm;
+    for (int i = 0; i < 16; i++)
+        r[i] = (i >= k) ? s1[i - k] : 0;
+})
+BLOCK1(b_vpsrldq, {
+    int k = imm > 15 ? 16 : imm;
+    for (int i = 0; i < 16; i++)
+        r[i] = (i + k < 16) ? s1[i + k] : 0;
+})
+/* упаковки со насыщением (128→нижняя половина из s1, верхняя из s2) */
+BLOCK1(b_vpacksswb, {
+    for (int i = 0; i < 8; i++) {
+        int16_t v; memcpy(&v, s1 + i*2, 2);
+        r[i] = (uint8_t)(v > 127 ? 127 : v < -128 ? -128 : v);
+    }
+    for (int i = 0; i < 8; i++) {
+        int16_t v; memcpy(&v, s2 + i*2, 2);
+        r[8+i] = (uint8_t)(v > 127 ? 127 : v < -128 ? -128 : v);
+    }
+})
+BLOCK1(b_vpackuswb, {
+    for (int i = 0; i < 8; i++) {
+        int16_t v; memcpy(&v, s1 + i*2, 2);
+        r[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+    for (int i = 0; i < 8; i++) {
+        int16_t v; memcpy(&v, s2 + i*2, 2);
+        r[8+i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+})
+BLOCK1(b_vpackssdw, {
+    for (int i = 0; i < 4; i++) {
+        int32_t v; memcpy(&v, s1 + i*4, 4);
+        int16_t o16 = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        memcpy(r + i*2, &o16, 2);
+    }
+    for (int i = 0; i < 4; i++) {
+        int32_t v; memcpy(&v, s2 + i*4, 4);
+        int16_t o16 = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        memcpy(r + 8 + i*2, &o16, 2);
+    }
+})
+/* пересечения (unpck): interleave низких/высоких элементов */
+#define UNPCK(name, T, half, idx) \
+BLOCK1(name, { \
+    int n = 16 / (int)sizeof(T); \
+    for (int i = 0; i < n/2; i++) { \
+        T v; \
+        memcpy(&v, s1 + ((half==0?i:i+n/2))*sizeof(T), sizeof(T)); \
+        memcpy(r + (2*i)*sizeof(T), &v, sizeof(T)); \
+        memcpy(&v, s2 + ((half==0?i:i+n/2))*sizeof(T), sizeof(T)); \
+        memcpy(r + (2*i+1)*sizeof(T), &v, sizeof(T)); \
+    } \
+})
+UNPCK(b_vpunpcklbw, uint8_t,  0, 0)
+UNPCK(b_vpunpckhbw, uint8_t,  1, 0)
+UNPCK(b_vpunpcklwd, uint16_t, 0, 0)
+UNPCK(b_vpunpckhwd, uint16_t, 1, 0)
+UNPCK(b_vpunpckldq, uint32_t, 0, 0)
+UNPCK(b_vpunpckhdq, uint32_t, 1, 0)
+BLOCK1(b_vpunpcklqdq, {
+    memcpy(r,     s1,     8);
+    memcpy(r + 8, s2,     8);
+})
+BLOCK1(b_vpunpckhqdq, {
+    memcpy(r,     s1 + 8, 8);
+    memcpy(r + 8, s2 + 8, 8);
+})
+/* vpblendw: imm-маска по словам (128-бит, AVX2 нет) */
+BLOCK1(b_vpblendw, {
+    for (int i = 0; i < 8; i++) {
+        uint16_t v = (imm & (1u << i)) ? ld16(s2 + i*2) : ld16(s1 + i*2);
+        st16(r + i*2, v);
+    }
+})
+/* vpshufb: поканальная перестановка байтов по контрольным байтам W */
+BLOCK1(b_vpshufb, {
+    for (int i = 0; i < 16; i++) {
+        uint8_t c = s2[i];
+        r[i] = (c & 0x80) ? 0 : s1[c & 0x0F];
+    }
+})
+/* vpsadbw: 8 байтовых |diff| в 16-бит сумму, нуль-расширение до qword */
+BLOCK1(b_vpsadbw, {
+    for (int q = 0; q < 2; q++) {
+        uint16_t s = 0;
+        for (int i = 0; i < 8; i++)
+            s += (uint16_t)abs((int)s1[q*8+i] - (int)s2[q*8+i]);
+        uint64_t v = s;
+        memcpy(r + q*8, &v, 8);
+    }
+})
+/* vpalignr: байтовый сдвиг пары s2:s1 в полосе (SSSE3-семантика) */
+BLOCK1(b_vpalignr, {
+    uint8_t cat[32];
+    memcpy(cat,     s2, 16);
+    memcpy(cat + 16, s1, 16);
+    int k = imm > 31 ? 32 : imm;
+    for (int i = 0; i < 16; i++)
+        r[i] = (i + k < 32) ? cat[i + k] : 0;
+})
+
 
 #define MINMAX_B(name, cond, T, cnt, ld, st) \
 BLOCK1(name, { \
@@ -1638,7 +1758,17 @@ int emu_generic_impl(emu_desc_t *d)
     case OP_vpmullw: case OP_vpmulhw: case OP_vpmulhuw: case OP_vpmaddwd:
     case OP_vpavgb: case OP_vpavgw:
     case OP_vpcmpeqb: case OP_vpcmpeqw: case OP_vpcmpeqd:
-    case OP_vpcmpgtb: case OP_vpcmpgtw: case OP_vpcmpgtd: {
+    case OP_vpcmpgtb: case OP_vpcmpgtw: case OP_vpcmpgtd:
+    case OP_vpsllw: case OP_vpsrlw: case OP_vpslld: case OP_vpsrld:
+    case OP_vpsllq: case OP_vpsrlq: case OP_vpslldq: case OP_vpsrldq:
+    case OP_vpacksswb: case OP_vpackssdw: case OP_vpackuswb:
+    case OP_vpunpcklbw: case OP_vpunpckhbw:
+    case OP_vpunpcklwd: case OP_vpunpckhwd:
+    case OP_vpunpckldq: case OP_vpunpckhdq:
+    case OP_vpunpcklqdq: case OP_vpunpckhqdq:
+    case OP_vunpcklps: case OP_vunpckhps:
+    case OP_vunpcklpd: case OP_vunpckhpd:
+    case OP_vpblendw: case OP_vpshufb: case OP_vpsadbw: case OP_vpalignr: {
         void (*fn)(uint8_t *, const uint8_t *, const uint8_t *, uint) = NULL;
         uint8_t S1[32], S2[32], D[32];
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
@@ -1732,6 +1862,33 @@ int emu_generic_impl(emu_desc_t *d)
         case OP_vpcmpgtb: fn = b_vpcmpgtb; break;
         case OP_vpcmpgtw: fn = b_vpcmpgtw; break;
         case OP_vpcmpgtd: fn = b_vpcmpgtd; break;
+        case OP_vpsllw:  fn = b_vpsllw;  break;
+        case OP_vpsrlw:  fn = b_vpsrlw;  break;
+        case OP_vpslld:  fn = b_vpslld;  break;
+        case OP_vpsrld:  fn = b_vpsrld;  break;
+        case OP_vpsllq:  fn = b_vpsllq;  break;
+        case OP_vpsrlq:  fn = b_vpsrlq;  break;
+        case OP_vpslldq: fn = b_vpslldq; break;
+        case OP_vpsrldq: fn = b_vpsrldq; break;
+        case OP_vpacksswb: fn = b_vpacksswb; break;
+        case OP_vpackssdw: fn = b_vpackssdw; break;
+        case OP_vpackuswb: fn = b_vpackuswb; break;
+        case OP_vpunpcklbw: fn = b_vpunpcklbw; break;
+        case OP_vpunpckhbw: fn = b_vpunpckhbw; break;
+        case OP_vpunpcklwd: fn = b_vpunpcklwd; break;
+        case OP_vpunpckhwd: fn = b_vpunpckhwd; break;
+        case OP_vpunpckldq: fn = b_vpunpckldq; break;
+        case OP_vpunpckhdq: fn = b_vpunpckhdq; break;
+        case OP_vpunpcklqdq: fn = b_vpunpcklqdq; break;
+        case OP_vpunpckhqdq: fn = b_vpunpckhqdq; break;
+        case OP_vunpcklps: fn = b_vpunpckldq; break;   /* та же interleave */
+        case OP_vunpckhps: fn = b_vpunpckhdq; break;
+        case OP_vunpcklpd: fn = b_vpunpcklqdq; break;
+        case OP_vunpckhpd: fn = b_vpunpckhqdq; break;
+        case OP_vpblendw: fn = b_vpblendw; break;
+        case OP_vpshufb:  fn = b_vpshufb;  break;
+        case OP_vpsadbw:  fn = b_vpsadbw;  break;
+        case OP_vpalignr: fn = b_vpalignr; break;
         default: break;
         }
 
@@ -1905,6 +2062,95 @@ int emu_generic_impl(emu_desc_t *d)
         }
         memcpy(EX(&st, di), D, 16);
         memset(EY(&st, di), 0, 16);       /* VEX.128 скаляр — верх 0 */
+        break;
+    }
+    /* ── VMOV*: r10-fallback загрузок/сохранений (vmovd/q, aps/ups,
+     * dqa/dqu, ss/sd 2-op, lddqu, ntdq/ntdqa) ── JSC/JIT обращается
+     * к данным через r10-адресацию — inline-карта отклоняет, generic
+     * обязан копировать 16/32Б между mem и shadow. VEX.128 reg-dst
+     * обнуляет верх (инвариант shadow). 3-op vmovss/sd (V-merge).  */
+    case OP_vmovd: case OP_vmovq: {
+        opnd_t d0 = d->dsts[0];
+        opnd_t s0 = d->srcs[0];
+        int esz = (opnd_get_size(d0) == OPSZ_8 ||
+                   opnd_get_size(s0) == OPSZ_8) ? 8 : 4;
+        if (is_vec_reg(d0)) {                 /* GPR/mem → xmm */
+            int di = xmm_idx(opnd_get_reg(d0));
+            uint64_t v = 0;
+            if (opnd_is_reg(s0) && is_gpr_reg(opnd_get_reg(s0)))
+                v = *EG(&st, gpr_idx(opnd_get_reg(s0)));
+            else if (opnd_is_memory_reference(s0))
+                emu_safe_read(&st, mem_addr(&st, s0), &v, esz);
+            else return 0;
+            uint8_t D[16] = {0};
+            memcpy(D, &v, esz);
+            memcpy(EX(&st, di), D, 16);
+            memset(EY(&st, di), 0, 16);       /* VEX.128: верх 0 */
+        } else if (is_vec_reg(s0)) {          /* xmm → GPR/mem */
+            int si = xmm_idx(opnd_get_reg(s0));
+            uint64_t v = 0;
+            memcpy(&v, EX(&st, si), esz);
+            if (opnd_is_reg(d0) && is_gpr_reg(opnd_get_reg(d0)))
+                put_gpr_val(&st, d0, v);
+            else if (opnd_is_memory_reference(d0))
+                emu_safe_write(&st, mem_addr(&st, d0), &v, esz);
+            else return 0;
+        } else return 0;
+        break;
+    }
+    case OP_vmovaps: case OP_vmovups:
+    case OP_vmovdqa: case OP_vmovdqu:
+    case OP_vmovss: case OP_vmovsd:
+    case OP_vlddqu: case OP_vmovntdq: case OP_vmovntdqa:
+    case OP_vmovntps: case OP_vmovntpd: {
+        opnd_t d0 = d->dsts[0];
+        opnd_t s0 = d->srcs[0];
+        int scalar = (d->opc == OP_vmovss || d->opc == OP_vmovsd);
+        int esz = (d->opc == OP_vmovsd || d->opc == OP_vmovntpd) ? 8
+                : (d->opc == OP_vmovss || d->opc == OP_vmovntps) ? 4 : 16;
+        if (is_vec_reg(d0)) {
+            int di = xmm_idx(opnd_get_reg(d0));
+            if (opnd_is_memory_reference(s0)) {
+                if (scalar) {
+                    uint8_t D[16] = {0};
+                    emu_safe_read(&st, mem_addr(&st, s0), D, esz);
+                    memcpy(EX(&st, di), D, 16);      /* верх 0 */
+                } else {
+                    int full = (opnd_get_size(d0) == OPSZ_32);
+                    emu_safe_read(&st, mem_addr(&st, s0), EX(&st, di), 16);
+                    if (full) emu_safe_read(&st, mem_addr(&st, s0) + 16,
+                                            EY(&st, di), 16);
+                    else memset(EY(&st, di), 0, 16);
+                }
+            } else if (is_vec_reg(s0)) {
+                int si = xmm_idx(opnd_get_reg(s0));
+                if (scalar && d->nsrc >= 2 && is_vec_reg(d->srcs[1])) {
+                    /* 3-op vmovss/sd: dst = {V верх, W elem0} */
+                    int wi = xmm_idx(opnd_get_reg(d->srcs[1]));
+                    uint8_t D[16];
+                    memcpy(D, EX(&st, si), 16);
+                    memcpy(D, EX(&st, wi), esz);
+                    memcpy(EX(&st, di), D, 16);
+                } else {
+                    memcpy(EX(&st, di), EX(&st, si), 16);
+                    if (opnd_get_size(d0) == OPSZ_32) {
+                        if (opnd_get_size(s0) == OPSZ_32)
+                            memcpy(EY(&st, di), EY(&st, si), 16);
+                        else memset(EY(&st, di), 0, 16);
+                    } else memset(EY(&st, di), 0, 16);
+                }
+            } else return 0;
+        } else if (opnd_is_memory_reference(d0) && is_vec_reg(s0)) {
+            int si = xmm_idx(opnd_get_reg(s0));
+            if (scalar) {
+                emu_safe_write(&st, mem_addr(&st, d0), EX(&st, si), esz);
+            } else {
+                int full = (opnd_get_size(s0) == OPSZ_32);
+                emu_safe_write(&st, mem_addr(&st, d0), EX(&st, si), 16);
+                if (full) emu_safe_write(&st, mem_addr(&st, d0) + 16,
+                                         EY(&st, si), 16);
+            }
+        } else return 0;
         break;
     }
     /* ── vpmovmskb (r10-fallback: dst GPR, у JSC r10/movmskb) ── */
