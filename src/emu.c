@@ -271,6 +271,78 @@ BLOCK1(b_pcmpeqq, {
         st64(r + q*8, ld64(s1 + q*8) == ld64(s2 + q*8) ? ~(uint64_t)0 : 0);
 })
 
+/* ── целочисленная VEX-семья для r10-fallback (§7.3 run #99/#100,
+ * bun/JSC: r10-операнды JIT уводят vpcmpeqb и пр. в generic) ──
+ * Байтовые/логические — поэлементно; насыщение — по SDM.      */
+BLOCK1(b_vpand,  { for (int i = 0; i < 16; i++) r[i] = s1[i] & s2[i]; })
+BLOCK1(b_vpor,   { for (int i = 0; i < 16; i++) r[i] = s1[i] | s2[i]; })
+BLOCK1(b_vpxor,  { for (int i = 0; i < 16; i++) r[i] = s1[i] ^ s2[i]; })
+BLOCK1(b_vpandn, { for (int i = 0; i < 16; i++) r[i] = (~s1[i]) & s2[i]; })
+
+/* поэлементная арифметика ширины T: T, счёт, выражение над a,b */
+#define IBLOCK(name, T, cnt, expr) \
+BLOCK1(name, { \
+    for (int i = 0; i < cnt; i++) { \
+        T a, b, o; \
+        memcpy(&a, s1 + i*sizeof(T), sizeof(T)); \
+        memcpy(&b, s2 + i*sizeof(T), sizeof(T)); \
+        (void)a; (void)b; expr; \
+        memcpy(r + i*sizeof(T), &o, sizeof(T)); \
+    } \
+})
+IBLOCK(b_vpaddb,  uint8_t,  16, o = (uint8_t)(a + b))
+IBLOCK(b_vpaddw,  uint16_t,  8, o = (uint16_t)(a + b))
+IBLOCK(b_vpaddd,  uint32_t,  4, o = (uint32_t)(a + b))
+IBLOCK(b_vpaddq,  uint64_t,  2, o = (uint64_t)(a + b))
+IBLOCK(b_vpsubb,  uint8_t,  16, o = (uint8_t)(a - b))
+IBLOCK(b_vpsubw,  uint16_t,  8, o = (uint16_t)(a - b))
+IBLOCK(b_vpsubd,  uint32_t,  4, o = (uint32_t)(a - b))
+IBLOCK(b_vpsubq,  uint64_t,  2, o = (uint64_t)(a - b))
+/* насыщающие: знаковые — кламп к [-128,127]/[-32768,32767],
+ * беззнаковые — к [0,255]/[0,65535]; порядок SDM: psubb(x,y)=x-y */
+IBLOCK(b_vpaddsb,  int8_t, 16, { int32_t t = (int32_t)a + b; \
+    o = (int8_t)(t > 127 ? 127 : t < -128 ? -128 : t); })
+IBLOCK(b_vpaddsw,  int16_t, 8, { int32_t t = (int32_t)a + b; \
+    o = (int16_t)(t > 32767 ? 32767 : t < -32768 ? -32768 : t); })
+IBLOCK(b_vpsubsb,  int8_t, 16, { int32_t t = (int32_t)a - b; \
+    o = (int8_t)(t > 127 ? 127 : t < -128 ? -128 : t); })
+IBLOCK(b_vpsubsw,  int16_t, 8, { int32_t t = (int32_t)a - b; \
+    o = (int16_t)(t > 32767 ? 32767 : t < -32768 ? -32768 : t); })
+IBLOCK(b_vpaddusb, uint8_t, 16, { int32_t t = (int32_t)a + b; \
+    o = (uint8_t)(t > 255 ? 255 : t); })
+IBLOCK(b_vpaddusw, uint16_t, 8, { int32_t t = (int32_t)a + b; \
+    o = (uint16_t)(t > 65535 ? 65535 : t); })
+IBLOCK(b_vpsubusb, uint8_t, 16, { int32_t t = (int32_t)a - b; \
+    o = (uint8_t)(t < 0 ? 0 : t); })
+IBLOCK(b_vpsubusw, uint16_t, 8, { int32_t t = (int32_t)a - b; \
+    o = (uint16_t)(t < 0 ? 0 : t); })
+/* умножения: младшие/старшие половины произведения */
+IBLOCK(b_vpmullw,  uint16_t, 8, { int32_t t = (int32_t)(int16_t)a * (int16_t)b; \
+    o = (uint16_t)(uint32_t)(t & 0xFFFF); })
+IBLOCK(b_vpmulhw,  uint16_t, 8, { int32_t t = (int32_t)(int16_t)a * (int16_t)b; \
+    o = (uint16_t)(uint32_t)((t >> 16) & 0xFFFF); })
+IBLOCK(b_vpmulhuw, uint16_t, 8, { uint32_t t = (uint32_t)a * b; \
+    o = (uint16_t)(t >> 16); })
+/* PMADDWD: dword[i] = p1(2i)+p2(2i+1), знаково */
+BLOCK1(b_vpmaddwd, {
+    for (int i = 0; i < 4; i++) {
+        int32_t p0 = (int32_t)(int16_t)ld16(s1 + i*4)     * (int16_t)ld16(s2 + i*4);
+        int32_t p1 = (int32_t)(int16_t)ld16(s1 + i*4 + 2) * (int16_t)ld16(s2 + i*4 + 2);
+        st32(r + i*4, (uint32_t)(p0 + p1));
+    }
+})
+/* средние: (a+b+1)>>1 */
+IBLOCK(b_vpavgb,  uint8_t,  16, o = (uint8_t)(((uint32_t)a + b + 1) >> 1))
+IBLOCK(b_vpavgw,  uint16_t,  8, o = (uint16_t)(((uint32_t)a + b + 1) >> 1))
+/* сравнения: VEX-формы pcmpeq и pcmpgt (b/w/d) */
+IBLOCK(b_vpcmpeqb, uint8_t,  16, o = (a == b) ? (uint8_t)0xFF : 0)
+IBLOCK(b_vpcmpeqw, uint16_t,  8, o = (a == b) ? (uint16_t)0xFFFF : 0)
+IBLOCK(b_vpcmpeqd, uint32_t,  4, o = (a == b) ? 0xFFFFFFFFu : 0)
+IBLOCK(b_vpcmpgtb, int8_t,  16, o = (a > b) ? (uint8_t)0xFF : 0)
+IBLOCK(b_vpcmpgtw, int16_t,  8, o = (a > b) ? (uint16_t)0xFFFF : 0)
+IBLOCK(b_vpcmpgtd, int32_t,  4, o = (a > b) ? 0xFFFFFFFFu : 0)
+
+
 #define MINMAX_B(name, cond, T, cnt, ld, st) \
 BLOCK1(name, { \
     for (int i = 0; i < cnt; i++) { \
@@ -1553,7 +1625,20 @@ int emu_generic_impl(emu_desc_t *d)
     case OP_insertps:
     case OP_aesenc: case OP_aesdec: case OP_aesenclast: case OP_aesdeclast:
     case OP_aesimc: case OP_aeskeygenassist:
-    case OP_pclmulqdq: case OP_vpclmulqdq: {
+    case OP_pclmulqdq: case OP_vpclmulqdq:
+    /* §7.3 run #100: целочисленная VEX-семья через r10-fallback
+     * (bun/JSC) — см. BLOCK1/IBLOCK определения выше */
+    case OP_vpand: case OP_vpandn: case OP_vpor: case OP_vpxor:
+    case OP_vpaddb: case OP_vpaddw: case OP_vpaddd: case OP_vpaddq:
+    case OP_vpsubb: case OP_vpsubw: case OP_vpsubd: case OP_vpsubq:
+    case OP_vpaddsb: case OP_vpaddsw:
+    case OP_vpaddusb: case OP_vpaddusw:
+    case OP_vpsubsb: case OP_vpsubsw:
+    case OP_vpsubusb: case OP_vpsubusw:
+    case OP_vpmullw: case OP_vpmulhw: case OP_vpmulhuw: case OP_vpmaddwd:
+    case OP_vpavgb: case OP_vpavgw:
+    case OP_vpcmpeqb: case OP_vpcmpeqw: case OP_vpcmpeqd:
+    case OP_vpcmpgtb: case OP_vpcmpgtw: case OP_vpcmpgtd: {
         void (*fn)(uint8_t *, const uint8_t *, const uint8_t *, uint) = NULL;
         uint8_t S1[32], S2[32], D[32];
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
@@ -1614,6 +1699,39 @@ int emu_generic_impl(emu_desc_t *d)
         case OP_vpsrlvq: fn = b_vpsrlvq; break;
         case OP_vpsravq: fn = b_vpsravq; break;
         case OP_insertps: fn = b_insertps; break;
+        /* §7.3 run #100: целочисленная VEX-семья (r10-fallback) */
+        case OP_vpand:  fn = b_vpand;  break;
+        case OP_vpandn: fn = b_vpandn; break;
+        case OP_vpor:   fn = b_vpor;   break;
+        case OP_vpxor:  fn = b_vpxor;  break;
+        case OP_vpaddb: fn = b_vpaddb; break;
+        case OP_vpaddw: fn = b_vpaddw; break;
+        case OP_vpaddd: fn = b_vpaddd; break;
+        case OP_vpaddq: fn = b_vpaddq; break;
+        case OP_vpsubb: fn = b_vpsubb; break;
+        case OP_vpsubw: fn = b_vpsubw; break;
+        case OP_vpsubd: fn = b_vpsubd; break;
+        case OP_vpsubq: fn = b_vpsubq; break;
+        case OP_vpaddsb:  fn = b_vpaddsb;  break;
+        case OP_vpaddsw:  fn = b_vpaddsw;  break;
+        case OP_vpaddusb: fn = b_vpaddusb; break;
+        case OP_vpaddusw: fn = b_vpaddusw; break;
+        case OP_vpsubsb:  fn = b_vpsubsb;  break;
+        case OP_vpsubsw:  fn = b_vpsubsw;  break;
+        case OP_vpsubusb: fn = b_vpsubusb; break;
+        case OP_vpsubusw: fn = b_vpsubusw; break;
+        case OP_vpmullw:  fn = b_vpmullw;  break;
+        case OP_vpmulhw:  fn = b_vpmulhw;  break;
+        case OP_vpmulhuw: fn = b_vpmulhuw; break;
+        case OP_vpmaddwd: fn = b_vpmaddwd; break;
+        case OP_vpavgb:   fn = b_vpavgb;   break;
+        case OP_vpavgw:   fn = b_vpavgw;   break;
+        case OP_vpcmpeqb: fn = b_vpcmpeqb; break;
+        case OP_vpcmpeqw: fn = b_vpcmpeqw; break;
+        case OP_vpcmpeqd: fn = b_vpcmpeqd; break;
+        case OP_vpcmpgtb: fn = b_vpcmpgtb; break;
+        case OP_vpcmpgtw: fn = b_vpcmpgtw; break;
+        case OP_vpcmpgtd: fn = b_vpcmpgtd; break;
         default: break;
         }
 
@@ -1787,6 +1905,21 @@ int emu_generic_impl(emu_desc_t *d)
         }
         memcpy(EX(&st, di), D, 16);
         memset(EY(&st, di), 0, 16);       /* VEX.128 скаляр — верх 0 */
+        break;
+    }
+    /* ── vpmovmskb (r10-fallback: dst GPR, у JSC r10/movmskb) ── */
+    case OP_vpmovmskb: {
+        if (!is_vec_reg(d->srcs[0])) return 0;
+        int vi = xmm_idx(opnd_get_reg(d->srcs[0]));
+        const uint8_t *S = EX(&st, vi);
+        const uint8_t *H = d->is_ymm ? EY(&st, vi) : NULL;
+        uint32_t m = 0;
+        for (int i = 0; i < 16; i++)
+            if (S[i] & 0x80) m |= 1u << i;
+        if (d->is_ymm)
+            for (int i = 0; i < 16; i++)
+                if (H[i] & 0x80) m |= 1u << (i + 16);
+        put_gpr_val(&st, d->dsts[0], m);
         break;
     }
     case OP_pextrb: case OP_pextrw: case OP_pextrd:
