@@ -47,6 +47,15 @@ static const vex_map_ent_t vex_map[] = {
     E(vpaddsb, paddsb, VF_NDS, F_AVX), E(vpaddsw, paddsw, VF_NDS, F_AVX),
     E(vpaddusb, paddusb, VF_NDS, F_AVX), E(vpaddusw, paddusw, VF_NDS, F_AVX),
     E(vpsubsb, psubsb, VF_NDS, F_AVX), E(vpsubsw, psubsw, VF_NDS, F_AVX),
+    /* §7.4 раунд #111: vpsubusb/vpsubusw/vpmulhuw отсутствовали в карте —
+     * проваливались в default passthrough (features.c: «действительно
+     * неизвестное»): на дев-хосте нативное исполнение читало верх
+     * РЕАЛЬНОГО ymm (мусор инварианта тени — расхождение native vs
+     * pass в t_iemu кейсах 19/20/23, hi-половина = ноль), на реальном
+     * Core 2 — SIGILL и trap-fallback на каждый вызов. Соседняя семья
+     * (vpaddusb/vpaddusw/vpsubsb/vpsubsw/vpmulhw) была в карте с v0.1. */
+    E(vpsubusb, psubusb, VF_NDS, F_AVX), E(vpsubusw, psubusw, VF_NDS, F_AVX),
+    E(vpmulhuw, pmulhuw, VF_NDS, F_AVX),
     E(vpavgb, pavgb, VF_NDS, F_AVX), E(vpavgw, pavgw, VF_NDS, F_AVX),
     E(vpand, pand, VF_NDS, F_AVX), E(vpandn, pandn, VF_NDS, F_AVX),
     E(vpor, por, VF_NDS, F_AVX), E(vpxor, pxor, VF_NDS, F_AVX),
@@ -120,6 +129,14 @@ static const vex_map_ent_t vex_map[] = {
        store писали мусор из аппаратной старшей половины вместо тени. */
     E(vmovdqa, movaps, VF_DIR, F_AVX), E(vmovdqu, movups, VF_DIR, F_AVX),
     E(vmovss, movss, VF_NDS, F_AVX),   E(vmovsd, movsd, VF_NDS, F_AVX),
+    /* §7.4 #111: SSE3-дупы — потерянные соседи из карты (VF_ND2 —
+     * чистые, legacy-формы reg,reg/reg,mem кодируемы). Полуходы
+     * vmovlps/hps/lpd/hpd сюда НЕ попадают: у movlps/hpd нет reg,reg
+     * legacy-формы (VF_NDS эмитит некодируемый 3-операндник —
+     * UNENCODABLE-гард, t_vx41), а store-форма пишет верх РЕАЛЬНОГО
+     * регистра из тени — это generic-кейс halfmove_op.             */
+    E(vmovshdup, movshdup, VF_ND2, F_AVX), E(vmovsldup, movsldup, VF_ND2, F_AVX),
+    E(vmovddup, movddup, VF_ND2, F_AVX),
     E(vmovntps, movntps, VF_DIR, F_AVX), E(vmovntpd, movntpd, VF_DIR, F_AVX),
     E(vmovntdq, movntdq, VF_DIR, F_AVX),
     E(vmovd, movd, VF_DIR, F_AVX), E(vmovq, movq, VF_DIR, F_AVX),

@@ -165,6 +165,39 @@ static const int generic_opcs[] = {
     OP_pmovsxdq, OP_pmovzxbw, OP_pmovzxbd, OP_pmovzxbq, OP_pmovzxwd,
     OP_pmovzxwq, OP_pmovzxdq,
     OP_ptest, OP_vtestps, OP_vtestpd,
+    /* §7.4 раунд #111: строковая семья — маршрутизация из left-native
+     * в generic (README: «маршрутизация в emu — следующий раунд»).
+     * На реальном Core 2 каждый вызов был SIGILL + trap-fallback
+     * (bun/simdutf звает pcmpistri на каждый поиск), теперь — один
+     * clean call; семантика выверена натурной пробой (t_istr.S). */
+    OP_pcmpestri, OP_pcmpestrm, OP_pcmpistri, OP_pcmpistrm,
+    OP_vpcmpestri, OP_vpcmpestrm, OP_vpcmpistri, OP_vpcmpistrm,
+    /* §7.4 раунд #111: VEX-алиасы уже-эмулируемых SSE4.1/4.2/AES —
+     * тот же класс, что vpsubusb (t_iemu 19/20/23): без маршрутизации —
+     * left-native (мусор тени на дев-хосте, SIGILL на Core 2) */
+    OP_vpcmpeqq, OP_vpcmpgtq, OP_vpmulld, OP_vpmuldq,
+    OP_vpackusdw, OP_vphminposuw, OP_vmpsadbw,
+    OP_vroundps, OP_vroundpd, OP_vroundss, OP_vroundsd,
+    OP_vdpps, OP_vdppd, OP_vblendps, OP_vblendpd,
+    OP_vblendvps, OP_vblendvpd, OP_vpblendvb,
+    OP_vpminuw, OP_vpmaxuw, OP_vpminud, OP_vpmaxud,
+    OP_vpminsb, OP_vpmaxsb, OP_vpminsd, OP_vpmaxsd,
+    OP_vpmovsxbw, OP_vpmovsxbd, OP_vpmovsxbq,
+    OP_vpmovsxwd, OP_vpmovsxwq, OP_vpmovsxdq,
+    OP_vpmovzxbw, OP_vpmovzxbd, OP_vpmovzxbq,
+    OP_vpmovzxwd, OP_vpmovzxwq, OP_vpmovzxdq,
+    OP_vinsertps, OP_vextractps, OP_vptest,
+    OP_vaesenc, OP_vaesdec, OP_vaesenclast, OP_vaesdeclast,
+    OP_vaesimc, OP_vaeskeygenassist,
+    /* AVX1: vmaskmov (load/store — один opc, ветвление в emu по dst),
+     * cvt-ширины (256-битные формы читают младшую половину источника —
+     * механическое расщепление inline-карты неприменимо), permil */
+    OP_vmaskmovps, OP_vmaskmovpd,
+    OP_vcvtdq2pd, OP_vcvtpd2dq, OP_vcvttpd2dq,
+    OP_vpermilps, OP_vpermilpd,
+    /* полуходы: load-форма = merge с m64 (reg,reg legacy-формы нет),
+     * store-форма читает верх результата из RAW_YHI-тени */
+    OP_vmovlps, OP_vmovhps, OP_vmovlpd, OP_vmovhpd,
     OP_insertps, OP_extractps, OP_pextrb, OP_pextrw, OP_pextrd,
     OP_vpextrb, OP_vpextrw, OP_vpextrd,        /* VEX-алиасы (и vpextrq) */
     OP_pinsrb, OP_pinsrd,
@@ -212,7 +245,8 @@ static void build_desc(instr_t *i, emu_desc_t *d)
     d->opc = instr_get_opcode(i);
     d->is_vex = (uint8_t)instr_bytes_vex(i);
     d->ndst = instr_num_dsts(i); if (d->ndst > 2) d->ndst = 2;
-    d->nsrc = instr_num_srcs(i); if (d->nsrc > 4) d->nsrc = 4;
+    /* §7.4 #111: лимит 5 — pcmpestri/strm несут srcs[4]=EDX (длина) */
+    d->nsrc = instr_num_srcs(i); if (d->nsrc > 5) d->nsrc = 5;
     for (int k = 0; k < d->ndst; k++) d->dsts[k] = instr_get_dst(i, k);
     for (int k = 0; k < d->nsrc; k++) d->srcs[k] = instr_get_src(i, k);
 
@@ -235,7 +269,11 @@ static void build_desc(instr_t *i, emu_desc_t *d)
         }
         if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
     }
-    for (int k = 0; k < 4; k++) {
+    /* §7.4 #111: лимит 5 — pcmpestri/strm несут srcs[3]=EAX, srcs[4]=EDX
+     * (длины строк); при жёстком 4 эти источники не попадали в gpr_src,
+     * не спиллись в BUF_GPR, и emu читал длины как нули (86/180 кейсов
+     * t_istr расходились: ECX=16, CF=0 — как у пустых строк). */
+    for (int k = 0; k < 5; k++) {
         if (k >= d->nsrc) break;
         opnd_t o = d->srcs[k];
         if (opnd_is_reg(o)) {

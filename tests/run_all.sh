@@ -41,12 +41,20 @@ done
 
 echo "── дифф-тесты (побайтно native vs pass)"
 gcc -O1 -msse4.1 "$DATA/t_r10.c" -o t_r10 || bad "сборка t_r10"
-for t in t_lztz t_r10 t_bcast t_s41; do
+# §7.4 #111: строковая SSE4.2 и VEX-алиасы (asm и C-варианты)
+for t in t_lztz t_r10 t_bcast t_s41 t_istr; do
     [ -x "$t" ] || continue
     "./$t" > n.bin 2>/dev/null
     run_pass -- "./$t" > p.bin 2>/dev/null
     if cmp -s n.bin p.bin; then ok "$t"; else bad "$t (вывод различается)"; fi
 done
+
+echo "── дифф C-тесты VEX-алиасов (t_vx41: stage 6 = все блоки)"
+if command -v gcc >/dev/null && gcc -O1 -mavx2 -maes "$DATA/t_vx41.c" -o t_vx41 2>/dev/null; then
+    "./t_vx41" 6 > nv.bin 2>/dev/null
+    run_pass -- "./t_vx41" 6 > pv.bin 2>/dev/null
+    if cmp -s nv.bin pv.bin; then ok "t_vx41 (VEX-алиасы/cvt/permil/maskmov)"; else bad "t_vx41 (вывод различается)"; fi
+else bad "сборка t_vx41"; fi
 
 echo "── broadcast: generic-путь (§7.3: -nobcast → emu, не left-native)"
 if [ -x t_bcast ]; then

@@ -106,13 +106,20 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
     memset(d, 0, sizeof(*d));
     d->opc = opc;
     d->ndst = instr_num_dsts(ins); if (d->ndst > 2) d->ndst = 2;
-    d->nsrc = instr_num_srcs(ins); if (d->nsrc > 4) d->nsrc = 4;
+    d->nsrc = instr_num_srcs(ins); if (d->nsrc > 5) d->nsrc = 5;
     for (int k = 0; k < d->ndst; k++) d->dsts[k] = instr_get_dst(ins, k);
     for (int k = 0; k < d->nsrc; k++) d->srcs[k] = instr_get_src(ins, k);
     d->flags_def = (opc == OP_ptest || opc == OP_pcmpestri ||
-                    opc == OP_pcmpistri || opc == OP_adcx || opc == OP_adox);
+                    opc == OP_pcmpestrm || opc == OP_pcmpistri ||
+                    opc == OP_pcmpistrm || opc == OP_vpcmpestri ||
+                    opc == OP_vpcmpestrm || opc == OP_vpcmpistri ||
+                    opc == OP_vpcmpistrm || opc == OP_adcx || opc == OP_adox);
+    /* §7.4 #111: ВСЕ четыре формы PCMPxSTRx пишут все 6 флагов (irmodel
+     * W(CF,ZF,SF,OF,AF,PF)=1) — раньше strm-формы и VEX-алиасы были
+     * пропущены, popf вернул бы приложению мусорные флаги. */
     if (opc == OP_blendvps || opc == OP_blendvpd || opc == OP_pblendvb ||
-        opc == OP_pcmpestri || opc == OP_pcmpestrm)
+        opc == OP_pcmpestri || opc == OP_pcmpestrm ||
+        opc == OP_vpcmpestri || opc == OP_vpcmpestrm)
         d->uses_xmm0 = 1;
     if (opc == OP_mulx) d->gpr_src |= (1u << gpr_idx(DR_REG_RDX));
     d->is_ymm = (dsz == OPSZ_32);

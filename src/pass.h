@@ -196,7 +196,7 @@ void rewrite_xgetbv(void *dc, instrlist_t *bb, instr_t *where);
 typedef struct {
     int      opc;
     int      nsrc, ndst;
-    opnd_t   srcs[4];
+    opnd_t   srcs[5];       /* pcmpestri/strm: 5 источников (EAX/EDX) */
     opnd_t   dsts[2];
     uint32_t gpr_src, gpr_dst;   /* битовые маски индексов RAX..R15 */
     uint32_t xmm_src, xmm_dst;   /* битовые маски индексов XMM0..15 */
