@@ -342,16 +342,25 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             opnd_create_reg(DR_REG_RAX)));
     }
 
-    /* (5) clean call — save_fpstate только когда трогаем xmm/ymm:
-     * эмулятор скомпилирован с -mno-sse и xmm не портит, а fxsave+
-     * fninit+fxrstor на каждый чистый вызов съедали ~60% стоимости
-     * (bun.exe на core2: спин в OLL-обёртке DR, §6.24). */
-    /* §7.3: fp остаётся условным — клиент собран с -msse2 (memcpy и
-     * структурные копии в emu_generic инлайнятся в movups/movq!) и
-     * ПОРТИТ xmm без fpstate-спасения (проверено: fp=false ломает
-     * faulttrap/sigtest/selftest локально). Врменный комментарий
-     * «-mno-sse» в старом коде был ошибочен.                        */
-    bool fp = (d->xmm_src | d->xmm_dst) != 0;
+    /* (5) clean call — fp=TRUE ВСЕГДА (см. комментарий ниже).
+     * История: раньше fp был условным «(xmm_src|xmm_dst)!=0» с мотивом
+     * «fxsave+fninit+fxrstor на каждый вызов съедали ~60% стоимости
+     * (bun.exe на core2: спин в OLL-обёртке DR, §6.24)». Оптимизация
+     * несостоятельна — см. §7.3 run #103: bun -e падал SyntaxError
+     * (порча xmm0-5 приложения каллби).                             */
+    /* §7.3 run #103: fp = TRUE ВСЕГДА. Условие (xmm_src|xmm_dst)!=0 —
+     * несостоятельная оптимизация: каллби (emu_generic) компилируется
+     * с -msse2 (GNU) / без ограничений (MSVC) — memcpy/структурные
+     * копии инлайнятся в movups xmm0-5, и при fp=false DR НЕ спасает
+     * xmm вокруг вызова → ПОРЧА векторов приложения. На Linux везло
+     * (кодеген не вкладывал SSE именно в fp=false-путях), на MSVC —
+     * закономерно: bun -e → SyntaxError в builtin (порча строк-данных
+     * в xmm0-5, векторные буферы JSC/bun). Бисекция #103: чистый DR →
+     * OK, -stage 1 → OK, -inline 0 -generic 0 (спуф без стабов) → OK,
+     * -inline 0 (generic-стабы) → FAIL, default → FAIL. Батарея
+     * локально зелёная и с fp=true (ценой fxsave на вызов — до
+     * отдельной xmm-чистой сборки emu, см. v0.3).                 */
+    bool fp = true;
     dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
                          OPND_CREATE_INTPTR((ptr_int_t)d));
 

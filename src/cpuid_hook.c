@@ -275,7 +275,9 @@ void rewrite_cpuid(void *dc, instrlist_t *bb, instr_t *where)
         dc, buf_opnd(BUF_CPU + 0, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, where, INSTR_CREATE_mov_st(
         dc, buf_opnd(BUF_CPU + 8, OPSZ_8), opnd_create_reg(DR_REG_RCX)));
-    dr_insert_clean_call(dc, bb, where, (void *)emu_cpuid, false, 0);
+    /* §7.3 run #103: fp=true всегда — cpuid_hook.c на MSVC тоже без
+     * -mno-sse (флаг только для GNU), каллби может трогать xmm0-5. */
+    dr_insert_clean_call(dc, bb, where, (void *)emu_cpuid, true, 0);
     pass_ins(dc, bb, where, INSTR_CREATE_mov_ld(
         dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_CPU + 16, OPSZ_8)));
     pass_ins(dc, bb, where, INSTR_CREATE_mov_ld(
