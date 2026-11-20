@@ -160,6 +160,8 @@ jobs:
         env:
           MSYS_NO_PATHCONV: "1"
           MSYS2_ARG_CONV_EXCL: "*"
+          PYTHONIOENCODING: "utf-8"
+          PYTHONUTF8: "1"
         run: |
           set -e
           : > guard_disasm.txt

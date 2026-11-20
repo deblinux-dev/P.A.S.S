@@ -26,6 +26,14 @@
 import re
 import sys
 
+# Windows CI: stdout по умолчанию — cp1252 (charmap); русские сообщения
+# падали в UnicodeEncodeError уже ПОСЛЕ чистого скана (репрод: run
+# 44671909380, шаг Guard Windows). Форсируем UTF-8 для stdout/stderr.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # --- точечный denylist (имена мнемоник; AT&T-суффиксы w/l/q/b
 #     допускаются автоматически) -------------------------------
 DENY_EXACT = [
