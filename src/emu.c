@@ -1952,14 +1952,47 @@ static void gpr_adcx_adox(estate_t *st, emu_desc_t *d)
     put_gpr_val(st, d->dsts[0], res & mask);
 }
 /* ══════════════════ POPCNT / LZCNT / TZCNT ══════════════════ */
+/* ПОРТАТИВНЫЙ popcount (SWAR) — БЕЗ аппаратного POPCNT (F3 0F B8,
+ * SSE4.2). __popcnt64 (MSVC) компилируется прямо в инструкцию POPCNT:
+ * на реальном целевом CPU (core2-класс — нет ни AVX, ни SSE4.2) она
+ * даёт #UD УЖЕ ВНУТРИ pass_client.dll → «internal crash 0xc000001d»
+ * (натурный репрод B-2003: bun исполняет popcnt → trap → emu → падение
+ * самого эмулятора). SWAR-идиома исполняется на базовом x86-64
+ * (целочисленные инструкции, SSE2-таргет). Подмену идиомы на POPCNT
+ * исключают флаги -msse2 -mno-sse4.2 -mno-popcnt (GNU) и CI-гвард
+ * scripts/scan_baseline.py (dumpbin/objdump скан наших объектов).
+ * pass_clz64/pass_ctz64 → BSR/BSF — базовые инструкции, безопасны.   */
+static inline uint64_t pass_popcount64(uint64_t x)
+{
+    x -= (x >> 1) & 0x5555555555555555ull;
+    x  = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+    x  = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return (x * 0x0101010101010101ull) >> 56;
+}
+# define PASS_POPCNT64(x) pass_popcount64(x)
 #ifdef _MSC_VER
-# define PASS_POPCNT64(x) __popcnt64(x)
 static inline int pass_clz64(uint64_t v)   { unsigned long i; _BitScanReverse64(&i, v); return 63 - (int)i; }
 static inline int pass_ctz64(uint64_t v)   { unsigned long i; _BitScanForward64(&i, v); return (int)i; }
 #else
-# define PASS_POPCNT64(x) __builtin_popcountll(x)
-static inline int pass_clz64(uint64_t v)   { return __builtin_clzll(v); }
-static inline int pass_ctz64(uint64_t v)   { return __builtin_ctzll(v); }
+/* GNU: БЕЗ __builtin_clzll/ctzll — gcc при -mno-lzcnt кодирует их
+ * «rep bsf» (байты F3 0F BC = TZCNT): на целевом CPU префикс F3
+ * игнорируется и исполняется BSF (без #UD), но в дизасме это
+ * НЕОТЛИЧИМО от настоящего TZCNT — гвард (scan_baseline.py) не
+ * должен гадать о намерении. SWAR на базовых инструкциях; v==0
+ * обрабатывается тотально (вызовы gpr_lzcnt/gpr_tzcnt уже
+ * гвардят ноль — здесь защита от UB на всякий случай).          */
+static inline int pass_clz64(uint64_t v)
+{
+    if (v == 0) return 64;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4;
+    v |= v >> 8; v |= v >> 16; v |= v >> 32;
+    return 64 - (int)pass_popcount64(v);   /* вжух: v = 2^bitlen-1 */
+}
+static inline int pass_ctz64(uint64_t v)
+{
+    if (v == 0) return 64;
+    return (int)pass_popcount64((v & (~v + 1)) - 1);  /* 2^ctz - 1 */
+}
 #endif
 
 /* Канонические флаги LZCNT/TZCNT (F3-класс):
@@ -2021,7 +2054,7 @@ static void gpr_tzcnt(estate_t *st, emu_desc_t *d)
 }
 
 /* ══════════════════ VTESTPS/PD ══════════════════ */
-static void vtest(estate_t *st, const uint8_t *d, const uint8_t *s, int is_pd)
+static void simdtest(estate_t *st, const uint8_t *d, const uint8_t *s, int is_pd)
 {
     int zf = 1, cf = 1;
     int n = is_pd ? 2 : 4;
@@ -2897,7 +2930,7 @@ int emu_generic_impl(emu_desc_t *d)
         uint8_t s1b[32], s2v[32];
         get_block32(&st, d->srcs[0], s1b);          /* 0dst_2src: см. (A) выше */
         get_block32(&st, d->srcs[1], s2v);
-        vtest(&st, s1b, s2v, d->opc == OP_vtestpd);
+        simdtest(&st, s1b, s2v, d->opc == OP_vtestpd);
         break;
     }
 

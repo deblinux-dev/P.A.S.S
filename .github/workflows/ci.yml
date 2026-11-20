@@ -67,6 +67,20 @@ jobs:
           cmake --build build --parallel "$(nproc)"
           ls -l build/libpass_client.so
 
+      - name: Guard — клиент без инструкций вне SSE2-базовой линии
+        # раунд #114: __popcnt64 (MSVC) компилировался в POPCNT → #UD
+        # внутри клиента на реальном CPU без SSE4.2 (internal crash
+        # B-2003). Скан наших объектников ловит весь класс (AVX/SSE4/
+        # POPCNT/LZCNT/BMI/AES/...) независимо от toolchain.
+        run: |
+          set -e
+          : > guard_disasm.txt
+          for o in build/CMakeFiles/pass_client.dir/src/*.o; do
+            echo "=== $o" >> guard_disasm.txt
+            objdump -d "$o" >> guard_disasm.txt
+          done
+          python3 scripts/scan_baseline.py guard_disasm.txt
+
       - name: Regression tests (tests/run_all.sh)
         run: |
           bash tests/run_all.sh "$PWD/build/libpass_client.so" "$PWD/dynamorio/bin64/drrun"
@@ -134,6 +148,26 @@ jobs:
           cmake -S . -B build -DDynamoRIO_DIR="$(pwd -W)/dynamorio/cmake"
           cmake --build build --config Release
           ls -l build/Release/pass_client.dll
+
+      - name: Guard — клиент без инструкций вне SSE2-базовой линии
+        # раунд #114: MSVC НЕ блокирует intrinsic-и флагами — __popcnt64
+        # в emu.c дал POPCNT (F3 0F B8) → #UD на целевом CPU без SSE4.2
+        # (internal crash B-2003 на bun_bl.exe). Скан НАШИХ .obj (не
+        # DLL: статический CRT содержит ISA-диспетчеризуемые memcpy с
+        # AVX2-путями и XGETBV в __isa_available_init — они под
+        # CPUID-гвардом CRT и на целевом CPU не исполняются).
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          set -e
+          : > guard_disasm.txt
+          for o in build/CMakeFiles/pass_client.dir/src/*.obj; do
+            echo "=== $o" >> guard_disasm.txt
+            dumpbin /DISASM:BYTES "$o" >> guard_disasm.txt
+          done
+          python scripts/scan_baseline.py guard_disasm.txt
 
       - name: Build pass.exe and selftest.exe
         shell: bash
@@ -519,7 +553,7 @@ jobs:
           # -fcommon: глобальные данные из заголовков DR (_USES_DR_VERSION_,
           # _DR_CLIENT_AVX512_CODE_IN_USE_) в MSVC-объектах drmgr определены
           # явно; gcc 10+ (-fno-common) даёт второй экземпляр — конфликт.
-          CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -fcommon -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
+          CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -fcommon -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-popcnt -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
           SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/trap.c src/segv_dump.c src/fuzz.c cpuid_hook.o"
           # порядок критичен: GNU ld обрабатывает архивы одним проходом,

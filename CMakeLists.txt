@@ -36,13 +36,28 @@ target_include_directories(pass_client PRIVATE src)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Базовый уровень x86-64 (SSE2): сам клиент обязан исполняться
     # на «старом» CPU без AVX/SSE4. Эмулятор (emu.c) — вовсе без SIMD.
+    # -mno-popcnt — в дополнение к -mno-sse4.2 (раунд #114: класс
+    # «intrinsic → аппаратная инструкция → #UD внутри клиента»;
+    # контроль — CI-гвард scripts/scan_baseline.py на наших объектах).
     target_compile_options(pass_client PRIVATE
         -O2 -g -Wall -Wextra -Wno-unused-parameter
         -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2
+        -mno-popcnt
         -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt
         -mno-movbe -mno-aes -mno-pclmul)
     set_source_files_properties(src/cpuid_hook.c PROPERTIES
         COMPILE_OPTIONS "-mno-sse;-mno-sse2;-mno-mmx")
     # plain-сигнатура — согласована с DynamoRIOConfig.cmake
     target_link_libraries(pass_client m)
+endif()
+
+if(MSVC)
+    # MSVC x64 по умолчанию — базовый x86-64 (SSE2): отключать /arch
+    # нечего. НО intrinsic-и компилятор НЕ блокирует: __popcnt64 даёт
+    # инструкцию POPCNT (SSE4.2) → #UD на целевом CPU — натурный
+    # репрод B-2003 (internal crash на bun_bl.exe, раунд #114).
+    # Правило: в клиенте запрещены аппаратные intrinsic-и выше базового
+    # уровня; контроль — CI-гвард scripts/scan_baseline.py (dumpbin /
+    # DISASM наших .obj до линковки).
+    message(STATUS "PASS: MSVC — SSE2-базовая линия enforced by code discipline + CI guard")
 endif()

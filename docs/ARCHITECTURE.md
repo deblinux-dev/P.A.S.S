@@ -625,6 +625,41 @@ objdump/nm), SIGABRT-проб помогает ловить abort() в glibc.
    run_all 27/27. Урок: «убранное из inline» обязано получить маршрут
    в emu в том же коммите; CI-хосты с AVX не исполняют trap-путь —
    класс trap-only проверяется на реальном старом железе.
+6. **ISA-базовая линия самого клиента: intrinsic → аппаратная инструкция →
+   #UD внутри pass_client.dll** (натурный репрод, Windows, 2026-11-20,
+   B-2003). После закрытия trap-цикла vcmpsd (п.5) bun_bl.exe на
+   реальном CPU без AVX упал громко, но уже не приложением:
+   «P.A.S.S. internal crash at PC 0x7ff7...e620», 0xC000001D
+   (ILLEGAL_INSTRUCTION), PC внутри диапазона клиента. Цепочка:
+   bun_bl (baseline, но по-прежнему требует SSE4.2) исполняет popcnt →
+   core2 #UD → trap-фоллбек → emu_generic → gpr_popcnt64 →
+   `__popcnt64` (MSVC) — это В ЛОБ инструкция POPCNT (F3 0F B8,
+   SSE4.2) → второй #UD, уже внутри клиента → VEH-фильтр клиента
+   видит PC в своём диапазоне → «internal crash». Почему CI не ловил:
+   на CI-хостах emu-путь popcnt не исполняется (нативно), а GNU-ветка
+   была под флагами -msse2 -mno-*; MSVC же НЕ блокирует intrinsic-и
+   никакими флагами — запрет существовал только как дисциплина кода.
+   ФИКС: битовая математика emu (popcount/clz/ctz) — SWAR без
+   builtins. Вычищены и GNU-«сёстры»: gcc при -mno-lzcnt кодирует
+   `__builtin_ctzll` как «rep bsf» (байты F3 0F BC = TZCNT): на
+   целевом CPU префикс F3 игнорируется и исполняется BSF (#UD нет),
+   но в дизасме это неотличимо от настоящего TZCNT — гвард не должен
+   гадать о намерении. ГВАРД: scripts/scan_baseline.py — denylist
+   мнемоник вне SSE2 (VEX/AVX-семья по префиксу 'v', SSE3/SSSE3/
+   SSE4.1/4.2, POPCNT/LZCNT/TZCNT, BMI/ADX, AES/PCLMUL, MOVBE,
+   XSAVE-семья, RDRAND/RDSEED/RDTSCP), сканирует НАШИ объектники из
+   CMakeFiles/pass_client.dir/src (НЕ весь DLL: статический CRT
+   содержит ISA-диспетчеризуемые memcpy/memset с AVX2-путями и
+   XGETBV в __isa_available_init — они под CPUID-гвардом CRT и на
+   целевом CPU не исполняются; их сканирование = ложные
+   срабатывания). Шаги в CI: objdump (Linux) и dumpbin /DISASM:BYTES
+   (Windows) до регрессионных тестов. Проверка: poisoned-объект
+   (gcc -mpopcnt + __builtin_popcountll → popcnt %rdi,%rax) гвард
+   ОТВОДИТ (exit 1); батарея 27/27, t_lztz (popcnt/lzcnt/tzcnt,
+   значения и флаги) бит-в-бит с нативом. Урок: клиент обязан быть
+   исполняемым на целевом CPU — эмулятор не имеет права использовать
+   то, что эмулирует; enforce только бинарным сканом — флагами MSVC
+   класс не закрывается.
 
 ## 8. Журнал дефектов v0.2 (как чинился «стартап glibc»)
 
