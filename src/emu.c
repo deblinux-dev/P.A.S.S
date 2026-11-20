@@ -2568,6 +2568,17 @@ int emu_generic_impl(emu_desc_t *d)
                 fn(D, S1, S2, imm);
                 if (d->is_ymm) fn(D + 16, S1 + 16, S2 + 16, imm);
             }
+            /* §7.5 #115: VCMPSD/VCMPSS флаги НЕ определяют — семья 0F C2
+             * (mask-compare) пишет только маску в DEST, в отличие от
+             * COMISD/UCOMISD (0F 2F) и VTESTPS/PD. Проверено натурным
+             * прогоном (probe_flags: comisd eq → ZF=1; vcmpsd pred
+             * 0/3/13 → rflags нетронуты на хосте и в диффе t_vcmp,
+             * 1536 кейсов × (RFLAGS+DEST) побайтно). Раньше здесь был
+             * ошибочный «COMISD-стиль» установки ZF/PF/CF — он давал
+             * расхождение с нативом сразу во всех парах (PF/ZF мусор
+             * после последнего add вместо SDM-таблицы). Сам контекст
+             * popf/pushf статического пути флаги приложения сохраняет
+             * бит-в-бит — этого достаточно. */
         } else {
             break;
         }

@@ -109,14 +109,25 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
     d->nsrc = instr_num_srcs(ins); if (d->nsrc > 5) d->nsrc = 5;
     for (int k = 0; k < d->ndst; k++) d->dsts[k] = instr_get_dst(ins, k);
     for (int k = 0; k < d->nsrc; k++) d->srcs[k] = instr_get_src(ins, k);
-    d->flags_def = (opc == OP_ptest || opc == OP_pcmpestri ||
-                    opc == OP_pcmpestrm || opc == OP_pcmpistri ||
-                    opc == OP_pcmpistrm || opc == OP_vpcmpestri ||
-                    opc == OP_vpcmpestrm || opc == OP_vpcmpistri ||
-                    opc == OP_vpcmpistrm || opc == OP_adcx || opc == OP_adox);
-    /* §7.4 #111: ВСЕ четыре формы PCMPxSTRx пишут все 6 флагов (irmodel
-     * W(CF,ZF,SF,OF,AF,PF)=1) — раньше strm-формы и VEX-алиасы были
-     * пропущены, popf вернул бы приложению мусорные флаги. */
+    /* #115: флаги — по IR-модели инструкции, как в статическом пути
+     * (build_desc, rewrite.c: instr_get_eflags → flags_def → popf).
+     * IR-модель покрывает ВСЕ флагоопределяющие опкоды — ptest/vtest,
+     * все 8 форм PCMPxSTRx (§7.4 #111), adcx/adox, lzcnt/tzcnt/popcnt/
+     * bzhi/pdep/pext, vcmpss/sd (§7.5), blendv-класс. Прежний жёсткий
+     * список (ptest, pcmpe-формы, adcx/adox) отбрасывал результат эмуляции
+     * для остальных: ZF/PF/CF, вычисленные emu в BUF_FLAGS, не
+     * возвращались приложению — ветвление шло по stale-флагам (тот же
+     * механизм, что «malloc(): corrupted top size» §6.x: сместившийся
+     * DF у node 8000+ эмуляций). Симптом B-2004: паника аллокатора bun
+     * «memory allocation of N bytes failed» на реальном CPU без AVX —
+     * trap-путь на нём исполняется, на CI-хосте с AVX невидим. */
+    {
+        uint efl = instr_get_eflags(ins, DR_QUERY_DEFAULT);
+        d->flags_def = (efl & (EFLAGS_WRITE_CF | EFLAGS_WRITE_ZF |
+                               EFLAGS_WRITE_SF | EFLAGS_WRITE_OF |
+                               EFLAGS_WRITE_PF | EFLAGS_WRITE_AF |
+                               EFLAGS_WRITE_DF)) != 0;
+    }
     if (opc == OP_blendvps || opc == OP_blendvpd || opc == OP_pblendvb ||
         opc == OP_pcmpestri || opc == OP_pcmpestrm ||
         opc == OP_vpcmpestri || opc == OP_vpcmpestrm)

@@ -1,13 +1,22 @@
 # t_vcmp.S — §7.5: дифференциальный тест скалярных сравнений
 # VCMPSS/VCMPSD. Матрица: 12 пар значений × 32 предиката imm8 ×
 # форма reg/mem, отдельно для double и float.
-# Вывод: после каждой операции полный DEST (16Б) — маска в lane0 и
-# верх из SRC1 (маркер 0xC3 в SRC1[127:64]; старый DEST забит мусором
-# 0x77 — проверка, что верх берётся из SRC1, а не из старого DEST).
+# Вывод: после каждой операции RFLAGS (8Б, pushfq СРАЗУ после
+# операции — раньше любого flag-modifying кода) и полный DEST (16Б)
+# — маска в lane0 и верх из SRC1 (маркер 0xC3 в SRC1[127:64]; старый
+# DEST забит мусором 0x77 — проверка, что верх из SRC1, а не из
+# старого DEST).
 # Native vs PASS — вывод обязан совпасть побайтно.
 # История: vcmpss/sd отсутствовали в эмуляции (§7.3 убрал из
 # inline-карты, generic-маршрут не был создан) — left-native на CPU
 # без AVX давал #UD и trap-цикл с exit 86 (bun.exe на Windows).
+# #115: добавлен контроль RFLAGS — VCMPSD/VCMPSS (семья 0F C2,
+# mask-compare) флаги НЕ определяют: RFLAGS после операции обязан
+# совпасть с натурным (остаток от предыдущих арифметических команд,
+# бит-в-бит). История: ошибочная гипотеза «COMISD-стиль» (unordered →
+# ZF|PF|CF и т.д.) давала расхождение во всех парах; натурный probe
+# (comisd eq → ZF=1; vcmpsd $0/$3/$13 → rflags нетронуты) определил
+# реальную семантику.
 .text
 .global _start
 _start:
@@ -26,10 +35,18 @@ pd_loop:
     .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     movdqu garb(%rip), %xmm2         /* мусор в старом DEST */
     vcmpsd $\i, %xmm1, %xmm0, %xmm2  /* DEST = cmp(SRC1=xmm0, SRC2=xmm1) */
+    pushfq
+    pop %rax
+    mov %rax, (%rbx,%r15,1)          /* RFLAGS сразу после операции */
+    add $8, %r15d
     movdqu %xmm2, (%rbx,%r15,1)
     add $16, %r15d
     movdqu garb(%rip), %xmm2
     vcmpsd $\i, 8(%r14,%r13,8), %xmm0, %xmm2   /* mem-форма: SRC2 = m64 */
+    pushfq
+    pop %rax
+    mov %rax, (%rbx,%r15,1)
+    add $8, %r15d
     movdqu %xmm2, (%rbx,%r15,1)
     add $16, %r15d
     .endr
@@ -48,10 +65,18 @@ ps_loop:
     .irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
     movdqu garb(%rip), %xmm2
     vcmpss $\i, %xmm1, %xmm0, %xmm2
+    pushfq
+    pop %rax
+    mov %rax, (%rbx,%r15,1)          /* RFLAGS сразу после операции */
+    add $8, %r15d
     movdqu %xmm2, (%rbx,%r15,1)
     add $16, %r15d
     movdqu garb(%rip), %xmm2
     vcmpss $\i, 4(%r14,%r13,8), %xmm0, %xmm2   /* mem-форма: SRC2 = m32 */
+    pushfq
+    pop %rax
+    mov %rax, (%rbx,%r15,1)
+    add $8, %r15d
     movdqu %xmm2, (%rbx,%r15,1)
     add $16, %r15d
     .endr
@@ -109,4 +134,5 @@ pstab:
 
 .section .bss
 .align 32
-msg:  .space 32768
+msg:  .space 65536                     /* #115: +8Б RFLAGS на кейс:
+                                         12×32×2×24 × 2 секции = 36864 */

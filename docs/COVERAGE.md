@@ -1,4 +1,4 @@
-# Покрытие инструкций P.A.S.S. v0.2.3 (§7.4 раунды #111–#112)
+# Покрытие инструкций P.A.S.S. v0.2.4 (§7.4–7.5 раунды #111–#115)
 
 Легенда: **inline** — безветвевая последовательность в кодовом кэше (быстро);
 **generic** — clean-call C-эмулятор (~100 нс); **trap** — не эмулируется,
@@ -16,7 +16,7 @@ t_s41, t_lztz, t_r10; C: t_vx41 — VEX-алиасы/cvt/permil/maskmov, 6 ст�
 | «Чистые» | vsqrtp*, vrcpps, vrsqrtp*, vcvtdq2ps, vcvtps2dq, vcvttps2dq, vpshufd, vpshuflw/hw, vcomis*, vucomis*, vcvts*s*→si | inline (VF_ND2) |
 | Перемещения | vmovaps/upd/apd/upd, vmovd/q, vmovss/sd (2- и 3-оп.), vmovntp*, vlddqu, vld/stmxcsr, vmovshdup/sldup/ddup (§7.4) | inline (VF_DIR/ND2; 256 — split) |
 | Полуходы | vmovlps/hps/lpd/hpd (load-merge и store из тени) | generic (§7.4) |
-| Сравнения с imm | vcmpps/pd/ss/sd | inline |
+| Сравнения с imm | vcmpps/pd; vcmpss/sd (#113, §7.5 — mask-compare, флагов нет, DEST[127:64]←SRC1) | inline; generic |
 | Конверсии | vcvtsi2ss/sd, vcvtss2sd, vcvtsd2ss | inline; vcvtps2pd (ymm←xmm), vcvtpd2ps, vcvtdq2pd, vcvtpd2dq, vcvttpd2dq (§7.4 — 256-битные формы читают младшую половину источника) | generic |
 | Broadcast | vbroadcastss/sd/f128/i128, vpbroadcastb/w/d/q (reg и mem) | inline (стабы 1dst_3src — §7.3) и generic (emu, -nobcast); t_bcast 18 кейсов × default/-nobcast/-inline 0 |
 | Комбинирование половин | vinsertf/i128, vextractf/i128 | inline |
