@@ -198,6 +198,13 @@ static const int generic_opcs[] = {
     /* полуходы: load-форма = merge с m64 (reg,reg legacy-формы нет),
      * store-форма читает верх результата из RAW_YHI-тени */
     OP_vmovlps, OP_vmovhps, OP_vmovlpd, OP_vmovhpd,
+    /* §7.5: скалярные сравнения vcmpss/vcmpsd — из inline-карты убраны
+     * в §7.3 (legacy-alias OP_cmpsd некодируем), в generic не попадали:
+     * left-native → на CPU без AVX #UD, bun-рантайм возвращает
+     * управление на ту же инструкцию → замкнутый trap-цикл, exit 86
+     * (натурный репродуктор на Windows, bun и bun-baseline одинаково).
+     * Все 32 предиката SDM Table 4-10 — vcmp_result в emu.c (t_vcmp). */
+    OP_vcmpss, OP_vcmpsd,
     OP_insertps, OP_extractps, OP_pextrb, OP_pextrw, OP_pextrd,
     OP_vpextrb, OP_vpextrw, OP_vpextrd,        /* VEX-алиасы (и vpextrq) */
     OP_pinsrb, OP_pinsrd,

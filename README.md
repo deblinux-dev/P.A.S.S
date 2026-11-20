@@ -153,8 +153,10 @@ pass.exe -target core2 -- my_avx2_app.exe args...
 asm-юнит-тесты на чистом `_start`+syscall, дифф-тесты «native vs pass побайтно»
 (printf-батарея, строковая батарея, матрица LZCNT/TZCNT с флагами, строковые
 SSE4.2 t_istr — 230 кейсов ECX+EFLAGS+XMM0, VEX-алиасы t_vx41 — cvt/permil/
-maskmov), статические приложения и KAT-батарея selftest (BMI2/BMI1/AES/PCLMUL/
-CRC32C/SSE4.x/AVX2/FMA против скалярных эталонов на чистом C).
+maskmov, скалярные сравнения t_vcmp — 1536 кейсов: 32 предиката VCMPSS/SD ×
+reg/mem × double/float), статические приложения и KAT-батарея selftest
+(BMI2/BMI1/AES/PCLMUL/CRC32C/SSE4.x/AVX2/FMA против скалярных эталонов на
+чистом C).
 
 ## Структура проекта
 

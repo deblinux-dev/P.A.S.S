@@ -630,6 +630,74 @@ BLOCK1(b_roundsd, {
     memcpy(r, &o, 8);
 })
 
+/* §7.5: VCMPSS/VCMPSD — скалярные сравнения с предикатным imm8.
+ * Из inline-карты убраны в §7.3 (legacy-alias OP_cmpsd некодируем),
+ * в generic не маршрутизировались: left-native → на реальном CPU без
+ * AVX #UD, bun-рантайм перехватывает исключение и возвращает
+ * управление на ту же инструкцию → замкнутый trap-цикл, exit 86
+ * (натурный репродуктор на Windows, bun/bun_bl — одинаково).
+ * SDM (VCMPPS псевдокод, OP5): imm[4:0] — предикат; имена 13/14/17-
+ * 19 — GE_OS/GT_OS/LT_OQ/LE_OQ/UNORD_S (часто путают с N*_OS/_UQ —
+ * таблица ниже выверена натурным прогоном t_vcmp на железе).
+ * «_S»-варианты отличаются лишь исключением #IA на NaN (MXCSR не
+ * моделируем — как во всех fp-эмуляциях). Сравнение float через
+ * double корректно: float→double точен.                            */
+static int vcmp_result(double a, double b, uint imm)
+{
+    int lt = (a < b), eq = (a == b);
+    int un = isnan(a) || isnan(b);
+    int gt = !lt && !eq && !un;
+    switch (imm & 0x1F) {
+    case 0:  return eq;            /* EQ_OQ  */
+    case 1:  return lt;            /* LT_OS  */
+    case 2:  return lt || eq;      /* LE_OS  */
+    case 3:  return un;            /* UNORD_Q*/
+    case 4:  return !eq;           /* NEQ_UQ */
+    case 5:  return !lt;           /* NLT_US */
+    case 6:  return !(lt || eq);   /* NLE_US */
+    case 7:  return !un;           /* ORD_Q  */
+    case 8:  return eq || un;      /* EQ_UQ  */
+    case 9:  return lt || un;      /* NGE_US (!ge) */
+    case 10: return !gt;           /* NGT_US (!gt) */
+    case 11: return 0;             /* FALSE_OQ     */
+    case 12: return gt || lt;      /* NEQ_OQ */
+    case 13: return gt || eq;      /* GE_OS  */
+    case 14: return gt;            /* GT_OS  */
+    case 15: return 1;             /* TRUE_UQ      */
+    case 16: return eq;            /* EQ_OS  */
+    case 17: return lt;            /* LT_OQ  */
+    case 18: return lt || eq;      /* LE_OQ  */
+    case 19: return un;            /* UNORD_S      */
+    case 20: return !eq;           /* NEQ_US */
+    case 21: return !lt;           /* NLT_UQ */
+    case 22: return !(lt || eq);   /* NLE_UQ */
+    case 23: return !un;           /* ORD_S  */
+    case 24: return eq || un;      /* EQ_US  */
+    case 25: return lt || un;      /* NGE_UQ */
+    case 26: return !gt;           /* NGT_UQ */
+    case 27: return 0;             /* FALSE_OS     */
+    case 28: return gt || lt;      /* NEQ_OS */
+    case 29: return gt || eq;      /* GE_OQ  */
+    case 30: return gt;            /* GT_OQ  */
+    case 31: return 1;             /* TRUE_US      */
+    }
+    return 0;                      /* imm[7:5] != 0 — reserved */
+}
+/* Скалярная форма: маска в lane0, верх 128 ← SRC1 (SDM: DEST[127:64] ←
+ * SRC1[127:64]; SRC1 = V-операнд, в DR-каноне srcs[0]).             */
+BLOCK1(b_vcmpsd, {
+    memcpy(r, s1, 16);
+    double a, b; memcpy(&a, s1, 8); memcpy(&b, s2, 8);
+    uint64_t m = vcmp_result(a, b, imm) ? ~(uint64_t)0 : 0;
+    memcpy(r, &m, 8);
+})
+BLOCK1(b_vcmpss, {
+    memcpy(r, s1, 16);
+    float a, b; memcpy(&a, s1, 4); memcpy(&b, s2, 4);
+    uint32_t m = vcmp_result((double)a, (double)b, imm) ? 0xFFFFFFFFu : 0;
+    memcpy(r, &m, 4);
+})
+
 /* BLEND-семья: imm-биты = ПОЛ i на канал (эмпирия run #106: native
  * blendps $0xA5 → lanes 0,2 из SRC; vblendps $0xA5 → то же; blendpd
  * $0x0A → lane 1 из SRC). Было (1 << (4+i)) — биты 4-7 для ОБОИХ
@@ -2193,6 +2261,7 @@ int emu_generic_impl(emu_desc_t *d)
     case OP_vpcmpeqq: case OP_vpcmpgtq: case OP_vpmulld: case OP_vpmuldq:
     case OP_vpackusdw: case OP_vphminposuw: case OP_vmpsadbw:
     case OP_vroundps: case OP_vroundpd: case OP_vroundss: case OP_vroundsd:
+    case OP_vcmpss: case OP_vcmpsd:   /* §7.5: скалярные сравнения */
     case OP_vdpps: case OP_vdppd:
     case OP_vblendps: case OP_vblendpd:
     case OP_vpminuw: case OP_vpmaxuw: case OP_vpminud: case OP_vpmaxud:
@@ -2311,6 +2380,8 @@ int emu_generic_impl(emu_desc_t *d)
         case OP_vroundpd:  fn = b_roundpd;  break;
         case OP_vroundss:  fn = b_roundss;  break;
         case OP_vroundsd:  fn = b_roundsd;  break;
+        case OP_vcmpss:    fn = b_vcmpss;   break;
+        case OP_vcmpsd:    fn = b_vcmpsd;   break;
         case OP_vdpps:     fn = b_dpps;     break;
         case OP_vdppd:     fn = b_dppd;     break;
         case OP_vpminuw: fn = b_pminuw; break;
@@ -2469,7 +2540,15 @@ int emu_generic_impl(emu_desc_t *d)
         }
         memcpy(EX(&st, di), D, 16);
         if (d->is_ymm) memcpy(EY(&st, di), D + 16, 16);
-        else if (d->is_vex) memset(EY(&st, di), 0, 16); /* VEX.128: верх в ноль */
+        else if (d->is_vex && (d->opc == OP_vroundss || d->opc == OP_vroundsd ||
+                               d->opc == OP_vcmpss  || d->opc == OP_vcmpsd))
+            /* скалярные VEX.128: DEST[MAXVL-1:64] ← SRC1[MAXVL-1:64] —
+             * верх YMM сохраняется из V-операнда, НЕ обнуляется (SDM).
+             * Прежде здесь был общий «VEX.128 → ноль» и для скалярных
+             * тоже — верх ymm-тени затирался после каждого vroundsd. */
+            memcpy(EY(&st, di), S1 + 16, 16);
+        else if (d->is_vex)
+            memset(EY(&st, di), 0, 16); /* VEX.128 packed: верх в ноль */
         break;
     }
 
