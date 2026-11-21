@@ -1,0 +1,185 @@
+diff --git a/src/pass.c b/src/pass.c
+index 745a42d..223bca2 100755
+--- a/src/pass.c
++++ b/src/pass.c
+@@ -219,7 +219,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
+ #endif
+     (void)id;
+     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
+-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2005\n");
++    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2007\n");
+ 
+     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
+     memset(&g_cfg, 0, sizeof(g_cfg));
+diff --git a/src/rewrite_special.c b/src/rewrite_special.c
+index 3c25539..90c9f35 100755
+--- a/src/rewrite_special.c
++++ b/src/rewrite_special.c
+@@ -572,17 +572,20 @@ static int try_extract128(void *dc, instrlist_t *bb, instr_t *i)
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, d0, raw_opnd(RAW_YHI(si), OPSZ_16)));
+         } else {
+-            /* mem dst: через xmm15 */
+-            int s_is_15 = (si == 15);
+-            if (!s_is_15)
+-                pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+-                    dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
++            /* mem dst: через xmm15 — спил/восстановление БЕЗУСЛОВНЫЕ.
++             * §7.3 B-2006 (bun 1.2.14 -e, JIT-спил): (1) mov_st/mov_ld с
++             * xmm-операндом = OP_mov с xmm — некодируемо (класс §7.3
++             * fault#1 FMA) → ловушка UNENCODABLE, bun -e умирал rc=-1;
++             * (2) ветка si==15 без спила тоже неверна: носитель всё
++             * равно затирается чтением RAW_YHI(15), а restore обязан
++             * вернуть app-lo (t_vextm case 4). */
++            pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, opnd_create_reg(X15), raw_opnd(RAW_YHI(si), OPSZ_16)));
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
+-            if (!s_is_15)
+-                pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
+-                    dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
++            pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
+         }
+     }
+     instrlist_remove(bb, i);
+@@ -603,6 +606,10 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
+     if (dst_is_15 || (opnd_is_reg(s2) && opnd_get_reg(s2) == X15))
+         return 0;                    /* патологические случаи — в generic */
+     int s1i = xmm_idx(opnd_get_reg(s1));
++    /* §7.3 B-2007 (t_vdir15): s1==xmm15 — носитель затирается без
++    * корректного восстановления в этой раскладке — уводим в generic,
++    * там операнды идут через теневой файл. */
++    if (s1i == 15) return 0;
+     opnd_t xw = opnd_create_reg(DR_REG_XMM0 + di);
+     opnd_t s1w = opnd_create_reg(DR_REG_XMM0 + s1i);
+     opnd_t s2w = opnd_is_reg(s2)
+diff --git a/src/rewrite_vex.c b/src/rewrite_vex.c
+index 16638c6..e4ddf94 100755
+--- a/src/rewrite_vex.c
++++ b/src/rewrite_vex.c
+@@ -594,6 +594,34 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
+                 remove_orig(dc, bb, i);
+                 return 1;                     /* no-op */
+             }
++            /* §7.3 B-2007 (t_vdir15): src==xmm15 — lo в реальном xmm15,
++            * читаем его ДО затирания носителем; после hi-копии
++            * восстанавливаем app-lo из спила. dst==xmm15 — без спила:
++            * финальная запись сама ставит app-lo. */
++            if (s1i == 15) {
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, raw_opnd(RAW_S15, OPSZ_16),
++                    opnd_create_reg(DR_REG_XMM15)));
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, opnd_create_reg(DR_REG_XMM0 + di),
++                    opnd_create_reg(DR_REG_XMM15)));
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, opnd_create_reg(DR_REG_XMM15),
++                    raw_opnd(RAW_YHI(15), OPSZ_16)));
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, raw_opnd(RAW_YHI(di), OPSZ_16),
++                    opnd_create_reg(DR_REG_XMM15)));
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, opnd_create_reg(DR_REG_XMM15),
++                    raw_opnd(RAW_S15, OPSZ_16)));
++                remove_orig(dc, bb, i);
++                return 1;
++            }
++            int rr15 = (di != 15);
++            if (rr15)
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, raw_opnd(RAW_S15, OPSZ_16),
++                    opnd_create_reg(DR_REG_XMM15)));
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, opnd_create_reg(DR_REG_XMM15),
+                 raw_opnd(RAW_YHI(s1i), OPSZ_16)));
+@@ -604,11 +632,25 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, opnd_create_reg(DR_REG_XMM0 + di),
+                 opnd_create_reg(DR_REG_XMM0 + s1i)));
++            if (rr15)
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, opnd_create_reg(DR_REG_XMM15),
++                    raw_opnd(RAW_S15, OPSZ_16)));
++
+             remove_orig(dc, bb, i);
+             return 1;
+         }
+         if (dst_is_reg && !s1_is_reg) {
+-            /* load: hi из [mem+16], lo из [mem] */
++            /* load: hi из em+16], lo из em] — через xmm15 СО СПИЛОМ.
++             * §7.3 B-2006 (t_x15dbg/t_vextm): без спила/восстановления
++             * приложение читало в xmm15 мусор — lo qword [mem+16] —
++             * после любой перезагрузки ymm из памяти. Спил — как в
++             * store-ветке ниже. */
++            int ld_dst15 = (di == 15);
++            if (!ld_dst15)
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, raw_opnd(RAW_S15, OPSZ_16),
++                    opnd_create_reg(DR_REG_XMM15)));
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, opnd_create_reg(DR_REG_XMM15),
+                 mem_off16(s1, 16, OPSZ_16)));
+@@ -618,31 +660,32 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
+             pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                 dc, opnd_create_reg(DR_REG_XMM0 + di),
+                 mem_off16(s1, 0, OPSZ_16)));
++            if (!ld_dst15)
++                pass_ins(dc, bb, i, INSTR_CREATE_movups(
++                    dc, opnd_create_reg(DR_REG_XMM15),
++                    raw_opnd(RAW_S15, OPSZ_16)));
+             remove_orig(dc, bb, i);
+             return 1;
+         }
+-        /* store: [mem] ← ymm (lo, затем hi через xmm15) */
++        /* store: ymm -> em] (lo, затем hi через xmm15). §7.3 B-2006:
++        * спил/восстановление БЕЗУСЛОВНЫЕ — при s1==15 носитель всё
++        * равно затирается чтением RAW_YHI(15), restore возвращает
++        * app-lo (иначе приложение читает в xmm15 старшую половину). */
+         if (!s1_is_reg) return 0;
+-        int s1_is_15 = (s1i == 15);
+-        if (!s1_is_15) {
+-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+-                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+-        }
++        pass_ins(dc, bb, i, INSTR_CREATE_movups(
++            dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+         pass_ins(dc, bb, i, INSTR_CREATE_movups(
+             dc, mem_off16(d0, 0, OPSZ_16),
+             opnd_create_reg(DR_REG_XMM0 + s1i)));
+-        if (!s1_is_15) {
+-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+-                dc, opnd_create_reg(DR_REG_XMM15),
+-                raw_opnd(RAW_YHI(s1i), OPSZ_16)));
+-        }
++        pass_ins(dc, bb, i, INSTR_CREATE_movups(
++            dc, opnd_create_reg(DR_REG_XMM15),
++            raw_opnd(RAW_YHI(s1i), OPSZ_16)));
+         pass_ins(dc, bb, i, INSTR_CREATE_movups(
+             dc, mem_off16(d0, 16, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+-        if (!s1_is_15) {
+-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+-                dc, opnd_create_reg(DR_REG_XMM15),
+-                raw_opnd(RAW_S15, OPSZ_16)));
+-        }
++        pass_ins(dc, bb, i, INSTR_CREATE_movups(
++            dc, opnd_create_reg(DR_REG_XMM15),
++            raw_opnd(RAW_S15, OPSZ_16)));
++
+         remove_orig(dc, bb, i);
+         return 1;
+     }
+diff --git a/tests/run_all.sh b/tests/run_all.sh
+index ec98280..3bb148f 100755
+--- a/tests/run_all.sh
++++ b/tests/run_all.sh
+@@ -30,7 +30,7 @@ done
+ run_pass() { "$DRRUN" -c "$CLIENT" -target core2 "$@" ; }
+ 
+ echo "── asm-тесты (код выхода 0 = успех и нативно, и под core2)"
+-for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256; do
++for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256 t_vextm t_vdir15; do
+     [ -x "$t" ] || continue
+     if "./$t" >/dev/null 2>&1 && run_pass -- "./$t" >/dev/null 2>&1; then
+         ok "$t"

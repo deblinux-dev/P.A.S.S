@@ -24,7 +24,7 @@ t_s41, t_lztz, t_r10; C: t_vx41 — VEX-алиасы/cvt/permil/maskmov, 6 ст�
 | Состояние | vzeroupper, vzeroall | inline (64 mov-imm; +pxor-цепочка) |
 | Переменные сдвиги | vpsllv*, vpsrlv*, vpsrav* | generic |
 | Перестановки cross-lane | vpermd, vpermq, vperm2f128, vperm2i128 | generic |
-| Смешение | vpblendd, vblendps/pd (imm), vblendvps/pd (VEX: база = V srcs[0], маска = srcs[2]), blendv*, pblendvb/vpblendvb, vtestps/pd | generic |
+| Смешение | vpblendd, vblendps/pd (imm), vblendvps/pd (VEX: база = V srcs[0], маска = srcs[2]), blendv*, pblendvb/vpblendvb (B-2008: is_ymm смешивает ОБЕ половины; раньше верх = мусор тени → порча кириллицы в bun/simdutf), vtestps/pd | generic |
 | ROUND/DOT | vroundps/pd/ss/sd, vdpps/dppd, mpsadbw (ymm: у lane1 свои биты imm), phminposuw, insertps | generic |
 | maskmov/gather | vpmaskmovd/q (load: srcs=[маска, mem], незаскированные = 0; store: srcs=[данные, маска]), vmaskmovps/pd (store: srcs=[маска, данные] — порядок DR различается по семействам!), vgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd | generic (маскированные каналы пропускаются) |
 | min/max SSE4.1-набор | pminsb/sd/uw/ud, pmaxsb/sd/uw/ud + VEX-алиасы (vpmin*, vpmax*) | generic |

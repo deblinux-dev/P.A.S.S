@@ -219,7 +219,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2005\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2008\n");
 
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));

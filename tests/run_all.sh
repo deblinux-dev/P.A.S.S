@@ -30,7 +30,7 @@ done
 run_pass() { "$DRRUN" -c "$CLIENT" -target core2 "$@" ; }
 
 echo "── asm-тесты (код выхода 0 = успех и нативно, и под core2)"
-for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256; do
+for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256 t_vextm t_vdir15; do
     [ -x "$t" ] || continue
     if "./$t" >/dev/null 2>&1 && run_pass -- "./$t" >/dev/null 2>&1; then
         ok "$t"
@@ -56,6 +56,18 @@ if command -v gcc >/dev/null && gcc -O1 -mavx2 -maes "$DATA/t_vx41.c" -o t_vx41 
     run_pass -- "./t_vx41" 6 > pv.bin 2>/dev/null
     if cmp -s nv.bin pv.bin; then ok "t_vx41 (VEX-алиасы/cvt/permil/maskmov)"; else bad "t_vx41 (вывод различается)"; fi
 else bad "сборка t_vx41"; fi
+
+echo "── дифф simdutf/B-2008: vpblendvb-ymm (старшая половина)"
+if command -v g++ >/dev/null && g++ -O2 -mavx2 -std=c++17 "$DATA/t_simdutf.cxx" -o t_simdutf 2>/dev/null; then
+    "./t_simdutf" > ns.bin 2>/dev/null
+    run_pass -- "./t_simdutf" > ps.bin 2>/dev/null
+    if cmp -s ns.bin ps.bin; then ok "t_simdutf (haswell utf16→utf8, B-2008)"; else bad "t_simdutf (вывод различается)"; fi
+else bad "сборка t_simdutf"; fi
+if command -v g++ >/dev/null && g++ -O2 -mavx2 -std=c++17 "$DATA/t_blendvar.cxx" -o t_blendvar 2>/dev/null; then
+    "./t_blendvar" > nb.bin 2>/dev/null
+    run_pass -- "./t_blendvar" > pb.bin 2>/dev/null
+    if cmp -s nb.bin pb.bin; then ok "t_blendvar (алиасинг dst vpblendvb + margin8, B-2008)"; else bad "t_blendvar (вывод различается)"; fi
+else bad "сборка t_blendvar"; fi
 
 echo "── broadcast: generic-путь (§7.3: -nobcast → emu, не left-native)"
 if [ -x t_bcast ]; then

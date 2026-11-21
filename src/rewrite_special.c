@@ -572,17 +572,20 @@ static int try_extract128(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, d0, raw_opnd(RAW_YHI(si), OPSZ_16)));
         } else {
-            /* mem dst: через xmm15 */
-            int s_is_15 = (si == 15);
-            if (!s_is_15)
-                pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
-                    dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
+            /* mem dst: через xmm15 — спил/восстановление БЕЗУСЛОВНЫЕ.
+             * §7.3 B-2006 (bun 1.2.14 -e, JIT-спил): (1) mov_st/mov_ld с
+             * xmm-операндом = OP_mov с xmm — некодируемо (класс §7.3
+             * fault#1 FMA) → ловушка UNENCODABLE, bun -e умирал rc=-1;
+             * (2) ветка si==15 без спила тоже неверна: носитель всё
+             * равно затирается чтением RAW_YHI(15), а restore обязан
+             * вернуть app-lo (t_vextm case 4). */
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(X15), raw_opnd(RAW_YHI(si), OPSZ_16)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(X15)));
-            if (!s_is_15)
-                pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
-                    dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
         }
     }
     instrlist_remove(bb, i);
@@ -603,6 +606,10 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
     if (dst_is_15 || (opnd_is_reg(s2) && opnd_get_reg(s2) == X15))
         return 0;                    /* патологические случаи — в generic */
     int s1i = xmm_idx(opnd_get_reg(s1));
+    /* §7.3 B-2007 (t_vdir15): s1==xmm15 — носитель затирается без
+    * корректного восстановления в этой раскладке — уводим в generic,
+    * там операнды идут через теневой файл. */
+    if (s1i == 15) return 0;
     opnd_t xw = opnd_create_reg(DR_REG_XMM0 + di);
     opnd_t s1w = opnd_create_reg(DR_REG_XMM0 + s1i);
     opnd_t s2w = opnd_is_reg(s2)

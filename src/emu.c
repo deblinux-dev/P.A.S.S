@@ -2993,24 +2993,45 @@ int emu_generic_impl(emu_desc_t *d)
         break;
     }
     case OP_pblendvb: case OP_vpblendvb: {
-        uint8_t *dv = EX(&st, xmm_idx(opnd_get_reg(d->dsts[0])));
-        /* legacy pblendvb: [W(rm), XMM0(маска), V(dst)] — W в srcs[0]
-         * (раньше src2_block брал srcs[1] = маску!); VEX vpblendvb:
-         * [V, W, mask] — без case-метки не доходит, ветка для устойчивости */
-        uint8_t t1[32], t3[32];
+        /* §8.1 (B-2008): VEX.256 vpblendvb — старшая половина РАНЬШЕ не
+         * смешивалась вовсе: EX(dst) получал низ, EY(dst) оставался
+         * мусором тени (или несмешанным операндом). В bun/simdutf
+         * (vpblendvb ymm в haswell-ядре utf16→utf8) это давало
+         * [c>>8, c&0xFF] в выхлопе: старшие слова utf8_unpacked были
+         * несмешанным операндом (raw или t4 — по аллокации регистров).
+         * Теперь: все три операнда читаются в локальные копии (низ+верх),
+         * обе половины смешиваются, EY(dst) пишется при is_ymm и
+         * обнуляется при VEX.128 (семантика VEX: верх = 0).
+         * legacy pblendvb: V = старый dst (читается до записи), маска —
+         * неявный XMM0.                                                 */
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        uint8_t s1v[32], s2v[32], mv[32];
         const uint8_t *s1b, *s2b, *m;
         if (d->is_vex) {
             /* VEX [V, W, mask]: база — srcs[0], маска — srcs[2]
              * (раньше маска читалась из XMM0 → 0x25252525-мусор) */
-            s1b = get_block16(&st, d->srcs[0], t1);
-            s2b = get_block16(&st, d->srcs[1], t2);
-            m   = get_block16(&st, d->srcs[2], t3);
+            get_block32(&st, d->srcs[0], s1v);          /* V (низ+верх) */
+            get_block32(&st, d->srcs[1], s2v);          /* W */
+            get_block32(&st, d->srcs[2], mv);           /* маска */
+            s1b = s1v;
+            s2b = s2v;
+            m   = mv;
         } else {
-            s1b = dv;                                   /* V = старый dst */
-            s2b = get_block16(&st, d->srcs[0], t2);
-            m   = EX(&st, 0);
+            s1b = EX(&st, di);                          /* V = старый dst */
+            get_block32(&st, d->srcs[0], s2v);
+            memcpy(mv, EX(&st, 0), 16);                 /* маска — XMM0 */
+            memset(mv + 16, 0, 16);
+            s2b = s2v;
+            m   = mv;
         }
-        b_pblendvb_m(dv, s1b, s2b, m);
+        b_pblendvb_m(EX(&st, di), s1b, s2b, m);         /* низ */
+        if (d->is_ymm) {
+            uint8_t rhi[16];
+            b_pblendvb_m(rhi, s1b + 16, s2b + 16, m + 16);
+            memcpy(EY(&st, di), rhi, 16);
+        } else if (d->is_vex) {
+            memset(EY(&st, di), 0, 16);                 /* VEX.128 */
+        }
         break;
     }
 

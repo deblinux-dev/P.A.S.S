@@ -594,6 +594,34 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
                 remove_orig(dc, bb, i);
                 return 1;                     /* no-op */
             }
+            /* §7.3 B-2007 (t_vdir15): src==xmm15 — lo в реальном xmm15,
+            * читаем его ДО затирания носителем; после hi-копии
+            * восстанавливаем app-lo из спила. dst==xmm15 — без спила:
+            * финальная запись сама ставит app-lo. */
+            if (s1i == 15) {
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_S15, OPSZ_16),
+                    opnd_create_reg(DR_REG_XMM15)));
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM0 + di),
+                    opnd_create_reg(DR_REG_XMM15)));
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15),
+                    raw_opnd(RAW_YHI(15), OPSZ_16)));
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_YHI(di), OPSZ_16),
+                    opnd_create_reg(DR_REG_XMM15)));
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15),
+                    raw_opnd(RAW_S15, OPSZ_16)));
+                remove_orig(dc, bb, i);
+                return 1;
+            }
+            int rr15 = (di != 15);
+            if (rr15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_S15, OPSZ_16),
+                    opnd_create_reg(DR_REG_XMM15)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(DR_REG_XMM15),
                 raw_opnd(RAW_YHI(s1i), OPSZ_16)));
@@ -604,11 +632,25 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(DR_REG_XMM0 + di),
                 opnd_create_reg(DR_REG_XMM0 + s1i)));
+            if (rr15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15),
+                    raw_opnd(RAW_S15, OPSZ_16)));
+
             remove_orig(dc, bb, i);
             return 1;
         }
         if (dst_is_reg && !s1_is_reg) {
-            /* load: hi из [mem+16], lo из [mem] */
+            /* load: hi из em+16], lo из em] — через xmm15 СО СПИЛОМ.
+             * §7.3 B-2006 (t_x15dbg/t_vextm): без спила/восстановления
+             * приложение читало в xmm15 мусор — lo qword [mem+16] —
+             * после любой перезагрузки ymm из памяти. Спил — как в
+             * store-ветке ниже. */
+            int ld_dst15 = (di == 15);
+            if (!ld_dst15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_S15, OPSZ_16),
+                    opnd_create_reg(DR_REG_XMM15)));
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(DR_REG_XMM15),
                 mem_off16(s1, 16, OPSZ_16)));
@@ -618,31 +660,32 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(DR_REG_XMM0 + di),
                 mem_off16(s1, 0, OPSZ_16)));
+            if (!ld_dst15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15),
+                    raw_opnd(RAW_S15, OPSZ_16)));
             remove_orig(dc, bb, i);
             return 1;
         }
-        /* store: [mem] ← ymm (lo, затем hi через xmm15) */
+        /* store: ymm -> em] (lo, затем hi через xmm15). §7.3 B-2006:
+        * спил/восстановление БЕЗУСЛОВНЫЕ — при s1==15 носитель всё
+        * равно затирается чтением RAW_YHI(15), restore возвращает
+        * app-lo (иначе приложение читает в xmm15 старшую половину). */
         if (!s1_is_reg) return 0;
-        int s1_is_15 = (s1i == 15);
-        if (!s1_is_15) {
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
-                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
-        }
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
         pass_ins(dc, bb, i, INSTR_CREATE_movups(
             dc, mem_off16(d0, 0, OPSZ_16),
             opnd_create_reg(DR_REG_XMM0 + s1i)));
-        if (!s1_is_15) {
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
-                dc, opnd_create_reg(DR_REG_XMM15),
-                raw_opnd(RAW_YHI(s1i), OPSZ_16)));
-        }
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15),
+            raw_opnd(RAW_YHI(s1i), OPSZ_16)));
         pass_ins(dc, bb, i, INSTR_CREATE_movups(
             dc, mem_off16(d0, 16, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
-        if (!s1_is_15) {
-            pass_ins(dc, bb, i, INSTR_CREATE_movups(
-                dc, opnd_create_reg(DR_REG_XMM15),
-                raw_opnd(RAW_S15, OPSZ_16)));
-        }
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15),
+            raw_opnd(RAW_S15, OPSZ_16)));
+
         remove_orig(dc, bb, i);
         return 1;
     }
