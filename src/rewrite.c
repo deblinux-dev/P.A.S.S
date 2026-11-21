@@ -38,6 +38,9 @@ void pass_ins(void *dc, instrlist_t *bb, instr_t *at, instr_t *in)
      * Каждая инструкция стаба реализует заменяемую `at` — её app-PC
      * и есть правильная трансляция. */
     instr_set_translation(in, instr_get_app_pc(at));
+    /* B-2009: маркер наших мета-инструкций для restore_state (рекреация
+     * app-контекста при SMC-flush/deletion-redirect — см. restore_state.c) */
+    instr_set_note(in, PASS_META_NOTE);
     /* §7.3 fault#1 КОРЕНЬ: emit.c делает instr_encode_to_copy и
      * ASSERT(pc != NULL) — в релизе проверка ВЫРЕЗАНА. Некодируемая
      * инструкция в стабе (2-я семья бага #10 после vcmpsd) оставляет
@@ -113,9 +116,15 @@ int opnd_uses_r10(opnd_t o)
     if (opnd_is_reg(o) && opnd_get_reg(o) == DR_REG_R10)
         return 1;
     if (opnd_is_memory_reference(o)) {
-        reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
-        if (b == DR_REG_R10 || ix == DR_REG_R10)
-            return 1;
+        /* B-2009: opnd_get_base валиден ТОЛЬКО для base-disp — rel/abs-адреса
+         * (vmovdqa <abs>[32byte] после rip-rel decode, call %rbx rsp-write)
+         * тоже memory_reference, но get_base на них — CLIENT_ASSERT в
+         * debug-DR и мусор в release. */
+        if (opnd_is_base_disp(o) || opnd_is_far_base_disp(o)) {
+            reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+            if (b == DR_REG_R10 || ix == DR_REG_R10)
+                return 1;
+        }
     }
     return 0;
 }
@@ -270,9 +279,12 @@ static void build_desc(instr_t *i, emu_desc_t *d)
                 d->gpr_dst |= 1u << gpr_idx(r);
             }
         } else if (opnd_is_memory_reference(o)) {
-            reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
-            if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
-            if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
+            /* B-2009: base/index только для base-disp (см. opnd_uses_r10) */
+            if (opnd_is_base_disp(o) || opnd_is_far_base_disp(o)) {
+                reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+                if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
+                if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
+            }
         }
         if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
     }
@@ -293,11 +305,14 @@ static void build_desc(instr_t *i, emu_desc_t *d)
                 d->gpr_src |= 1u << gpr_idx(r);
             }
         } else if (opnd_is_memory_reference(o)) {
-            reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
-            if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
-            if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
-            if (ix >= DR_REG_XMM0 && ix <= DR_REG_XMM15)
-                d->xmm_src |= 1u << xmm_idx(ix);      /* gather: индекс в xmm */
+            /* B-2009: base/index только для base-disp (см. opnd_uses_r10) */
+            if (opnd_is_base_disp(o) || opnd_is_far_base_disp(o)) {
+                reg_id_t b = opnd_get_base(o), ix = opnd_get_index(o);
+                if (is_gpr_reg(b)) d->gpr_src |= 1u << gpr_idx(b);
+                if (is_gpr_reg(ix)) d->gpr_src |= 1u << gpr_idx(ix);
+                if (ix >= DR_REG_XMM0 && ix <= DR_REG_XMM15)
+                    d->xmm_src |= 1u << xmm_idx(ix);      /* gather: индекс в xmm */
+            }
             if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
         }
         if (opnd_get_size(o) == OPSZ_32) d->is_ymm = 1;
@@ -334,6 +349,10 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     emu_desc_t *d = (emu_desc_t *)dr_global_alloc(sizeof(emu_desc_t));
     build_desc(i, d);
     d->pc_next = instr_get_app_pc(i) + instr_length(dc, i);
+    /* B-2009: регистрация переписанного pc → маски dst/флагов для
+     * restore_state (рекреация SMC-flush/deletion-redirect). */
+    pass_rw_record((void *)instr_get_app_pc(i), d->gpr_dst, d->xmm_dst,
+                   (d->flags_use || d->flags_def) ? 1 : 0);
 
     /* r10 в операндах поддерживается: carrier_begin спилит исходный r10
      * в RAW_SV10, а ниже (4b) значение переносится в BUF_GPR(10) —
@@ -351,10 +370,17 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
      * прочие неопределяемые биты. Без захвата popf записал бы мусор из
      * BUF_FLAGS: у node 8000+ эмуляций tzcnt/bzhi перевернули DF → rep movs/stos шли
      * назад → «malloc(): corrupted top size». */
+    /* B-2009: захваченный пред-оп образ кладётся в ОБА слота: BUF_FLAGS —
+     * вход эмулятора (emu читает EFLAG(st) = buf+BUF_FLAGS и мутирует его
+     * в после-оп), BUF_FLAGS0 — пред-оп копия для restore_state
+     * (рекреация SMC-flush восстанавливает ИМЕННО пред-оп состояние). */
     if (d->flags_use || d->flags_def) {
         pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
         pass_ins(dc, bb, i, INSTR_CREATE_pop(
             dc, buf_opnd(BUF_FLAGS, OPSZ_8)));
+        pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
+        pass_ins(dc, bb, i, INSTR_CREATE_pop(
+            dc, buf_opnd(BUF_FLAGS0, OPSZ_8)));
     }
 
     /* (3) спилы xmm.
@@ -373,6 +399,15 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             dc, buf_opnd(BUF_XMM(k), OPSZ_16),
             opnd_create_reg(DR_REG_XMM0 + k)));
     }
+    /* B-2009: пред-оп спил xmm-dst в BUF_XMMD — BUF_XMM(k) перезаписывается
+     * результатом emu; при рекреации SMC-flush нужен ИСХОДНЫЙ dst
+     * (реисполнение dst∧src — vpblendvb ymm с dst==src). */
+    for (int k = 0; k < 16; k++) {
+        if (!(d->xmm_dst & (1u << k))) continue;
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, buf_opnd(BUF_XMMD(k), OPSZ_16),
+            opnd_create_reg(DR_REG_XMM0 + k)));
+    }
     /* (4) спилы GPR: RAX всегда — он носитель при перезагрузке флагов.
      * r10 в цикле исключён: его значение переносится отдельно в (4b). */
     uint32_t gprall = (d->gpr_src | d->gpr_dst | (1u << gpr_idx(DR_REG_RAX)))
@@ -381,6 +416,16 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         if (!(gprall & (1u << k))) continue;
         pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
             dc, buf_opnd(BUF_GPR(k), OPSZ_8),
+            opnd_create_reg(DR_REG_RAX + k)));
+    }
+    /* B-2009: пред-оп спил GPR-dst + rax в BUF_GPRD — BUF_GPR(k) для dst
+     * перезаписывается результатом emu; restore_state восстанавливает
+     * исходные dst для реисполнения (crc32/popcnt/adcx с dst==rax и
+     * прочие dst∧src-опы). */
+    for (int k = 0; k < 16; k++) {
+        if (!(((d->gpr_dst | (1u << gpr_idx(DR_REG_RAX)))) & (1u << k))) continue;
+        pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+            dc, buf_opnd(BUF_GPRD(k), OPSZ_8),
             opnd_create_reg(DR_REG_RAX + k)));
     }
 
@@ -616,6 +661,22 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     }
     (void)cur;
 
+    /* B-2009: пометить note'ом инструкции, вставленные МИМО pass_ins
+     * (гард (5*), прокси (5b), (6)) — walk назад до первой app-инструкции
+     * с ЧУЖИМ app-pc (соседние переписанные последовательности продолжают
+     * walk — безвредно: restore_state ключуется по pc-якорю). Инструкции
+     * DR-обёртки clean call остаются без note — их рекреацию ведёт DR. */
+    {
+        app_pc mypc = instr_get_app_pc(i);
+        for (instr_t *w = instr_get_prev(i); w != NULL; w = instr_get_prev(w)) {
+            app_pc wpc = instr_get_app_pc(w);
+            if (wpc != NULL && wpc != mypc)
+                break;                       /* чужая app-инструкция */
+            if (!instr_is_label(w) && instr_get_note(w) == NULL)
+                instr_set_note(w, PASS_META_NOTE);
+        }
+    }
+
     /* (8) удалить исходную инструкцию */
     instrlist_remove(bb, i);
     instr_destroy(dc, i);
@@ -715,6 +776,16 @@ static int run_rewriter(void *dc, instrlist_t *bb, instr_t *i, rewrite_fn_t fn)
     int handled = fn(dc, bb, i);
     if (handled && opc0 < OPC_MAX)
         PASS_ATOMIC_INC32(&g_stat_static[opc0]);
+    /* B-2009: счётчик переписываний для pass_bb_event — блок с
+     * переписанными инструкциями обязан вернуть DR_EMIT_STORE_TRANSLATIONS:
+     * recreate DR пересобирает ilist прогоном bb-события с translating=true,
+     * и если клиент его НЕ меняет, раскладка recreate не совпадает с
+     * кэш-раскладкой → recreate_app не находит точку прерывания
+     * (translate.c:1242 ASSERT_NOT_REACHED в debug; в release —
+     * RECREATE_FAILURE → искажённый контекст → заморозка bun на
+     * JIT-холодном патчировании, симптом B-2008). */
+    if (handled)
+        PASS_ATOMIC_INC32(&g_bb_rwseq);
     if (handled && g_cfg.verbose >= 3) {
         dr_fprintf(STDERR, "[P.A.S.S.] rewrite opc=%d @ " PIFX ":\n",
                    opc0, (ptr_uint_t)pc);
@@ -866,13 +937,27 @@ dr_emit_flags_t pass_bb_event(void *dc, void *tag, instrlist_t *bb,
 
     PASS_ATOMIC_INC32(&g_stat_bbs);
 
-    instr_t *i = instrlist_first(bb);
-    while (i != NULL) {
-        instr_t *next = instr_get_next(i);
-        rewrite_instr(dc, bb, i);
-        i = next;
+    /* B-2009: блок с переписанными инструкциями → DR_EMIT_STORE_TRANSLATIONS.
+     * recreate DR для SMC-flush/deletion-redirect пересобирает ilist
+     * прогоном bb-события с translating=true; клиент его не меняет, поэтому
+     * раскладка recreate (чистый app-код) не совпадает с кэш-раскладкой
+     * (вставленные стабы) → recreate_app не находит точку прерывания
+     * (debug: translate.c:1242; release: RECREATE_FAILURE → искажённый
+     * app-контекст → заморозка bun на JIT-холодном патчировании).
+     * STORE_TRANSLATIONS велит DR сохранить ilist целиком (с нашими
+     * стабами и note'ами) — recreate идёт по нему точно и вызывает
+     * restore_state (restore_state.c) на наших мета-инструкциях.      */
+    {
+        uint seq0 = g_bb_rwseq;
+        instr_t *i = instrlist_first(bb);
+        while (i != NULL) {
+            instr_t *next = instr_get_next(i);
+            rewrite_instr(dc, bb, i);
+            i = next;
+        }
+        return (g_bb_rwseq != seq0) ? DR_EMIT_STORE_TRANSLATIONS
+                                    : DR_EMIT_DEFAULT;
     }
-    return DR_EMIT_DEFAULT;
 }
 
 void pass_rewrite_init(void)

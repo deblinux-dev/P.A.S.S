@@ -215,6 +215,12 @@ static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xsp : 0,
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xbp : 0);
     }
+    /* B-2009: не наша инструкция — DR_SIGNAL_DELIVER (доставка как при
+     * нативном исполнении). Намеренные ud2-trap'ы JIT-кода JSC (OSR)
+     * обрабатываются самим приложением; «пустой console.log» и краш fs
+     * были вызваны НЕ доставкой, а потерей входа флагов эмулятора —
+     * захват (2) обязан заполнять BUF_FLAGS (вход emu), а не только
+     * BUF_FLAGS0 (пред-оп для restore_state). */
     if (info->sig != SIGILL)
         return DR_SIGNAL_DELIVER;
     if (!info->raw_mcontext_valid || info->raw_mcontext == NULL)
@@ -223,7 +229,7 @@ static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
     if (trap_emulate(dc, mc)) {
         return DR_SIGNAL_REDIRECT;
     }
-    /* не наша инструкция — отдать приложению (оно и так бы упало) */
+    /* не наша инструкция — отдать приложению как при нативном исполнении */
     return DR_SIGNAL_DELIVER;
 }
 #else

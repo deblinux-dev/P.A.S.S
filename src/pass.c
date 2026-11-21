@@ -66,6 +66,9 @@ static void parse_options(int argc, const char *argv[])
             g_no_proxy = 1;
         } else if (strcmp(a, "-stage") == 0 && k + 1 < argc) {
             g_stage_override = atoi(argv[++k]);
+        } else if (strcmp(a, "-sampler") == 0 && k + 1 < argc) {
+            /* B-2009 diag: PC-сэмплинг (dr_set_itimer), мс */
+            g_sampler_ms = atoi(argv[++k]);
         } else if (strcmp(a, "-fuzz") == 0) {
             g_do_fuzz = 1;
         }
@@ -75,6 +78,7 @@ static void parse_options(int argc, const char *argv[])
 int g_no_veh = 0;        /* -noveh    */
 int g_no_proxy = 0;      /* -noproxy  */
 int g_stage_override = -1; /* -stage N */
+int g_sampler_ms = 0;     /* -sampler <мс>: PC-сэмплинг (diag B-2009) */
 int g_do_fuzz = 0;       /* -fuzz: перебор карт рерайтера */
 
 /* Ленивая инициализация TLS: thread-init не вызывается для главного
@@ -266,6 +270,10 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     cpuid_init();
     pass_rewrite_init();
+    /* B-2009: restore_state — корректная рекреация app-контекста
+     * переписанных последовательностей (SMC-flush/deletion-redirect;
+     * заморозка bun/JSC на холодном патчировании JIT-страниц) */
+    pass_restore_state_init();
     /* §7.3: перебор карт рерайтера (ловушка UNENCODABLE без bun).
      * ТОЛЬКО клиентская опция: getenv в инжектируемом процессе
      * ненадёжен даже на Linux (возвращал мусор → ложный запуск).   */
@@ -275,6 +283,15 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     }
     if (g_cfg.enable_trap)
         trap_init();
+
+    /* B-2009 diag: сэмплер app-PC (dr_set_itimer); getenv в инжектируемом
+     * процессе ненадёжен — только клиентская опция -sampler <мс>. */
+#ifdef LINUX
+    if (g_sampler_ms > 0) {
+        extern void pass_sampler_start(long interval_ms);
+        pass_sampler_start(g_sampler_ms);
+    }
+#endif
 
     drmgr_register_thread_init_event(pass_thread_init);
     drmgr_register_thread_exit_event(pass_thread_exit);

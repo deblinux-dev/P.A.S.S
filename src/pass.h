@@ -106,6 +106,7 @@ extern uint32_t g_stat_generic[OPC_MAX];  /* исполнено через clean
 extern uint32_t g_stat_unsupported[OPC_MAX];
 extern uint32_t g_stat_trap;              /* срабатываний trap-fallback */
 extern uint32_t g_stat_bbs;
+extern uint g_bb_rwseq;  /* B-2009: переписывания в текущем bb (STORE_TRANSLATIONS) */
 
 /* ─────────── RAW TLS (быстрые inline-доступы через gs:) ───────────
  * hi-половины ymm + временные слоты. Инвариант shadow-режима:
@@ -144,13 +145,40 @@ extern uint32_t g_stat_bbs;
                                           rax после clean call ненадёжен
                                           (DR-эпилог с fp=1 его затирает),
                                           гард стаба читает СЛОТ.     */
-#define BUF_SIZE    472u
+/* §B-2009: пред-оп банки для restore_state (SMC-flush/deletion
+ * redirect по переписанным последовательностям). BUF_FLAGS перезаписывается
+ * обёрткой emu_generic ПОСЛЕ-оп флагами, BUF_GPR(k)/BUF_XMM(k) — результатами
+ * для dst — поэтому пред-оп образ живёт отдельно:                    */
+#define BUF_FLAGS0  472u               /* пред-оп образ eflags (захват (2))  */
+#define BUF_GPRD(i) (480u + (i)*8u)    /* пред-оп спил GPR-dst + rax         */
+#define BUF_XMMD(i) (608u + (i)*16u)   /* пред-оп спил xmm-dst               */
+#define BUF_SIZE    872u
+
+/* ────────── B-2009: restore_state (рекреация app-контекста) ────────── */
+#define PASS_META_NOTE ((void *)(ptr_int_t)1)   /* note наших мета-инструкций */
+void pass_rw_record(void *pc, uint32_t gpr_dst, uint32_t xmm_dst, int cap_flags);
+void pass_restore_state_init(void);
 
 /* Индексы регистров (xmm_idx принимает и XMM, и YMM; gpr_idx
  * нормализует любой ширинный GPR — EAX/AX/AL → RAX)               */
-static inline reg_id_t gpr_norm(reg_id_t r) { return reg_resize_to_opsz(r, OPSZ_8); }
+static inline reg_id_t gpr_norm(reg_id_t r) {
+    /* B-2009: reg_resize_to_opsz роняет debug-DR на НЕ-GPR регистрах
+     * (DR_REG_INVALID от opnd_get_reg(memref), сегментные, XFLAGS):
+     * «unsupported reg»/«invalid size for simd register». Фильтр ДО
+     * ресайза; прочие регры возвращаются как есть — вызывающий обязан
+     * проверять is_gpr_reg. */
+    if (reg_is_gpr(r))
+        return reg_resize_to_opsz(r, OPSZ_8);
+    return r;
+}
 static inline int gpr_idx(reg_id_t r) { return (int)(gpr_norm(r) - DR_REG_RAX); }
 static inline int is_gpr_reg(reg_id_t r) {
+    /* B-2009: только настоящие GPR (reg_is_gpr отсекает INVALID/SIMD/seg —
+     * раньше reg_resize_to_opsz(simd, OPSZ_8) был debug-assert'ом
+     * «invalid size for simd register» (vpbroadcastb-блок glibc-ifunc),
+     * а в release — UB. */
+    if (!reg_is_gpr(r))
+        return 0;
     reg_id_t n = gpr_norm(r);
     return n >= DR_REG_RAX && n <= DR_REG_R15;
 }
@@ -186,6 +214,7 @@ extern int g_no_spoof;
 extern int g_no_veh;          /* -noveh: без VEH-логгера (бисекция)      */
 extern int g_no_proxy;        /* -noproxy: без прокси фолта (бисекция)   */
 extern int g_stage_override;  /* -stage N: переопределяет PASS_STAGE     */
+extern int g_sampler_ms;      /* -sampler <мс>: PC-сэмплинг (diag)        */
 extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */
 featset_t exposed_features(void);
 void emu_cpuid(void);                                   /* clean call */

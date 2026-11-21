@@ -15,6 +15,7 @@ uint32_t g_stat_generic[OPC_MAX];
 uint32_t g_stat_unsupported[OPC_MAX];
 uint32_t g_stat_trap;
 uint32_t g_stat_bbs;
+uint g_bb_rwseq;      /* B-2009: счётчик переписываний (STORE_TRANSLATIONS) */
 uint64_t g_dyn_generic;
 uint64_t g_dyn_trap;
 
