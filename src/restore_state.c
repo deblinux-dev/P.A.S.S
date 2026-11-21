@@ -173,6 +173,12 @@ static bool pass_restore_state_ex(void *drcontext, bool restore_memory,
     if (rec->cap_flags)
         dst->xflags = *(uint64_t *)(buf + BUF_FLAGS0);
     dst->rax = *(uint64_t *)(buf + BUF_GPRD(0));
+    /* B-2010: во время стаба rsp = per-thread scratch-стек (перекл.
+     * (1b)); app rsp гарантированно лежит в BUF_GPR(4) (заливка (4)).
+     * Без этого фолт внутри переписанной последовательности доставился
+     * бы приложению с rsp = scratch-стек — SEH/сигнальные хендлеры
+     * исполнялись бы на чужом стеке. */
+    dst->xsp = *(uint64_t *)(buf + BUF_GPR(gpr_idx(DR_REG_RSP)));
     for (int k = 0; k < 16; k++) {
         if (rec->gpr_dst & (1u << k)) {
             reg_t *slot = mc_gpr_slot(dst, k);

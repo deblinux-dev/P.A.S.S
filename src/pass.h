@@ -129,7 +129,13 @@ extern uint g_bb_rwseq;  /* B-2009: переписывания в текущем
 #define RAW_FAULT   472u              /* §7.3: адрес недоступной памяти (фолт
                                        * generic-пути; код в RAW_TG: bit0=фолт,
                                        * bit1=запись). Прокси в rewrite.c. */
-#define RAW_SIZE    480u              /* 60 слотов по 8Б         */
+/* ── B-2010: красная зона x86-64 ── clean call DR и pushf-захваты писали
+ * под app rsp (rsp-8..rsp-400) — в КРАСНУЮ ЗОНУ (128Б живых данных
+ * листовых функций clang/gcc). Симптом: Math.max/parseInt/JSON.* у bun
+ * возвращали undefined, console.log молчал (t_redzone: 45 vs 44).
+ * Решение: собственный per-thread scratch-стек; весь стаб (pushf,
+ * DR-clean-call, прокси) исполняется на нём, app-стек не трогается. */
+#define RAW_SIZE    480u              /* 60 слотов по 8Б                      */
 
 /* ───────────── per-thread BUF (доступ C-кода через r10) ─────────────
  * Спил-образ регистров для generic-пути (clean call).               */
@@ -216,6 +222,8 @@ extern int g_no_proxy;        /* -noproxy: без прокси фолта (би�
 extern int g_stage_override;  /* -stage N: переопределяет PASS_STAGE     */
 extern int g_sampler_ms;      /* -sampler <мс>: PC-сэмплинг (diag)        */
 extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */
+extern int g_strace;          /* -strace: трассировка syscall'ов (diag)  */
+extern int g_special_only;    /* -specialonly N: special только для opc N (diag) */
 featset_t exposed_features(void);
 void emu_cpuid(void);                                   /* clean call */
 void rewrite_cpuid(void *dc, instrlist_t *bb, instr_t *where);
@@ -276,6 +284,7 @@ const vex_map_ent_t *vex_map_lookup(int opc);
 const vex_map_ent_t *vex_map_all(int *count);
 const void *fma_tab_all(int *count);   /* fma_ent_t* — тип объявлен ниже */
 void pass_fuzz_run(void);
+void pass_strace_init(void);  /* B-2010 diag: syscall-трейсер            */
 int  try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i);
 int  try_rewrite_special(void *dc, instrlist_t *bb, instr_t *i);
 int  special_req_ok(int opc);   /* есть ли вообще обработчик */

@@ -27,6 +27,7 @@ static void parse_options(int argc, const char *argv[])
     g_cfg.enable_generic = 1;
     g_cfg.enable_trap = 1;
     g_cfg.verbose = 0;
+    g_strace = 0;
     for (int k = 1; k < argc; k++) {
         const char *a = argv[k];
         if (strcmp(a, "-target") == 0 && k + 1 < argc) {
@@ -66,6 +67,10 @@ static void parse_options(int argc, const char *argv[])
             g_no_proxy = 1;
         } else if (strcmp(a, "-stage") == 0 && k + 1 < argc) {
             g_stage_override = atoi(argv[++k]);
+        } else if (strcmp(a, "-specialonly") == 0 && k + 1 < argc) {
+            g_special_only = atoi(argv[++k]);
+        } else if (strcmp(a, "-strace") == 0) {
+            g_strace = 1;
         } else if (strcmp(a, "-sampler") == 0 && k + 1 < argc) {
             /* B-2009 diag: PC-сэмплинг (dr_set_itimer), мс */
             g_sampler_ms = atoi(argv[++k]);
@@ -80,6 +85,8 @@ int g_no_proxy = 0;      /* -noproxy  */
 int g_stage_override = -1; /* -stage N */
 int g_sampler_ms = 0;     /* -sampler <мс>: PC-сэмплинг (diag B-2009) */
 int g_do_fuzz = 0;       /* -fuzz: перебор карт рерайтера */
+int g_strace = 0;        /* -strace: syscall-трейсер (diag B-2010) */
+int g_special_only = -1; /* -specialonly N: спец-путь только для одного opc */
 
 /* Ленивая инициализация TLS: thread-init не вызывается для главного
  * потока (он уже под DR до регистрации события), поэтому первый
@@ -283,6 +290,9 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     }
     if (g_cfg.enable_trap)
         trap_init();
+    /* B-2010 diag: syscall-трейсер (опция -strace) */
+    if (g_strace)
+        pass_strace_init();
 
     /* B-2009 diag: сэмплер app-PC (dr_set_itimer); getenv в инжектируемом
      * процессе ненадёжен — только клиентская опция -sampler <мс>. */

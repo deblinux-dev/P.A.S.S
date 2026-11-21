@@ -43,6 +43,7 @@ static inline void st8 (uint8_t *p, uint8_t v)  { p[0] = v; }
 /* ── флаги ── */
 #define FCF (1u<<0)
 #define FPF (1u<<2)
+#define FPZ (1u<<3)   /* спец-значение keep: записать PF=0 (не сохранить!) */
 #define FAF (1u<<4)
 #define FZF (1u<<6)
 #define FSF (1u<<7)
@@ -75,7 +76,14 @@ static void flags_arith_k(estate_t *st, uint64_t res, uint64_t mask,
         while (b) { p ^= (b & 1); b >>= 1; }
         if (p == 0) fl |= FPF;
     }
-    flags_setmask(st, fl & ~keep, (FCF|FPF|FAF|FZF|FSF|FOF) & ~keep);
+    if (keep & FPZ) {
+        /* B-2010: реальные Intel у BMI-арифметики (bzhi/bextr/andn/bls*)
+         * PF не вычисляют — пишут 0 (наблюдение: вход PF=1 -> выход PF=0
+         * на всей матрице t_bmi2). FPZ = «записать 0», FPF = «сохранить». */
+        flags_setmask(st, fl & ~FPF, (FCF|FPF|FAF|FZF|FSF|FOF) & ~(keep & ~FPZ));
+    } else {
+        flags_setmask(st, fl & ~keep, (FCF|FPF|FAF|FZF|FSF|FOF) & ~keep);
+    }
 }
 
 static void flags_arith(estate_t *st, uint64_t res, uint64_t mask, int carry, int overflow)
@@ -118,6 +126,7 @@ static byte *mem_addr(estate_t *st, opnd_t op)
  * в app-PC инструкции — SEH/сигналы работают как нативно. Inline-путь
  * прозрачен изначально (там реальные инструкции).                 */
 static int emu_generic_impl(emu_desc_t *d);
+static int emu_seq = 0;   /* B-2010 diag: счётчик трассировки */
 
 static void emu_fault_record(estate_t *st, byte *addr, int is_write)
 {
@@ -1788,13 +1797,11 @@ static void gpr_pext(estate_t *st, emu_desc_t *d)
             bit++;
         }
     put_gpr_val(st, d->dsts[0], res);
-    /* §6.22: флаги PDEP/PEXT — детерминированно по SDM (ZF/SF/PF по
-     * результату, CF/OF=0); реальные Intel отдают часть флагов
-     * микрокодом нерегулярно, но приложения флаги PDEP/PEXT не
-     * потребляют — детерминированность важнее. */
-    flags_arith_k(st, res,
-                  (opnd_get_size(d->dsts[0]) == OPSZ_8) ? ~0ull : 0xFFFFFFFFull,
-                  0, 0, 0);
+    /* B-2010: реальные Intel у PDEP/PEXT НЕ трогают флаги вовсе
+     * (t_bmi2: входные PF/ZF=1 остаются 1 на всей матрице, независимо
+     * от результата). Старая эмуляция писала ZF/SF/PF по результату
+     * (SDM-текст) — расходилась с натурой. Флаги сохраняются обёрткой
+     * emu_generic (захват/возврат), так что здесь — только результат. */
 }
 static void gpr_pdep(estate_t *st, emu_desc_t *d)
 {
@@ -1807,9 +1814,7 @@ static void gpr_pdep(estate_t *st, emu_desc_t *d)
             bit++;
         }
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res,
-                  (opnd_get_size(d->dsts[0]) == OPSZ_8) ? ~0ull : 0xFFFFFFFFull,
-                  0, 0, 0);
+    /* B-2010: флаги не трогаем — как у gpr_pext (см. выше). */
 }
 static void gpr_bzhi(estate_t *st, emu_desc_t *d)
 {
@@ -1823,7 +1828,8 @@ static void gpr_bzhi(estate_t *st, emu_desc_t *d)
     if (g_cfg.verbose >= 4)
         dr_fprintf(STDERR, "[P.A.S.S.] bzhi: src=%016llx idx=%d w=%d -> res=%016llx\n",
                    (unsigned long long)src, (int)idx, width, (unsigned long long)res);
-    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, (int)cf, 0, FPF);
+    /* B-2010: PF у bzhi реальный Intel пишет 0 (t_bmi2), не чётность */
+    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, (int)cf, 0, FPZ);
 }
 static void gpr_bextr(estate_t *st, emu_desc_t *d)
 {
@@ -1835,7 +1841,8 @@ static void gpr_bextr(estate_t *st, emu_desc_t *d)
     uint64_t mask = (len >= 64) ? ~0ull : ((len == 0) ? 0 : ((1ull << len) - 1));
     uint64_t res = v & mask;
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, 0, 0, FPF);
+    /* B-2010: PF у bextr — 0, как у bzhi (t_bmi2) */
+    flags_arith_k(st, res, (width == 32) ? 0xFFFFFFFFull : ~0ull, 0, 0, FPZ);
 }
 /* ══════════════════ BMI1/BMI2 (§6.22: generic-путь с точными флагами
  * реального Intel; inline-вариант rewrite_special искажал CF у blsi/
@@ -1850,7 +1857,8 @@ static void gpr_andn(estate_t *st, emu_desc_t *d)
     uint64_t s2 = get_gpr_val(st, d->srcs[1]) & mask;
     uint64_t res = (~s1) & s2;
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res, mask, 0, 0, FPF);
+    /* B-2010: PF у andn — 0 (t_bmi2) */
+    flags_arith_k(st, res, mask, 0, 0, FPZ);
 }
 static void gpr_blsi(estate_t *st, emu_desc_t *d)
 {
@@ -1859,7 +1867,8 @@ static void gpr_blsi(estate_t *st, emu_desc_t *d)
     uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
     uint64_t res = v & ((~v + 1) & mask);          /* x & -x */
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res, mask, (v != 0), 0, FPF);
+    /* B-2010: PF у blsi — 0 (t_bmi2); CF=(src!=0) — подтверждено натурой */
+    flags_arith_k(st, res, mask, (v != 0), 0, FPZ);
 }
 static void gpr_blsmsk(estate_t *st, emu_desc_t *d)
 {
@@ -1868,7 +1877,8 @@ static void gpr_blsmsk(estate_t *st, emu_desc_t *d)
     uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
     uint64_t res = (v ^ (v - 1)) & mask;
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res, mask, (v == 0), 0, FPF);
+    /* B-2010: PF у blsmsk — 0 (t_bmi2) */
+    flags_arith_k(st, res, mask, (v == 0), 0, FPZ);
 }
 static void gpr_blsr(estate_t *st, emu_desc_t *d)
 {
@@ -1877,7 +1887,8 @@ static void gpr_blsr(estate_t *st, emu_desc_t *d)
     uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
     uint64_t res = v & (v - 1);
     put_gpr_val(st, d->dsts[0], res);
-    flags_arith_k(st, res, mask, (v == 0), 0, FPF);
+    /* B-2010: PF у blsr — 0 (t_bmi2) */
+    flags_arith_k(st, res, mask, (v == 0), 0, FPZ);
 }
 static void gpr_bmi2shift(estate_t *st, emu_desc_t *d)
 {
@@ -1918,7 +1929,10 @@ static void gpr_mulx(estate_t *st, emu_desc_t *d)
     int is32 = (opnd_get_size(d->srcs[0]) == OPSZ_4);
     uint64_t lo, hi;
     if (is32) {
-        uint64_t pr = (uint64_t)((uint32_t)rdx * (uint32_t)src);
+        /* B-2010: умножать в 64-битной ширине! (uint32_t)rdx*(uint32_t)src
+         * в C — unsigned int, заворачивался по mod 2^32: lo верный,
+         * hi ВСЕГДА 0 (t_bmi2: 9/16 входов со старшей половиной != 0). */
+        uint64_t pr = ((uint64_t)(uint32_t)rdx) * ((uint64_t)(uint32_t)src);
         lo = pr & 0xFFFFFFFF; hi = pr >> 32;
     } else {
         mul64x64(rdx, src, &lo, &hi);
@@ -2161,7 +2175,27 @@ int emu_generic(emu_desc_t *d)
             *(uint64_t *)(buf0 + BUF_R10) = (uint64_t)mc0.r10;
         }
     }
+    /* B-2010 diag: полная трассировка эмуляций (-verbose 5) — GPR-срез
+     * (BUF_GPR 0..15) и флаги до/после каждого эмулированного опкода.
+     * Цель: поймать, ГДЕ портится значение (например, JSValue возврата
+     * JSC-builtin'ов в rax).                                     */
+    if (g_cfg.verbose >= 5 && buf0 != NULL) {
+        dr_fprintf(STDERR, "[EMU %04d] opc=%d pre:", emu_seq++, d->opc);
+        for (int i = 0; i < 16; i++)
+            dr_fprintf(STDERR, " %016llx",
+                       (unsigned long long)*(uint64_t *)(buf0 + BUF_GPR(i)));
+        dr_fprintf(STDERR, " fl=%08x\n",
+                   (unsigned)*(uint32_t *)(buf0 + BUF_FLAGS));
+    }
     int rc = emu_generic_impl(d);
+    if (g_cfg.verbose >= 5 && buf0 != NULL) {
+        dr_fprintf(STDERR, "[EMU %04d] opc=%d post:", emu_seq - 1, d->opc);
+        for (int i = 0; i < 16; i++)
+            dr_fprintf(STDERR, " %016llx",
+                       (unsigned long long)*(uint64_t *)(buf0 + BUF_GPR(i)));
+        dr_fprintf(STDERR, " fl=%08x rc=%d\n",
+                   (unsigned)*(uint32_t *)(buf0 + BUF_FLAGS), rc);
+    }
     /* §7.3: код возврата — в BUF_RC. rax после clean call с fp=1
      * затирается DR-эпилогом (call dr-хелпера после fxrstor), поэтому
      * гард стаба (rewrite.c, 5*) читает СЛОТ, а не rax. TLS к этому
@@ -2876,6 +2910,31 @@ int emu_generic_impl(emu_desc_t *d)
         } else {
             put_gpr_val(&st, d->dsts[0], v);
         }
+        break;
+    }
+    /* ── VINSERTF128/VINSERTI128 (B-2010): special-путь отклоняет
+     * патологические случаи (dst==xmm15 / s1==xmm15 / s2==xmm15 —
+     * конфликт с xmm15-носителем), а generic-кейса не существовало:
+     * операция уходила в report_unsupported → нативный no-op на
+     * Penryn → МОЛЧАЛИВАЯ потеря hi-половины (t_ins128 case 7:
+     * vinserti128 $1, xmm2, ymm15, ymm15 — hi=0; у bun 1.2.14 именно
+     * так терялся результат console.log/Math.max — возвращаемый
+     * undefined / пустой вывод). DR IR: dsts[0]=ymm, srcs[0]=ymm-база,
+     * srcs[1]=xmm/m128, srcs[2]=imm (порядок подтверждён работой
+     * try_insert128 на штатных случаях).                          */
+    case OP_vinsertf128: case OP_vinserti128: {
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        uint8_t D[32], S[16];
+        get_block32(&st, d->srcs[0], D);              /* базовый ymm */
+        if (opnd_is_reg(d->srcs[1]))
+            memcpy(S, EX(&st, xmm_idx(opnd_get_reg(d->srcs[1]))), 16);
+        else
+            emu_safe_read(&st, mem_addr(&st, d->srcs[1]), S, 16);
+        int imm = opnd_is_immed_int(d->srcs[2])
+                ? (int)opnd_get_immed_int(d->srcs[2]) : 0;
+        memcpy(D + (imm & 1) * 16, S, 16);
+        memcpy(EX(&st, di), D, 16);
+        memcpy(EY(&st, di), D + 16, 16);
         break;
     }
     case OP_pinsrb: case OP_pinsrd:   /* OP_pinsrq == OP_pinsrd (алиас) */

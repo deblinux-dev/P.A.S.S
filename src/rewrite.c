@@ -418,6 +418,7 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
             dc, buf_opnd(BUF_GPR(k), OPSZ_8),
             opnd_create_reg(DR_REG_RAX + k)));
     }
+
     /* B-2009: пред-оп спил GPR-dst + rax в BUF_GPRD — BUF_GPR(k) для dst
      * перезаписывается результатом emu; restore_state восстанавливает
      * исходные dst для реисполнения (crc32/popcnt/adcx с dst==rax и
@@ -661,6 +662,11 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     }
     (void)cur;
 
+    /* (7b) B-2010: возврат на app-стек. rsp держит вершину scratch-стека;
+     * app rsp — в RAW_TRSP; rax к этому моменту уже восстановлен из BUF —
+     * танец через RAW_TRAX возвращает и его. Порядок важен: (6) уже
+     * восстановил ВСЕ результаты, включая rsp-dst (их у нас нет —
+     * alt_switch=0 для таких опов). */
     /* B-2009: пометить note'ом инструкции, вставленные МИМО pass_ins
      * (гард (5*), прокси (5b), (6)) — walk назад до первой app-инструкции
      * с ЧУЖИМ app-pc (соседние переписанные последовательности продолжают
@@ -897,6 +903,17 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
         return;
     if (g_cfg.enable_inline && !g_disable_special &&
         run_rewriter(dc, bb, i, try_rewrite_special))
+        return;
+    /* B-2010: vinsertf128/vinserti128, отклонённые inline-путём
+     * (dst==xmm15 / s1==xmm15 / s2==xmm15 — конфликт с xmm15-носителем),
+     * обязаны уходить в generic-стаб: там операнды читаются из теневого
+     * файла, носитель не участвует. Раньше такие случаи проваливались
+     * до report_unsupported → нативный no-op на Penryn → молчаливая
+     * потеря hi-половины результата (t_ins128 case 7; у bun 1.2.14 —
+     * пустой console.log и undefined у JSC-builtin'ов).            */
+    if ((opc == OP_vinsertf128 || opc == OP_vinserti128) &&
+        g_cfg.enable_generic &&
+        run_rewriter(dc, bb, i, rewrite_generic_instr))
         return;
 
     /* §7.3: r10 в операндах — inline-пути отклонили (носитель BUF),
