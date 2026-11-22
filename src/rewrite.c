@@ -454,6 +454,24 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
      * локально зелёная и с fp=true (ценой fxsave на вызов — до
      * отдельной xmm-чистой сборки emu, см. v0.3).                 */
     bool fp = true;
+    /* B-2014: КРАСНАЯ ЗОНА x86-64 вокруг clean call. DR-кодеген clean
+     * call пушит все GPR (+fpstate fxsave) на app-стек ПОД rsp — прямо
+     * в [rsp-128, rsp): bun (clang -O2) держит там локальные данные
+     * leaf-функций. Симптом: require('fs') ломался во ВСЕХ режимах
+     * (спец-танец → SIGSEGV rsi=0xd в классификаторе модулей 0x2ecdc54
+     * [ptr-поле структуры = 13 = длина соседнего поля]; trap-путь →
+     * ошибка лексера «Expected ";" but found " "» и «Maximum call
+     * stack size exceeded») — tzcnt 5473×/pmovsxbd 994× через generic
+     * стаб между записью в red zone и её чтением. Батареи не ловили:
+     * асмовый тестовый код red zone не использует. Фикс: sub rsp,0x80
+     * перед call — пушы DR уходят НИЖЕ red zone приложения; add rsp,0x80
+     * после (DR балансирует rsp сам, сдвиг чисто смещает базу).      */
+    /* B-2014 ПОПЫТКА red-zone-сдвига (lea -0x80(%rsp),rsp вокруг call)
+     * ОТМЕНЕНА: хвост стаба (7b) «возврат на app-стек» держит в rsp
+     * вершину scratch-стека и ссылается на него относительно — сдвиг
+     * ломает 16/33 батарей. Красная зона здесь НЕ защищается сдвигом;
+     * гипотеза о её роли в bun-require не подтвердилась фиксацией
+     * (краш сместился, но не исчез). Вопрос — в B-2015.             */
     dr_insert_clean_call(dc, bb, i, (void *)emu_generic, fp, 1,
                          OPND_CREATE_INTPTR((ptr_int_t)d));
 
@@ -968,6 +986,10 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
     if (g_cfg.enable_inline && run_rewriter(dc, bb, i, try_rewrite_vex))
         return;
     if (g_cfg.enable_inline && !g_disable_special &&
+        /* B-2014: вернул проверку -specialonly (флаг парсился с B-2012,
+         * но проверка потерялась при рефакторах) — special-путь только
+         * для одного опкода, остальное уходит в generic/trap. */
+        (g_special_only < 0 || g_special_only == opc) &&
         run_rewriter(dc, bb, i, try_rewrite_special))
         return;
     /* B-2010: vinsertf128/vinserti128, отклонённые inline-путём

@@ -223,7 +223,9 @@ static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
                    "[P.A.S.S.] SIGSEGV @ app_pc " PIFX
                    " access=" PIFX "\n  rax=" PIFX " rbx=" PIFX
                    " rcx=" PIFX " rdx=" PIFX " rdi=" PIFX " rsi=" PIFX
-                   " rsp=" PIFX " rbp=" PIFX "\n",
+                   " rsp=" PIFX " rbp=" PIFX "\n  r8=" PIFX " r9=" PIFX
+                   " r10=" PIFX " r11=" PIFX " r12=" PIFX " r13=" PIFX
+                   " r14=" PIFX " r15=" PIFX "\n",
                    pc ? (ptr_uint_t)pc : 0,
                    (ptr_uint_t)info->access_address,
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xax : 0,
@@ -233,7 +235,33 @@ static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xdi : 0,
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xsi : 0,
                    info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xsp : 0,
-                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xbp : 0);
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->xbp : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r8 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r9 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r10 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r11 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r12 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r13 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r14 : 0,
+                   info->mcontext != NULL ? (ptr_uint_t)info->mcontext->r15 : 0);
+        /* B-2014: rbp-трейс — bun собран с frame pointers; покадрово
+         * печатаем адреса возврата, чтобы локализовать, где ломается
+         * живой аргумент (rsi) при вложенных вызовах. */
+        if (pc != NULL && info->mcontext != NULL) {
+            ptr_uint_t rbp = (ptr_uint_t)info->mcontext->xbp;
+            int f;
+            for (f = 0; f < 12 && rbp; f++) {
+                ptr_uint_t ret = 0, next = 0;
+                if (!dr_safe_read((void *)(rbp + 8), sizeof(ret), &ret, NULL) ||
+                    !dr_safe_read((void *)rbp, sizeof(next), &next, NULL))
+                    break;
+                dr_fprintf(STDERR, "  frame[%02d] rbp=" PIFX " ret=" PIFX "\n",
+                           f, rbp, ret);
+                if (next <= rbp)
+                    break; /* цепочка сошла на нет или в другой стек */
+                rbp = next;
+            }
+        }
     }
     /* B-2009: не наша инструкция — DR_SIGNAL_DELIVER (доставка как при
      * нативном исполнении). Намеренные ud2-trap'ы JIT-кода JSC (OSR)

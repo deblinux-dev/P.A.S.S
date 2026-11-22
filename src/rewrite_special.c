@@ -241,6 +241,12 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
     int is_ymm = (opnd_get_reg(s0) >= DR_REG_YMM0);
     int dst_is_rax = (di == gpr_idx(DR_REG_RAX));
 
+    /* B-2014 diag: какие формы vpmovmskb исполняет приложение */
+    if (g_cfg.verbose >= 2)
+        dr_fprintf(STDERR, "[PMK] si=%d ymm=%d dst=%s sz=%d\n",
+                   si, is_ymm, get_register_name(opnd_get_reg(d0)),
+                   (int)opnd_get_size(d0));
+
     if (!is_ymm) {
         pass_ins(dc, bb, i, instr_create_1dst_1src(dc, OP_pmovmskb, d0, s0));
         return 1;
