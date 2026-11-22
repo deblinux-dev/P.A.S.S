@@ -22,6 +22,7 @@
  *    отклонение (fds остаются открытыми); альтернатива — спин DR
  *    на часы. Малые диапазоны уходят в честную эмуляцию DR.       */
 #define PASS_CLOSE_RANGE_LIMIT 4096
+#ifdef LINUX
 #ifdef SYS_close_range
 #    define PASS_SYS_CLOSE_RANGE SYS_close_range
 #else
@@ -30,18 +31,26 @@
 #ifndef CLOSE_RANGE_CLOEXEC
 #    define CLOSE_RANGE_CLOEXEC 4
 #endif
+#endif /* LINUX */
 
 static bool sc_filter(void *drcontext, int sysnum)
 {
     (void)drcontext;
-    /* B-2013: фикс-путь должен получать pre-событие всегда,
-     * трейс-путь — только под -strace */
-    return g_strace || sysnum == PASS_SYS_CLOSE_RANGE;
+    /* B-2013: фикс-путь должен получать pre-событие всегда (LINUX:
+     * нумерация сисколлов ядра), трейс-путь — только под -strace.
+     * На Windows номера NT-сисколлов зависят от билда — фикс там
+     * не зарегистрирован вовсе. */
+    return g_strace
+#ifdef LINUX
+           || sysnum == PASS_SYS_CLOSE_RANGE
+#endif
+        ;
 }
 
 /* B-2013: pre-хук срабатывает ДО core-обработки DR (dispatch.c:
  * instrument_pre_syscall → return false = сисколл не исполняется
- * вовсе, 4G-цикл эмуляции не запускается). */
+ * вовсе, 4G-цикл эмуляции не запускается). LINUX-only. */
+#ifdef LINUX
 static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
 {
     ptr_int_t first, last, flags;
@@ -60,15 +69,18 @@ static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
     dr_syscall_set_result(drcontext, 0);
     return false; /* не исполнять сисколл и не входить в эмуляцию DR */
 }
+#endif /* LINUX */
 
 static bool sc_pre(void *drcontext, int sysnum)
 {
     ptr_int_t a0 = dr_syscall_get_param(drcontext, 0);
     ptr_int_t a1 = dr_syscall_get_param(drcontext, 1);
     ptr_int_t a2 = dr_syscall_get_param(drcontext, 2);
+#ifdef LINUX
     if (sysnum == PASS_SYS_CLOSE_RANGE &&
         a1 - a0 > PASS_CLOSE_RANGE_LIMIT)
         return true; /* уже обработан sc_pre_fix_close_range */
+#endif
     if (sysnum == 1 /*write*/ || sysnum == 20 /*writev*/) {
         dr_fprintf(STDERR, "[SC %d] %p %p %p", sysnum, a0, a1, a2);
         if (sysnum == 1 && (a0 == 1 || a0 == 2) && a1 && a2 && a2 <= 128) {
@@ -107,7 +119,9 @@ static void sc_post(void *drcontext, int sysnum)
 void pass_strace_init(void)
 {
     drmgr_register_filter_syscall_event(sc_filter);
+#ifdef LINUX
     drmgr_register_pre_syscall_event(sc_pre_fix_close_range);
+#endif
     drmgr_register_pre_syscall_event(sc_pre);
     drmgr_register_post_syscall_event(sc_post);
 }
