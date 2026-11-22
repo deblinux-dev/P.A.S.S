@@ -80,7 +80,7 @@ if [ "$PHASE" = "1" ]; then
   done
 
   echo "── дифф ISA-батареи (побайтно):"
-  for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp; do
+  for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp t_live15; do
     [ -x "$t" ] || continue
     "./$t" > "$REF/$t.bin" 2>/dev/null
     qpass "./$t" > "$OUT/$t.bin" 2>/dev/null

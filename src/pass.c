@@ -69,6 +69,17 @@ static void parse_options(int argc, const char *argv[])
             g_stage_override = atoi(argv[++k]);
         } else if (strcmp(a, "-specialonly") == 0 && k + 1 < argc) {
             g_special_only = atoi(argv[++k]);
+        } else if (strcmp(a, "-skipopc") == 0 && k + 1 < argc) {
+            /* B-2012: "1067,1064,..." — опкоды оставить нативными (bisect) */
+            extern uint8_t g_skip_opc[2048];
+            char tmp[256];
+            strncpy(tmp, argv[++k], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = 0;
+            for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ",")) {
+                int op = atoi(tok);
+                if (op > 0 && op < 2048)
+                    g_skip_opc[op] = 1;
+            }
         } else if (strcmp(a, "-strace") == 0) {
             g_strace = 1;
         } else if (strcmp(a, "-sampler") == 0 && k + 1 < argc) {
@@ -165,6 +176,25 @@ static void pass_exit(void)
             dr_fprintf(STDERR, "%s=%u ", opc_name(top[t]), g_stat_generic[top[t]]);
         dr_fprintf(STDERR, "\n");
     }
+    /* B-2012: топ-10 статических перезаписей per-opc (бисект inline-пути) */
+    if (static_total > 0) {
+        int stop[10] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+        for (int t = 0; t < 10; t++) {
+            int best = -1;
+            for (int k = 0; k < OPC_MAX; k++) {
+                if (g_stat_static[k] == 0) continue;
+                bool taken = false;
+                for (int q = 0; q < t; q++) if (stop[q] == k) taken = true;
+                if (!taken && (best < 0 || g_stat_static[k] > g_stat_static[best]))
+                    best = k;
+            }
+            stop[t] = best;
+        }
+        dr_fprintf(STDERR, "  top static: ");
+        for (int t = 0; t < 10 && stop[t] >= 0; t++)
+            dr_fprintf(STDERR, "%s=%u ", opc_name(stop[t]), g_stat_static[stop[t]]);
+        dr_fprintf(STDERR, "\n");
+    }
     /* §7.3: топ-5 НЕобработанных опкодов (left-native/trap-класс).
      * Пусто в здоровом прогоне; ненулевой — прямое имя виновника
      * класса «молчаливый пропуск → мусор → паника аллокатора».     */
@@ -186,6 +216,8 @@ static void pass_exit(void)
             dr_fprintf(STDERR, "%s=%u ", opc_name(utop[t]), g_stat_unsupported[utop[t]]);
         dr_fprintf(STDERR, "\n");
     }
+    dr_fprintf(STDERR, "  recreate: ours=%u skipTG=%u restored=%u nobuf=%u\n",
+               g_rs_ours, g_rs_skip_tg, g_rs_restored, g_rs_nobuf);
     dr_fprintf(STDERR, "[P.A.S.S.] ─────────────────────────────────────────\n\n");
 }
 

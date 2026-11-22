@@ -34,6 +34,12 @@
 
 static int g_dbg_calls = 0;
 
+/* B-2012 diag: счётчики recreate-пути (бисект «порча при перезаписи») */
+uint32_t g_rs_ours = 0;      /* recreate попал в нашу последовательность */
+uint32_t g_rs_skip_tg = 0;   /* скипнуты по BUF_TG != 0 (Case B)         */
+uint32_t g_rs_restored = 0;  /* реально восстановлено                    */
+uint32_t g_rs_nobuf = 0;     /* buf == NULL                              */
+
 /* ── реестр переписанных pc: pc → (gpr_dst, xmm_dst, cap_flags) ── */
 typedef struct rwrec {
     void            *pc;
@@ -160,10 +166,15 @@ static bool pass_restore_state_ex(void *drcontext, bool restore_memory,
     /* (2) Case B: фолт-доставка fault-proxy — контекст приготовлен
      * прокси; рестарт не нужен */
     uint8_t *buf = (uint8_t *)drmgr_get_tls_field(drcontext, g_tls_idx_buf);
-    if (buf == NULL)
+    if (buf == NULL) {
+        g_rs_nobuf++;
         return true;
-    if (*(uint64_t *)(buf + BUF_TG) != 0)
+    }
+    g_rs_ours++;
+    if (*(uint64_t *)(buf + BUF_TG) != 0) {
+        g_rs_skip_tg++;
         return true;
+    }
 
     /* (3) пред-оп восстановление: приложение возобновится на pc(i)
      * и реисполнит операцию целиком. r10 — из BUF_R10 (обёртка emu_generic
@@ -190,6 +201,7 @@ static bool pass_restore_state_ex(void *drcontext, bool restore_memory,
         if (rec->xmm_dst & (1u << k))
             memcpy(&dst->simd[k], buf + BUF_XMMD(k), 16);
     }
+    g_rs_restored++;
     return true;
 }
 

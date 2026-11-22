@@ -108,6 +108,14 @@ extern uint32_t g_stat_trap;              /* срабатываний trap-fallb
 extern uint32_t g_stat_bbs;
 extern uint g_bb_rwseq;  /* B-2009: переписывания в текущем bb (STORE_TRANSLATIONS) */
 
+/* B-2012: -skipopc — опкоды, исключённые из перезаписи (passthrough).
+ * Диагностика бисекта: под CPU с реальной фичей оп исполняется нативно;
+ * восстановление поведения приложения указывает на виновный оп.       */
+extern uint8_t g_skip_opc[OPC_MAX];
+
+/* B-2012: счётчики recreate-пути (restore_state.c) */
+extern uint32_t g_rs_ours, g_rs_skip_tg, g_rs_restored, g_rs_nobuf;
+
 /* ─────────── RAW TLS (быстрые inline-доступы через gs:) ───────────
  * hi-половины ymm + временные слоты. Инвариант shadow-режима:
  *   hardware xmm_r = младшие 128 бит логического ymm_r,

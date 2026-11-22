@@ -904,6 +904,9 @@ static void rewrite_instr(void *dc, instrlist_t *bb, instr_t *i)
     /* системные особые случаи */
     if (opc == OP_cpuid && !g_no_spoof) { run_rewriter(dc, bb, i, rewrite_cpuid_w); return; }
     if (opc == OP_xgetbv && !g_no_spoof) { run_rewriter(dc, bb, i, rewrite_xgetbv_w); return; }
+    /* B-2012: -skipopc — опкод исключён из перезаписи, остаётся нативным.
+     * cpuid/xgetbv-хуки важнее (спуфинг обязан работать всегда).       */
+    if (g_skip_opc[opc]) return;
     if (opc == OP_prefetchw && !opc_supported(opc, dsz)) {
         run_rewriter(dc, bb, i, rewrite_nop_w);
         return;

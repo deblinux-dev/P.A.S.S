@@ -19,6 +19,9 @@ uint g_bb_rwseq;      /* B-2009: счётчик переписываний (STOR
 uint64_t g_dyn_generic;
 uint64_t g_dyn_trap;
 
+/* B-2012: -skipopc — passthrough-таблица (bisect виновного опкода) */
+uint8_t g_skip_opc[OPC_MAX];
+
 static const char *feat_names[F_COUNT] = {
     "sse3","ssse3","sse4.1","sse4.2","popcnt","aes","pclmulqdq",
     "avx","avx2","fma","bmi1","bmi2","movbe","lzcnt","f16c",

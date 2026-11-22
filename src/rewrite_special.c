@@ -260,7 +260,12 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
         dc, raw_opnd(RAW_TG3, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
-    /* hi-маска */
+    /* B-2012: ПОРЯДОК КРИТИЧЕН — HI извлекается в eax ПЕРВЫМ: если d0==rax,
+     * извлечение LO в d0 обязано быть ПОСЛЕДНИМ (иначе hi-шаг затирает lo:
+     * reorder-вариант ломал glibc-strlen с vpmovmskb → %eax, t_live15 c86).
+     * si==15: LO читается из носителя, восстановленного из RAW_S15 (в git
+     * порядке прямой pmovmskb по xmm15 читал УЖЕ загруженный hi — двойной
+     * hi-маска, t_live15 c83-класс).                                   */
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_YHI(si), OPSZ_16)));
     pass_ins(dc, bb, i, instr_create_1dst_1src(
@@ -269,9 +274,16 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
         dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(16)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
         dc, raw_opnd(RAW_TG2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
-    /* lo-маска в приёмник + объединение */
-    pass_ins(dc, bb, i, instr_create_1dst_1src(
-        dc, OP_pmovmskb, d0, opnd_create_reg(DR_REG_XMM0 + si)));
+    /* lo-маска в приёмник (последняя!) + объединение */
+    if (si == 15) {
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
+        pass_ins(dc, bb, i, instr_create_1dst_1src(
+            dc, OP_pmovmskb, d0, opnd_create_reg(DR_REG_XMM15)));
+    } else {
+        pass_ins(dc, bb, i, instr_create_1dst_1src(
+            dc, OP_pmovmskb, d0, opnd_create_reg(DR_REG_XMM0 + si)));
+    }
     pass_ins(dc, bb, i, INSTR_CREATE_or(
         dc, d0, raw_opnd(RAW_TG2, opnd_get_size(d0))));
     /* восстановления: флаги, xmm15, rax.
@@ -309,6 +321,33 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
     return 1;
 }
 
+/* B-2012: legacy movmskps/movmskpd НЕ кодируется энкодером DR 11.91
+ * (enc_test: FAIL на любой паре r32←xmm; pmovmskb/psrld/and/imul — OK).
+ * Замена: psrld сдвигает знаковый бит на байтовую границу, pmovmskb даёт
+ * биты {0,4(,8,12)}, imul-магия сжимает их без переносов:
+ *   ps: psrld $24; pmovmskb; and 0x1111; imul 0x12480000; shr 28
+ *       (магия выверена на всех 16 входах — каждый целевой бит получает
+ *       ровно одно слагаемое, переноса нет).
+ *   pd: psrld $31; pmovmskb; and 0x11; imul 0x12000000; shr 28.
+ * xmm_scratch — НАШ носитель (psrld портит его; app-регистр подавать
+ * запрещено). dst нормализуется на r32-имя (энкодер pmovmskb не берёт
+ * 64-битные имена: RDI+OPSZ_4 = UNENCODABLE).                    */
+static void emit_movmsk_calc(void *dc, instrlist_t *bb, instr_t *i,
+                             int is_pd, opnd_t d0, opnd_t xmm_scratch)
+{
+    opnd_t d32 = d0;
+    if (opnd_is_reg(d0) && reg_is_64bit(opnd_get_reg(d0)))
+        d32 = opnd_create_reg(reg_64_to_32(opnd_get_reg(d0)));
+    pass_ins(dc, bb, i, INSTR_CREATE_psrld(dc, xmm_scratch,
+        OPND_CREATE_INT8(is_pd ? 31 : 24)));
+    pass_ins(dc, bb, i, instr_create_1dst_1src(dc, OP_pmovmskb, d32, xmm_scratch));
+    pass_ins(dc, bb, i, INSTR_CREATE_and(dc, d32,
+        OPND_CREATE_INT32(is_pd ? 0x11 : 0x1111)));
+    pass_ins(dc, bb, i, instr_create_1dst_2src(dc, OP_imul, d32, d32,
+        OPND_CREATE_INT32(is_pd ? 0x12000000 : 0x12480000)));
+    pass_ins(dc, bb, i, INSTR_CREATE_shr(dc, d32, OPND_CREATE_INT8(28)));
+}
+
 static int try_vmovmsk(void *dc, instrlist_t *bb, instr_t *i)
 {
     int opc = instr_get_opcode(i);
@@ -320,15 +359,26 @@ static int try_vmovmsk(void *dc, instrlist_t *bb, instr_t *i)
     int si = xmm_idx(opnd_get_reg(s0));
     int is_ymm = (opnd_get_reg(s0) >= DR_REG_YMM0);
     int dst_is_rax = (di == gpr_idx(DR_REG_RAX));
-    int ms_op = (opc == OP_vmovmskps) ? OP_movmskps : OP_movmskpd;
+    int is_pd = (opc == OP_vmovmskpd);
     int shift = (opc == OP_vmovmskps) ? 4 : 2;
 
     if (!is_ymm) {
-        pass_ins(dc, bb, i, instr_create_1dst_1src(dc, ms_op, d0, s0));
+        /* B-2012: источник — через носитель (psrld портит), носитель
+         * со спилом (app-xmm15 жив) */
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15), s0));
+        emit_movmsk_calc(dc, bb, i, is_pd, d0, opnd_create_reg(DR_REG_XMM15));
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
         return 1;
     }
     /* B-2011: стеклесный захват/рестор — см. try_pmovmskb (идентичный
-     * танец: lahf+seto → TG3, рестор через RAW_T2 + sahf). */
+     * танец: lahf+seto → TG3, рестор через RAW_T2 + sahf).
+     * B-2012: ПОРЯДОК — HI в eax ПЕРВЫМ (если d0==rax, LO в d0 — последним
+     * шагом; см. try_pmovmskb). LO — через носитель (psrld портит источник),
+     * при si==15 носитель восстанавливается из RAW_S15 (app-lo). */
     save_gpr_tmp(dc, bb, i, DR_REG_RAX);
     pass_ins(dc, bb, i, INSTR_CREATE_lahf(dc));
     pass_ins(dc, bb, i, INSTR_CREATE_setcc(dc, OP_seto,
@@ -337,16 +387,24 @@ static int try_vmovmsk(void *dc, instrlist_t *bb, instr_t *i)
         dc, raw_opnd(RAW_TG3, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+    /* hi-маска */
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_YHI(si), OPSZ_16)));
-    pass_ins(dc, bb, i, instr_create_1dst_1src(
-        dc, ms_op, opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_XMM15)));
+    emit_movmsk_calc(dc, bb, i, is_pd,
+        opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_XMM15));
     pass_ins(dc, bb, i, INSTR_CREATE_shl(
         dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(shift)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
         dc, raw_opnd(RAW_TG2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
-    pass_ins(dc, bb, i, instr_create_1dst_1src(
-        dc, ms_op, d0, opnd_create_reg(DR_REG_XMM0 + si)));
+    /* lo-маска в приёмник (последняя!) — через носитель */
+    if (si == 15) {
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
+    } else {
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(
+            dc, opnd_create_reg(DR_REG_XMM15), opnd_create_reg(DR_REG_XMM0 + si)));
+    }
+    emit_movmsk_calc(dc, bb, i, is_pd, d0, opnd_create_reg(DR_REG_XMM15));
     pass_ins(dc, bb, i, INSTR_CREATE_or(
         dc, d0, raw_opnd(RAW_TG2, opnd_get_size(d0))));
     if (dst_is_rax)
@@ -595,12 +653,18 @@ static int try_extract128(void *dc, instrlist_t *bb, instr_t *i)
     if (!opnd_is_immed_int(imo)) return 0;
     int imm = (int)opnd_get_immed_int(imo);
     int si = xmm_idx(opnd_get_reg(s0));
+    /* B-2012 (t_live15 #18): VEX.128-запись в reg-приёмник обнуляет
+     * верхние 128 бит логического ymm — RAW_YHI(dst) = 0 (инвариант
+     * тени; раньше ymm0.hi оставался stale → мусорные ymm-чтения). */
     if (imm == 0) {
         pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, d0, opnd_create_reg(DR_REG_XMM0 + si)));
+        if (opnd_is_reg(d0))
+            zero_yhi(dc, bb, i, xmm_idx(opnd_get_reg(d0)));
     } else {
         if (opnd_is_reg(d0)) {
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, d0, raw_opnd(RAW_YHI(si), OPSZ_16)));
+            zero_yhi(dc, bb, i, xmm_idx(opnd_get_reg(d0)));
         } else {
             /* mem dst: через xmm15 — спил/восстановление БЕЗУСЛОВНЫЕ.
              * §7.3 B-2006 (bun 1.2.14 -e, JIT-спил): (1) mov_st/mov_ld с
@@ -644,20 +708,43 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
     opnd_t s1w = opnd_create_reg(DR_REG_XMM0 + s1i);
     opnd_t s2w = opnd_is_reg(s2)
         ? opnd_create_reg(DR_REG_XMM0 + xmm_idx(opnd_get_reg(s2))) : s2;
+    int s2i = opnd_is_reg(s2) ? xmm_idx(opnd_get_reg(s2)) : -1;
 
+    /* B-2012 (t_live15 #17): носитель xmm15 обязан спилиться/восстановиться
+     * (RAW_S15) — clang-код держит живые данные в callee-saved xmm15 через
+     * всё тело функции (натурный симптом: bun builtin-возвраты = undefined).
+     * reg-S2 идёт в RAW_YHI напрямую (носитель не нужен); mem-S2 — через
+     * носитель со спилом. s2==dst (reg): hi приёмника не меняется. */
     if (imm == 0) {
-        /* lo = S2, hi = S1.hi (через xmm15) */
+        /* lo = S2, hi = S1.hi (mem→mem — только через носитель) */
         pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s2w));
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(
-            dc, opnd_create_reg(X15), raw_opnd(RAW_YHI(s1i), OPSZ_16)));
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(
-            dc, raw_opnd(RAW_YHI(di), OPSZ_16), opnd_create_reg(X15)));
+        if (s1i != di) {
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(X15), raw_opnd(RAW_YHI(s1i), OPSZ_16)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_YHI(di), OPSZ_16), opnd_create_reg(X15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
+        }
     } else {
-        /* lo = S1, hi = S2 (через xmm15) */
+        /* lo = S1, hi = S2 */
         pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s1w));
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, opnd_create_reg(X15), s2w));
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(
-            dc, raw_opnd(RAW_YHI(di), OPSZ_16), opnd_create_reg(X15)));
+        if (s2i >= 0) {
+            if (s2i != di)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_YHI(di), OPSZ_16), s2w));
+        } else {
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(X15), s2w));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_YHI(di), OPSZ_16), opnd_create_reg(X15)));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
+        }
     }
     instrlist_remove(bb, i);
     instr_destroy(dc, i);

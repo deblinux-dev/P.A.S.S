@@ -1323,7 +1323,11 @@ static void halfmove_op(estate_t *st, emu_desc_t *d)
         half = t;
     } else {
         int si = xmm_idx(opnd_get_reg(d->srcs[1]));
-        half = ld64(EX(st, si));
+        /* B-2012 (t_live15 #73): reg-reg форма OP_vmovlps — это VMOVHLPS
+         * (DR-алиас OP_vmovhlps = OP_vmovlps) — собирает ВТОРОЙ qword
+         * 128-битного src2 = EX+8 (не EX/q0 и не EY/q2 — тень ymm!).
+         * VMOVLHPS (OP_vmovhps reg-reg) — младший qword (EX). */
+        half = (d->opc == OP_vmovlps) ? ld64(EX(st, si) + 8) : ld64(EX(st, si));
     }
     /* V (srcs[0]) — база слияния: ВЕСЬ его 128-битный вид лежит в
      * реальном xmm (спил); hi64 результата = hi64(V) для lpd/lps,
