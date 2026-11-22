@@ -2163,7 +2163,12 @@ int emu_generic(emu_desc_t *d)
         *(uint64_t *)(buf0 + BUF_FAULT) = 0;
     }
     /* app-флаги → BUF_FLAGS всегда: их восстанавливает безусловный
-     * (6)-рестор (прокси (5b) портит флаги test/shr) */
+     * (6)-рестор (прокси (5b) портит флаги test/shr).
+     * B-2011: BUF_FLAGS0 (пред-оп копия restore_state) кладётся ТОТ ЖЕ
+     * образ — стековый захват (2) удалён (красная зона). Пре-
+     * последовательность флаг-сохраняющая, поэтому mc.xflags в точке
+     * clean call = ИСТИННЫЙ пред-оп образ; после этой записи impl
+     * мутирует арифметические биты только в BUF_FLAGS. */
     {
         uint8_t *buf0 = (uint8_t *)drmgr_get_tls_field(dc0, g_tls_idx_buf);
         dr_mcontext_t mc0;
@@ -2172,6 +2177,7 @@ int emu_generic(emu_desc_t *d)
         mc0.flags = DR_MC_INTEGER | DR_MC_CONTROL;
         if (buf0 != NULL && dr_get_mcontext(dc0, &mc0)) {
             *(uint32_t *)(buf0 + BUF_FLAGS) = (uint32_t)mc0.xflags;
+            *(uint32_t *)(buf0 + BUF_FLAGS0) = (uint32_t)mc0.xflags;
             *(uint64_t *)(buf0 + BUF_R10) = (uint64_t)mc0.r10;
         }
     }

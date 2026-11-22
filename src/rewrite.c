@@ -363,25 +363,19 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
     /* (1) носитель r10 */
     carrier_begin(dc, bb, i);
 
-    /* (2) захват флагов: при flags_use — как источники; при flags_def —
-     * ОБЯЗАТЕЛЬНО даже если инструкция их не читает: эмулятор обновляет
-     * только арифметические биты поверх захваченного значения (flags_setmask
-     — read-modify-write), и popf вернёт приложению нетронутыми DF/IF/TF и
-     * прочие неопределяемые биты. Без захвата popf записал бы мусор из
-     * BUF_FLAGS: у node 8000+ эмуляций tzcnt/bzhi перевернули DF → rep movs/stos шли
-     * назад → «malloc(): corrupted top size». */
-    /* B-2009: захваченный пред-оп образ кладётся в ОБА слота: BUF_FLAGS —
-     * вход эмулятора (emu читает EFLAG(st) = buf+BUF_FLAGS и мутирует его
-     * в после-оп), BUF_FLAGS0 — пред-оп копия для restore_state
-     * (рекреация SMC-flush восстанавливает ИМЕННО пред-оп состояние). */
-    if (d->flags_use || d->flags_def) {
-        pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
-        pass_ins(dc, bb, i, INSTR_CREATE_pop(
-            dc, buf_opnd(BUF_FLAGS, OPSZ_8)));
-        pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
-        pass_ins(dc, bb, i, INSTR_CREATE_pop(
-            dc, buf_opnd(BUF_FLAGS0, OPSZ_8)));
-    }
+    /* (2) B-2011: стековый захват флагов УДАЛЁН. Раньше: pushf→BUF_FLAGS
+     * ×2 (BUF_FLAGS0) — записи в [app_rsp-8], т.е. В КРАСНУЮ ЗОНУ x86-64
+     * (128 байт под rsp — живые данные листовых функций; t_redzone:
+     * 0x44 вместо 0x45, bun: Math.max → undefined, console.log молчит).
+     * Потребность в стеке отпала целиком:
+     *  — аппаратные флаги через всю пре-последовательность НЕ трогаются
+     *    (mov/movups/lahf/seto — флаг-сохраняющие), поэтому mc.xflags в
+     *    точке clean call = ИСТИННЫЙ пред-оп образ;
+     *  — обёртка emu_generic кладёт его в BUF_FLAGS (вход эмулятора) и
+     *    BUF_FLAGS0 (копия restore_state) — обе роли бывшего захвата;
+     *  — DF/IF/TF не восстанавливаются popf'ом, а сохраняются ТРАНЗИТИВНО:
+     *    их не пишет ни одна инструкция последовательности (в отличие от
+     *    popf мусорного образа — баг node 8000+). */
 
     /* (3) спилы xmm.
      * §7.3 run #106 (B): uses_xmm0 (неявная маска XMM0 у pcmpestri/
@@ -518,44 +512,70 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instr_t *p_shr = INSTR_CREATE_shr(
             dc, opnd_create_reg(DR_REG_RAX), OPND_CREATE_INT8(1));
         instr_t *p_jr = INSTR_CREATE_jcc(dc, OP_jz, opnd_create_instr(l_read));
-        /* WRITE-путь */
+        /* WRITE-путь. B-2011: стековый транспорт (push адреса / pushf-popf)
+         * заменён на staging BUF_STG. Раскладка как в (6): sahf читает AH,
+         * а BUF_FLAGS — сырой EFLAGS — обязателен shl $8 (AH := байт 0);
+         * OF — add-трюк последним флаг-пишущим опом; перезагрузка AH-образа
+         * из staging (mov не пишет флаги); sahf. DF/IF/TF — транзитивно.
+         * Адрес фолта — из BUF_FAULT напрямую. БАГ B-2010-отката: мёртвая
+         * загрузка BUF_R10 в r10 — удалена вместе со стековым транспортом. */
         instr_t *p_wfa = INSTR_CREATE_mov_ld(
-            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
-        instr_t *p_wpush = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
-        instr_t *p_wfl = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
-        instr_t *p_wpushf = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
-        instr_t *p_wpopf = INSTR_CREATE_popf(dc);
+        instr_t *p_wshl8 = INSTR_CREATE_shl(
+            dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(8));
+        instr_t *p_wst = INSTR_CREATE_mov_st(
+            dc, buf_opnd(BUF_STG, OPSZ_8), opnd_create_reg(DR_REG_RAX));
+        instr_t *p_wld = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *p_wshl = INSTR_CREATE_shl(
+            dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(20));
+        instr_t *p_wadd = INSTR_CREATE_add(
+            dc, opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_EAX));
+        instr_t *p_wrld = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_STG, OPSZ_8));
+        instr_t *p_wsahf = INSTR_CREATE_sahf(dc);
         instr_t *p_wrax = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_GPR(0), OPSZ_8));
         instr_t *p_wr10 = INSTR_CREATE_mov_ld(
-            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_R10, OPSZ_8));
-        instr_t *p_wpop = INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_R10));
+            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_FAULT, OPSZ_8));
         instr_t *p_wacc = INSTR_CREATE_mov_st(
             dc, opnd_create_base_disp(DR_REG_R10, DR_REG_NULL, 0, 0, OPSZ_1),
             OPND_CREATE_INT8(0));
         instr_t *p_wjmp = INSTR_CREATE_jmp_short(dc, opnd_create_instr(l_end));
-        /* READ-путь */
+        /* READ-путь. БАГ (тянется с отбрасывания alt-стека B-2010): доступ
+         * шёл по [rax] ПОСЛЕ перезагрузки app-rax (p_rrax) — т.е. по адресу
+         * ПРИЛОЖЕНИЯ, а не фолта; теперь — по настоящему адресу фолта
+         * (rax = BUF_FAULT), r10 = прочитанный байт (throwaway, см. шапку
+         * (5b)). app-rax осознанно кlobber'ится — восстанавливается в (6). */
         instr_t *p_rfa = INSTR_CREATE_mov_ld(
-            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
-        instr_t *p_rpush = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
-        instr_t *p_rfl = INSTR_CREATE_mov_ld(
             dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
-        instr_t *p_rpushf = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
-        instr_t *p_rpopf = INSTR_CREATE_popf(dc);
-        instr_t *p_rrax = INSTR_CREATE_mov_ld(
-            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_GPR(0), OPSZ_8));
+        instr_t *p_rshl8 = INSTR_CREATE_shl(
+            dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(8));
+        instr_t *p_rst = INSTR_CREATE_mov_st(
+            dc, buf_opnd(BUF_STG, OPSZ_8), opnd_create_reg(DR_REG_RAX));
+        instr_t *p_rld = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *p_rshl = INSTR_CREATE_shl(
+            dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(20));
+        instr_t *p_radd = INSTR_CREATE_add(
+            dc, opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_EAX));
+        instr_t *p_rrld = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_STG, OPSZ_8));
+        instr_t *p_rsahf = INSTR_CREATE_sahf(dc);
+        instr_t *p_rfa2 = INSTR_CREATE_mov_ld(
+            dc, opnd_create_reg(DR_REG_RAX), buf_opnd(BUF_FAULT, OPSZ_8));
         instr_t *p_rr10 = INSTR_CREATE_mov_ld(
-            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_R10, OPSZ_8));
-        instr_t *p_rpop = INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_R10));
+            dc, opnd_create_reg(DR_REG_R10), buf_opnd(BUF_FAULT, OPSZ_8));
         instr_t *p_racc = INSTR_CREATE_movzx(
             dc, opnd_create_reg(DR_REG_R10D), opnd_create_base_disp(
                 DR_REG_RAX, DR_REG_NULL, 0, 0, OPSZ_1));
         instr_t *proxy_ins[] = { p_movc, p_t0, p_jz, p_shr, p_jr,
-                                 p_wfa, p_wpush, p_wfl, p_wpushf, p_wpopf,
-                                 p_wrax, p_wr10, p_wpop, p_wacc, p_wjmp,
-                                 p_rfa, p_rpush, p_rfl, p_rpushf, p_rpopf,
-                                 p_rrax, p_rr10, p_rpop, p_racc };
+                                 p_wfa, p_wshl8, p_wst, p_wld, p_wshl,
+                                 p_wadd, p_wrld, p_wsahf, p_wrax, p_wr10,
+                                 p_wacc, p_wjmp,
+                                 p_rfa, p_rshl8, p_rst, p_rld, p_rshl,
+                                 p_radd, p_rrld, p_rsahf, p_rfa2, p_rr10,
+                                 p_racc };
         for (size_t pi = 0; pi < sizeof(proxy_ins)/sizeof(proxy_ins[0]); pi++)
             instr_set_translation(proxy_ins[pi], instr_get_app_pc(i));
         instrlist_preinsert(bb, i, p_movc);
@@ -564,16 +584,28 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         instrlist_preinsert(bb, i, p_shr);
         instrlist_preinsert(bb, i, p_jr);
         instrlist_preinsert(bb, i, p_wfa);
-        instrlist_preinsert(bb, i, p_wpush);
-        instrlist_preinsert(bb, i, p_wfl);
-        instrlist_preinsert(bb, i, p_wpushf);
-        instrlist_preinsert(bb, i, p_wpopf);
+        instrlist_preinsert(bb, i, p_wshl8);
+        instrlist_preinsert(bb, i, p_wst);
+        instrlist_preinsert(bb, i, p_wld);
+        instrlist_preinsert(bb, i, p_wshl);
+        instrlist_preinsert(bb, i, p_wadd);
+        instrlist_preinsert(bb, i, p_wrld);
+        instrlist_preinsert(bb, i, p_wsahf);
         instrlist_preinsert(bb, i, p_wrax);
         instrlist_preinsert(bb, i, p_wr10);
-        instrlist_preinsert(bb, i, p_wpop);
         instrlist_preinsert(bb, i, p_wacc);
         instrlist_preinsert(bb, i, p_wjmp);
         instrlist_preinsert(bb, i, l_read);
+        instrlist_preinsert(bb, i, p_rfa);
+        instrlist_preinsert(bb, i, p_rshl8);
+        instrlist_preinsert(bb, i, p_rst);
+        instrlist_preinsert(bb, i, p_rld);
+        instrlist_preinsert(bb, i, p_rshl);
+        instrlist_preinsert(bb, i, p_radd);
+        instrlist_preinsert(bb, i, p_rrld);
+        instrlist_preinsert(bb, i, p_rsahf);
+        instrlist_preinsert(bb, i, p_rfa2);
+        instrlist_preinsert(bb, i, p_rr10);
         instrlist_preinsert(bb, i, p_racc);
         instrlist_preinsert(bb, i, l_end);
     }
@@ -624,20 +656,51 @@ int rewrite_generic_instr(void *dc, instrlist_t *bb, instr_t *i)
         }
     }
     /* флаги: безусловное восстановление — прокси (5b) мог их портить,
-     * а обёртка emu_generic кладёт app-флаги в BUF_FLAGS на каждом вызове */
+     * а обёртка emu_generic кладёт app-флаги в BUF_FLAGS на каждом вызове.
+     * B-2011: СТЕКЛЕСНЫЙ рестор вместо push rax/popf (красная зона).
+     * РАСКЛАДКА КРИТИЧНА (баг v1 трюка, пойман t_lztz: 28/44 строк):
+     * sahf читает AH = биты 8..15 rax, а BUF_FLAGS — СЫРОЙ образ EFLAGS
+     * (арифметический байт в AL, битах 0..7) — без сдвига CF брался из
+     * бита 8 (TF!), PF из бита 10 (DF) — вся пятёрка со сдвигом 8.
+     * Поэтому: (1) AH := байт 0 образа через shl $8; (2) OF — add-трюк
+     * ПОСЛЕДНИМ флаг-пишущим опом (shl $20/add, shl $8 его бы убил);
+     * (3) перезагрузка AH-образа из staging (mov не пишет флаги — OF жив);
+     * (4) sahf возвращает CF/PF/AF/ZF/SF. Итог: все 6 арифметических
+     * битов = образ; DF/IF/TF — транзитивно нетронуты (см. (2)). */
     if (1) {
         instr_t *n1 = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
                                           buf_opnd(BUF_FLAGS, OPSZ_8));
-        instr_t *n2 = INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX));
-        instr_t *n3 = INSTR_CREATE_popf(dc);
+        instr_t *n1b = INSTR_CREATE_shl(dc, opnd_create_reg(DR_REG_EAX),
+                                        OPND_CREATE_INT8(8));
+        instr_t *n1c = INSTR_CREATE_mov_st(dc, buf_opnd(BUF_STG, OPSZ_8),
+                                           opnd_create_reg(DR_REG_RAX));
+        instr_t *n1d = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
+                                           buf_opnd(BUF_FLAGS, OPSZ_8));
+        instr_t *n1e = INSTR_CREATE_shl(dc, opnd_create_reg(DR_REG_EAX),
+                                        OPND_CREATE_INT8(20));
+        instr_t *n1f = INSTR_CREATE_add(dc, opnd_create_reg(DR_REG_EAX),
+                                        opnd_create_reg(DR_REG_EAX));
+        instr_t *n1g = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),
+                                           buf_opnd(BUF_STG, OPSZ_8));
+        instr_t *n3 = INSTR_CREATE_sahf(dc);
         instr_set_translation(n1, instr_get_app_pc(i));
-        instr_set_translation(n2, instr_get_app_pc(i));
+        instr_set_translation(n1b, instr_get_app_pc(i));
+        instr_set_translation(n1c, instr_get_app_pc(i));
+        instr_set_translation(n1d, instr_get_app_pc(i));
+        instr_set_translation(n1e, instr_get_app_pc(i));
+        instr_set_translation(n1f, instr_get_app_pc(i));
+        instr_set_translation(n1g, instr_get_app_pc(i));
         instr_set_translation(n3, instr_get_app_pc(i));
         instrlist_postinsert(bb, cur, n1); cur = n1;
-        instrlist_postinsert(bb, cur, n2); cur = n2;
+        instrlist_postinsert(bb, cur, n1b); cur = n1b;
+        instrlist_postinsert(bb, cur, n1c); cur = n1c;
+        instrlist_postinsert(bb, cur, n1d); cur = n1d;
+        instrlist_postinsert(bb, cur, n1e); cur = n1e;
+        instrlist_postinsert(bb, cur, n1f); cur = n1f;
+        instrlist_postinsert(bb, cur, n1g); cur = n1g;
         instrlist_postinsert(bb, cur, n3); cur = n3;
     }
-    /* rax — всегда последним: popf затирает его носителем;
+    /* rax — всегда последним: рестор флагов использует его как носитель;
        спил гарантирует исходное значение (rax — dst или источник) */
     {
         instr_t *ni = INSTR_CREATE_mov_ld(dc, opnd_create_reg(DR_REG_RAX),

@@ -155,10 +155,15 @@ extern uint g_bb_rwseq;  /* B-2009: переписывания в текущем
  * redirect по переписанным последовательностям). BUF_FLAGS перезаписывается
  * обёрткой emu_generic ПОСЛЕ-оп флагами, BUF_GPR(k)/BUF_XMM(k) — результатами
  * для dst — поэтому пред-оп образ живёт отдельно:                    */
-#define BUF_FLAGS0  472u               /* пред-оп образ eflags (захват (2))  */
+#define BUF_FLAGS0  472u               /* пред-оп образ eflags (B-2011: кладёт
+                                          обёртка emu_generic из mc.xflags;
+                                          раньше — стековый захват (2))       */
 #define BUF_GPRD(i) (480u + (i)*8u)    /* пред-оп спил GPR-dst + rax         */
 #define BUF_XMMD(i) (608u + (i)*16u)   /* пред-оп спил xmm-dst               */
-#define BUF_SIZE    872u
+#define BUF_STG     864u               /* B-2011: staging для стеклесного
+                                          рестора флагов (sahf-трюк: копия
+                                          образа на время shl/add)           */
+#define BUF_SIZE    872u               /* 864+8 — ровно впритык               */
 
 /* ────────── B-2009: restore_state (рекреация app-контекста) ────────── */
 #define PASS_META_NOTE ((void *)(ptr_int_t)1)   /* note наших мета-инструкций */

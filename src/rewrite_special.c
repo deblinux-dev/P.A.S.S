@@ -245,10 +245,17 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
         pass_ins(dc, bb, i, instr_create_1dst_1src(dc, OP_pmovmskb, d0, s0));
         return 1;
     }
-    /* rax — носитель (спил всегда), флаги — в TG3 (оригинал их не меняет) */
+    /* rax — носитель (спил всегда); флаги — в TG3 (оригинал их не меняет).
+     * B-2011: СТЕКЛЕСНЫЙ захват вместо pushf→rax (красная зона):
+     * lahf (ah = байт 0 флагов: CF PF AF ZF SF) + seto (al = OF) — оба
+     * флаг-сохраняющие; в TG3 лежит пара (ah,al) для стеклесного
+     * рестора. DF/IF/TF не захватываются и не трогаются нигде в танце
+     * (mov/movups/pmovmskb/shl/or — все их не пишут, кроме shl/or,
+     * которые чинятся рестором) — сохраняются транзитивно. */
     save_gpr_tmp(dc, bb, i, DR_REG_RAX);
-    pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
-    pass_ins(dc, bb, i, INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_RAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_lahf(dc));
+    pass_ins(dc, bb, i, INSTR_CREATE_setcc(dc, OP_seto,
+        opnd_create_reg(DR_REG_AL)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
         dc, raw_opnd(RAW_TG3, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
@@ -269,14 +276,27 @@ static int try_pmovmskb(void *dc, instrlist_t *bb, instr_t *i)
         dc, d0, raw_opnd(RAW_TG2, opnd_get_size(d0))));
     /* восстановления: флаги, xmm15, rax.
      * БАГ v0.1: при dst==rax результат затирался загрузкой образа
-     * флагов в rax-носитель — сохраняем результат в TG2. */
+     * флагов в rax-носитель — сохраняем результат в TG2.
+     * B-2011: стеклесный рестор вместо push/popf (красная зона):
+     * образ из TG3 → rax; копия в RAW_T2 (mov не пишет флаги);
+     * shl $31 (al=OF → bit31); add eax,eax (OF восстановлен,
+     * прочие биты — мусор); перезагрузка образа из RAW_T2 (OF жив);
+     * sahf возвращает CF/PF/AF/ZF/SF из ah. RAW_T2 в этих танцах
+     * свободен (его юзает только vinsert128 в rewrite_vex.c). */
     if (dst_is_rax)
         pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
             dc, raw_opnd(RAW_TG2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
         dc, opnd_create_reg(DR_REG_RAX), raw_opnd(RAW_TG3, OPSZ_8)));
-    pass_ins(dc, bb, i, INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX)));
-    pass_ins(dc, bb, i, INSTR_CREATE_popf(dc));
+    pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+        dc, raw_opnd(RAW_T2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_shl(
+        dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(31)));
+    pass_ins(dc, bb, i, INSTR_CREATE_add(
+        dc, opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_EAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
+        dc, opnd_create_reg(DR_REG_RAX), raw_opnd(RAW_T2, OPSZ_8)));
+    pass_ins(dc, bb, i, INSTR_CREATE_sahf(dc));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
     if (dst_is_rax)
@@ -307,9 +327,12 @@ static int try_vmovmsk(void *dc, instrlist_t *bb, instr_t *i)
         pass_ins(dc, bb, i, instr_create_1dst_1src(dc, ms_op, d0, s0));
         return 1;
     }
+    /* B-2011: стеклесный захват/рестор — см. try_pmovmskb (идентичный
+     * танец: lahf+seto → TG3, рестор через RAW_T2 + sahf). */
     save_gpr_tmp(dc, bb, i, DR_REG_RAX);
-    pass_ins(dc, bb, i, INSTR_CREATE_pushf(dc));
-    pass_ins(dc, bb, i, INSTR_CREATE_pop(dc, opnd_create_reg(DR_REG_RAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_lahf(dc));
+    pass_ins(dc, bb, i, INSTR_CREATE_setcc(dc, OP_seto,
+        opnd_create_reg(DR_REG_AL)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
         dc, raw_opnd(RAW_TG3, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
@@ -331,8 +354,15 @@ static int try_vmovmsk(void *dc, instrlist_t *bb, instr_t *i)
             dc, raw_opnd(RAW_TG2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
     pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
         dc, opnd_create_reg(DR_REG_RAX), raw_opnd(RAW_TG3, OPSZ_8)));
-    pass_ins(dc, bb, i, INSTR_CREATE_push(dc, opnd_create_reg(DR_REG_RAX)));
-    pass_ins(dc, bb, i, INSTR_CREATE_popf(dc));
+    pass_ins(dc, bb, i, INSTR_CREATE_mov_st(
+        dc, raw_opnd(RAW_T2, OPSZ_8), opnd_create_reg(DR_REG_RAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_shl(
+        dc, opnd_create_reg(DR_REG_EAX), OPND_CREATE_INT8(31)));
+    pass_ins(dc, bb, i, INSTR_CREATE_add(
+        dc, opnd_create_reg(DR_REG_EAX), opnd_create_reg(DR_REG_EAX)));
+    pass_ins(dc, bb, i, INSTR_CREATE_mov_ld(
+        dc, opnd_create_reg(DR_REG_RAX), raw_opnd(RAW_T2, OPSZ_8)));
+    pass_ins(dc, bb, i, INSTR_CREATE_sahf(dc));
     pass_ins(dc, bb, i, INSTR_CREATE_movups(
         dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
     if (dst_is_rax)

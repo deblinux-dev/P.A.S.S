@@ -73,6 +73,26 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
     if (opc_supported(opc, dsz) && opc != OP_cpuid && opc != OP_xgetbv) {
         if (g_fail_streak >= TRAP_FAIL_LIMIT)
             trap_deadloop_abort(dc, ins);
+        /* B-2011 diag: ud2-доставка — дамп контекста, чтобы опознать
+         * источник SIGILL (JSC probe-сентинел / Zig unreachable / иное).
+         * Гейт verbose>=1 (B-2012: доставка SIGILL в app-обработчик —
+         * чистый repro: bun -target native -cpu max → rc=132). */
+        if (opc == OP_ud2 && g_cfg.verbose >= 1) {
+            uint8_t *p = (uint8_t *)mc->pc;
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.][UD2DUMP] pc=" PIFX " rax=" PIFX
+                       " rcx=" PIFX " rdx=" PIFX " rbx=" PIFX
+                       " rsp=" PIFX " rbp=" PIFX " rsi=" PIFX
+                       " rdi=" PIFX " r8=" PIFX " r9=" PIFX
+                       " r10=" PIFX " r11=" PIFX " fl=%08x\n  bytes:",
+                       (ptr_uint_t)mc->pc, mc->xax, mc->xcx, mc->xdx,
+                       mc->xbx, mc->xsp, mc->xbp, mc->xsi, mc->xdi,
+                       mc->r8, mc->r9, mc->r10, mc->r11,
+                       (unsigned)mc->xflags);
+            for (int b = -16; b < 8; b++)
+                dr_fprintf(STDERR, " %02x", p[b]);
+            dr_fprintf(STDERR, "\n");
+        }
         instr_destroy(dc, ins);
         return 0;   /* инструкция легальна — SIGILL по другой причине */
     }
