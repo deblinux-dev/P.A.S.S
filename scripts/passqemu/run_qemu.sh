@@ -46,7 +46,7 @@ if [ "$PHASE" = "1" ]; then
   else bad "контроль t_istr: rc=0 без клиента?!"; fi
 
   echo "── asm-тесты под P.A.S.S. @ $CPU (rc=0):"
-  for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256 t_vextm t_vdir15; do
+  for t in t_pmov2 t_vz t_flags t_msk t_store t_str t_vq t_vq4 t_fmasd t_fam t_sh256 t_vextm t_vdir15 t_sigill; do
     [ -x "$t" ] || continue
     qpass "./$t" >/dev/null 2>&1 && ok "$t" || bad "$t (rc!=0)"
   done
@@ -80,7 +80,7 @@ if [ "$PHASE" = "1" ]; then
   done
 
   echo "── дифф ISA-батареи (побайтно):"
-  for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp t_live15; do
+  for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp t_live15 t_sigill; do
     [ -x "$t" ] || continue
     "./$t" > "$REF/$t.bin" 2>/dev/null
     qpass "./$t" > "$OUT/$t.bin" 2>/dev/null

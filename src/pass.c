@@ -323,8 +323,9 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     if (g_cfg.enable_trap)
         trap_init();
     /* B-2010 diag: syscall-трейсер (опция -strace) */
-    if (g_strace)
-        pass_strace_init();
+    /* B-2013: безусловно — модуль содержит не только diag-трейсер
+     * (-strace), но и постоянный фикс close_range (см. strace.c) */
+    pass_strace_init();
 
     /* B-2009 diag: сэмплер app-PC (dr_set_itimer); getenv в инжектируемом
      * процессе ненадёжен — только клиентская опция -sampler <мс>. */
