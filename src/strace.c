@@ -105,6 +105,24 @@ static bool sc_pre(void *drcontext, int sysnum)
         dr_fprintf(STDERR, "\n");
         return true;
     }
+    /* B-2014: execve — печатаем путь и argv (spawn-циклы Godot/bun) */
+    if (sysnum == 59) {
+        char pbuf[128];
+        if (a0 && dr_safe_read((void *)a0, sizeof(pbuf), pbuf, NULL)) {
+            pbuf[sizeof(pbuf) - 1] = 0;
+            dr_fprintf(STDERR, "[SC 59 execve] \"%s\" argv:", pbuf);
+            char *av[8];
+            dr_safe_read((void *)a1, sizeof(av), av, NULL);
+            for (int k = 0; k < 8 && av[k]; k++) {
+                char ab[96];
+                if (dr_safe_read(av[k], sizeof(ab), ab, NULL)) {
+                    ab[sizeof(ab) - 1] = 0;
+                    dr_fprintf(STDERR, " [%s]", ab);
+                }
+            }
+            dr_fprintf(STDERR, "\n");
+        }
+    }
     /* компактный поток прочих syscall'ов */
     dr_fprintf(STDERR, "[SC %d] %p %p %p\n", sysnum, a0, a1, a2);
     return true;

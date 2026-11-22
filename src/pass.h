@@ -291,7 +291,7 @@ typedef struct {
     feat_t req;      /* требуемая фича для нативного исполнения */
 } vex_map_ent_t;
 
-enum { VF_NDS = 0, VF_ND2, VF_SHIFT, VF_DIR, VF_SPECIAL };
+enum { VF_NDS = 0, VF_ND2, VF_SHIFT, VF_DIR, VF_SPECIAL, VF_EXTR, VF_INS };
 const vex_map_ent_t *vex_map_lookup(int opc);
 /* §7.3 fuzz */
 const vex_map_ent_t *vex_map_all(int *count);

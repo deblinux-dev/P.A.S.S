@@ -41,8 +41,16 @@ featset_t profile_from_name(const char *name)
     if (strcmp(name, "native") == 0) {
         return g_cfg.host;                  /* passthrough без эмуляции */
     } else if (strcmp(name, "core2") == 0) {
-        /* Merom/Penryn: SSE3, SSSE3. Нет SSE4.x/POPCNT/AVX. */
+        /* Merom: SSE3, SSSE3. Нет SSE4.x/POPCNT/AVX. */
         p = FEAT(F_SSE3) | FEAT(F_SSSE3);
+    } else if (strcmp(name, "penryn") == 0) {
+        /* B-2014: Penryn = Merom + SSE4.1 НАТИВНО (вольфдейл-ядро).
+         * Легаси-SSE4.1 passthrough без стабов — Godot 4.5 (сборка под
+         * SSE4.1, 185М legacy pextrd) под -target core2 давал 1.07 млрд
+         * clean call'ов = «цикл зависания»; под penryn Storm уходит:
+         * CPUID честно светит SSE4.1 (profile ∩ host), приложение
+         * исполняет их нативно. SSE4.2/POPCNT/AVX — эмуляция.       */
+        p = FEAT(F_SSE3) | FEAT(F_SSSE3) | FEAT(F_SSE41);
     } else if (strcmp(name, "nehalem") == 0) {
         p = FEAT(F_SSE3) | FEAT(F_SSSE3) | FEAT(F_SSE41) |
             FEAT(F_SSE42) | FEAT(F_POPCNT) | FEAT(F_LZCNT);

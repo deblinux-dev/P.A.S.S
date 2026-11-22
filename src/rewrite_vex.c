@@ -81,6 +81,22 @@ static const vex_map_ent_t vex_map[] = {
     E(vpmaxub, pmaxub, VF_NDS, F_AVX), E(vpmaxsw, pmaxsw, VF_NDS, F_AVX),
     E(vpminub, pminub, VF_NDS, F_AVX), E(vpminsw, pminsw, VF_NDS, F_AVX),
     E(vpblendw, pblendw, VF_NDS, F_AVX),
+    /* ── B-2014: семья SSE4.1 с точными legacy-аналогами. Раньше вся
+     * семья проваливалась в generic-стаб (vpextrd у Godot 4.5 — 288М
+     * clean call'ов за 150 с = «цикл зависания»; у bun — 4946 pinsrd).
+     * VF_EXTR: vpextrX r32/m, xmm, imm → legacy pextrX (операнды 1:1,
+     * mem-dst кодируем напрямую — SSE4.1 нативен на Penryn).
+     * VF_INS: vpinsrX dst, merge, r32/m, imm → movaps + legacy pinsrX. */
+    E(vpextrb, pextrb, VF_EXTR, F_AVX), E(vpextrw, pextrw, VF_EXTR, F_AVX),
+    E(vpextrd, pextrd, VF_EXTR, F_AVX),
+    E(vpinsrb, pinsrb, VF_INS, F_AVX),  E(vpinsrw, pinsrw, VF_INS, F_AVX),
+    E(vpinsrd, pinsrd, VF_INS, F_AVX),
+    E(vptest, ptest, VF_EXTR, F_AVX),
+    E(vpminsb, pminsb, VF_NDS, F_AVX),  E(vpminsd, pminsd, VF_NDS, F_AVX),
+    E(vpmaxsb, pmaxsb, VF_NDS, F_AVX),  E(vpmaxsd, pmaxsd, VF_NDS, F_AVX),
+    E(vpackusdw, packusdw, VF_NDS, F_AVX),
+    E(vpmuldq, pmuldq, VF_NDS, F_AVX),  E(vpmulld, pmulld, VF_NDS, F_AVX),
+    E(vroundps, roundps, VF_ND2, F_AVX), E(vroundpd, roundpd, VF_ND2, F_AVX),
     E(vpalignr, palignr, VF_NDS, F_AVX),
     /* скалярные merge */
     E(vaddss, addss, VF_NDS, F_AVX), E(vaddsd, addsd, VF_NDS, F_AVX),
@@ -205,6 +221,8 @@ static void restore15(void *dc, instrlist_t *bb, instr_t *at, int used15, int ds
 
 /* ══════════════ 128-битный путь ══════════════ */
 
+static void remove_orig(void *dc, instrlist_t *bb, instr_t *i);
+
 static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
                        const vex_map_ent_t *e)
 {
@@ -215,9 +233,11 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
     /* §7.3 (fuzz): mem-dst — только generic, КРОМЕ перемещений: DIR —
      * store'ы vmovaps/vmovd/vmovq (кодируемы, валидны с v0.1), а также
      * 2-формы vmovss/vmovsd (store, stub 1d1s). Арифметика NDS/ND2/SHIFT
-     * с mem-dst (unpcklps em], xmm, xmm) inline не умеет — в generic. */
+     * с mem-dst (unpcklps em], xmm, xmm) inline не умеет — в generic.
+     * B-2014: VF_EXTR — legacy pextr* имеет mem-dst-форму (SSE4.1),
+     * кодируем напрямую (vpextrd mem-dst у Godot — 288М generic). */
     if (!opnd_is_reg(instr_get_dst(i, 0)) &&
-        !(e->form == VF_DIR ||
+        !(e->form == VF_DIR || e->form == VF_EXTR ||
           e->vex_op == OP_vmovss || e->vex_op == OP_vmovsd))
         return 0;
     /* §7.3 (fuzz): imm-семья (cmpps/cmppd/shufps/shufpd/pblendw/palignr)
@@ -304,6 +324,44 @@ static int rewrite_128(void *dc, instrlist_t *bb, instr_t *i,
         opnd_set_size(&s2eff, OPSZ_8);
 
     switch (e->form) {
+    case VF_EXTR: {
+        /* B-2014: vpextrb/w/d r32/m, xmm, imm → legacy pextrb/w/d.
+         * Операнды 1:1 (DR-канон 1dst_2src (d, s, i)), mem-dst —
+         * напрямую (размер операнда DR сам декодировал по VEX-опкоду —
+         * emu.c §7.3: у pextrb это OPSZ_2 — тот же канон и у legacy).
+         * vptest — без imm: 1dst_1src (d, s) — флаги задает нативно. */
+        if (has_imm) {
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, e->legacy_op, d0, s1, imm));
+        } else {
+            pass_ins(dc, bb, i, instr_create_1dst_1src(
+                dc, e->legacy_op, d0, s1));
+        }
+        remove_orig(dc, bb, i);
+        return 1;
+    }
+    case VF_INS: {
+        /* B-2014: vpinsrX dst, merge, r32/m, imm →
+         *   movaps dst ← merge (если merge != dst);
+         *   legacy pinsrX dst, r32/m, imm (1dst_2src (d, s, i)).
+         * DR-канон VEX: (d, merge, src, imm) 1dst_3src; 2-форма —
+         * (d, src, imm), merge = сам dst. zero_yhi — общий хвост. */
+        if (!opnd_is_reg(d0)) return 0;
+        opnd_t ins_src = s2, ins_imm = imm;
+        if (nsrc >= 3 && opnd_is_immed_int(instr_get_src(i, nsrc - 1))) {
+            ins_src = instr_get_src(i, nsrc - 2);
+            ins_imm = instr_get_src(i, nsrc - 1);
+        } else if (!has_imm)
+            return 0;
+        if (opnd_is_reg(s1) && opnd_get_reg(s1) != opnd_get_reg(d0))
+            pass_ins(dc, bb, i, INSTR_CREATE_movaps(dc, xmm16(d0), xmm16(s1)));
+        else if (opnd_is_memory_reference(s1))
+            return 0; /* merge из mem — синтетика, в generic */
+        pass_ins(dc, bb, i, instr_create_1dst_2src(
+            dc, e->legacy_op, d0, ins_src, ins_imm));
+        remove_orig(dc, bb, i);
+        return 1;
+    }
     case VF_DIR:
         if ((e->vex_op == OP_vmovd || e->vex_op == OP_vmovq) &&
             opnd_is_reg(d0) && is_gpr_reg(opnd_get_reg(d0)) && opnd_is_reg(s1)) {
@@ -495,8 +553,10 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
     if (instr_num_dsts(i) == 0)
         return 0;
     /* §7.3 (fuzz): mem-dst — только generic, КРОМЕ DIR-store'ов
-     * (vmovaps/vmovnt* ymm — валидны с v0.1; vmovss/sd ymm-форм нет) */
-    if (!opnd_is_reg(instr_get_dst(i, 0)) && e->form != VF_DIR)
+     * (vmovaps/vmovnt* ymm — валидны с v0.1; vmovss/sd ymm-форм нет);
+     * B-2014: VF_EXTR — legacy pextr* mem-dst (SSE4.1) напрямую. */
+    if (!opnd_is_reg(instr_get_dst(i, 0)) &&
+        !(e->form == VF_DIR || e->form == VF_EXTR))
         return 0;
     /* §7.3 (fuzz): imm-семья без imm — синтетика, в generic ДО staging */
     if (e->form == VF_NDS &&
@@ -514,6 +574,46 @@ static int rewrite_256(void *dc, instrlist_t *bb, instr_t *i,
         for (int k = 0; k < nsrc; k++)
             if (opnd_uses_r10(instr_get_src(i, k)))
                 return 0;
+    }
+
+    /* ── VF_EXTR (B-2014): VEX.256 vpextrX — imm выбирает элемент из
+     * ПОЛНОГО ymm: imm < nlo — из аппаратного xmm (lo), иначе из
+     * RAW_YHI(src) с корректировкой imm. Носитель xmm15 — со спилом
+     * (s1i==15: hi — в RAW_YHI(15), чтение его в xmm15 портит app-lo
+     * — тот же класс t_vdir15). VF_INS 256 — не реализован (редка). */
+    if (e->form == VF_EXTR) {
+        opnd_t xd = instr_get_dst(i, 0);
+        opnd_t xs = instr_get_src(i, 0);
+        int xn = instr_num_srcs(i);
+        if (!opnd_is_reg(xs) || xn < 2 ||
+            !opnd_is_immed_int(instr_get_src(i, xn - 1)))
+            return 0;
+        int q = (int)opnd_get_immed_int(instr_get_src(i, xn - 1));
+        int s1i = xmm_idx(opnd_get_reg(xs));
+        int nlo = (e->legacy_op == OP_pextrb) ? 16
+                : (e->legacy_op == OP_pextrw) ? 8 : 4;
+        int used15 = 0;
+        if (q < nlo) {
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, e->legacy_op, xd, opnd_create_reg(DR_REG_XMM0 + s1i),
+                OPND_CREATE_INT32(q)));
+        } else {
+            if (s1i != 15) {
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(DR_REG_XMM15)));
+                used15 = 1;
+            }
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_YHI(s1i), OPSZ_16)));
+            pass_ins(dc, bb, i, instr_create_1dst_2src(
+                dc, e->legacy_op, xd, opnd_create_reg(DR_REG_XMM15),
+                OPND_CREATE_INT32(q - nlo)));
+            if (used15)
+                pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                    dc, opnd_create_reg(DR_REG_XMM15), raw_opnd(RAW_S15, OPSZ_16)));
+        }
+        remove_orig(dc, bb, i);
+        return 1;
     }
     opnd_t d0 = instr_get_dst(i, 0);
     int nsrc = instr_num_srcs(i);
