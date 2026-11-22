@@ -6,7 +6,9 @@
  * процессе ненадёжен — см. pass.c).
  * B-2013: содержит и ПОСТОЯННЫЙ фикс close_range (не diag!). */
 #include "pass.h"
-#include <sys/syscall.h>
+#ifdef LINUX
+#include <sys/syscall.h> /* SYS_close_range; MSVC не знает этот заголовок */
+#endif
 
 /* B-2013: обход дефекта DR 11.91.20763: SYS_close_range эмулируется
  * циклом по КАЖДОМУ fd диапазона (os.c: for (i=first; i<=last; i++)

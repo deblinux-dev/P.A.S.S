@@ -23,9 +23,11 @@ add_library(pass_client SHARED
     src/rewrite.c
     src/rewrite_vex.c
     src/rewrite_special.c
+    src/restore_state.c
     src/trap.c
     src/segv_dump.c
     src/strace.c
+    src/sampler.c
     src/fuzz.c
     )
 
