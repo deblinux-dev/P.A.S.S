@@ -2225,6 +2225,81 @@ int emu_generic(emu_desc_t *d)
     return rc;
 }
 
+/* ── B-2016: кольцевой буфер последних generic-опов ──
+ * Симптом B-2015: bun 1.4.5 Windows падал «memory allocation of N bytes
+ * failed» (fastfail 0xC0000409) — fastfail обходит ВСЕ user-mode
+ * обработчики (DR exception event НЕ получает его), итоги не печатаются,
+ * а по логу видно только ~15 syscalls. Единственный шанс узнать, ЧТО
+ * исполнялось перед смертью — фиксировать каждый generic-вызов в
+ * дешёвый TLS-агностичный кольцевой буфер и печатать его: (а) в итоги,
+ * (б) при любом diag-исключении (#UD и т.п.), (в) при OOM-детекте в
+ * syscall-событии (strace.c: NtWriteFile/NtDeviceIoControlFile с текстом
+ * «memory allocation of» — пишется ДО fastfail, ловится в user-mode). */
+#define GENERIC_RING_N 32
+static int          g_generic_ring[GENERIC_RING_N];
+static volatile unsigned g_generic_ring_idx;
+
+void pass_generic_ring_note(int opc)
+{
+    unsigned i = g_generic_ring_idx++ & (GENERIC_RING_N - 1);
+    g_generic_ring[i] = opc;
+}
+
+/* дамп «последнее состояние» + регистры текущего потока. why — причина
+ * (OOM/UD/EXIT); dc может быть NULL (печать без регистров).          */
+void pass_diag_dump(const char *why, void *dc)
+{
+    unsigned base = g_generic_ring_idx & (GENERIC_RING_N - 1);
+    dr_fprintf(STDERR, "[P.A.S.S.][DIAG] %s — последние generic-опы:\n", why);
+    /* хронологический порядок: от старого к новому */
+    unsigned n = (g_generic_ring_idx < GENERIC_RING_N) ? g_generic_ring_idx
+                                                       : GENERIC_RING_N;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned i = (base + GENERIC_RING_N - n + k) & (GENERIC_RING_N - 1);
+        dr_fprintf(STDERR, " %s", (k % 8 == 0) ? "  " : "");
+        dr_fprintf(STDERR, "op#%d", g_generic_ring[i]);
+    }
+    dr_fprintf(STDERR, "\n");
+    /* топ-10 по счётчикам */
+    {
+        int taken[10] = { 0 };
+        dr_fprintf(STDERR, "[P.A.S.S.][DIAG] top generic:");
+        for (int t = 0; t < 10; t++) {
+            int best = -1;
+            for (int k2 = 0; k2 < OPC_MAX; k2++) {
+                if (g_stat_generic[k2] == 0) continue;
+                int dup = 0;
+                for (int q = 0; q < t; q++) if (taken[q] == k2) dup = 1;
+                if (!dup && (best < 0 || g_stat_generic[k2] > g_stat_generic[best]))
+                    best = k2;
+            }
+            if (best < 0) break;
+            taken[t] = best;
+            dr_fprintf(STDERR, " op#%d=%u", best, g_stat_generic[best]);
+        }
+        dr_fprintf(STDERR, "\n");
+    }
+    dr_fprintf(STDERR, "[P.A.S.S.][DIAG] bb=%u inline_rwsq=%u generic=%llu\n",
+               g_stat_bbs, g_bb_rwseq, (unsigned long long)g_dyn_generic);
+    if (dc != NULL) {
+        dr_mcontext_t mc;
+        memset(&mc, 0, sizeof(mc));
+        mc.size = sizeof(mc);
+        mc.flags = DR_MC_INTEGER | DR_MC_CONTROL;
+        if (dr_get_mcontext(dc, &mc)) {
+            dr_fprintf(STDERR,
+                       "  rax=" PIFX " rbx=" PIFX " rcx=" PIFX " rdx=" PIFX "\n"
+                       "  rsi=" PIFX " rdi=" PIFX " rbp=" PIFX " rsp=" PIFX "\n"
+                       "   r8=" PIFX "  r9=" PIFX " r10=" PIFX " r11=" PIFX "\n"
+                       "  r12=" PIFX " r13=" PIFX " r14=" PIFX " r15=" PIFX "\n",
+                       mc.xax, mc.xbx, mc.xcx, mc.xdx,
+                       mc.xsi, mc.xdi, mc.xbp, mc.xsp,
+                       mc.r8, mc.r9, mc.r10, mc.r11,
+                       mc.r12, mc.r13, mc.r14, mc.r15);
+        }
+    }
+}
+
 int emu_generic_impl(emu_desc_t *d)
 {
     void *dc = dr_get_current_drcontext();
@@ -2238,6 +2313,7 @@ int emu_generic_impl(emu_desc_t *d)
         PASS_ATOMIC_INC32(&g_stat_generic[d->opc]);
     }
     PASS_ATOMIC_INC32(&g_dyn_generic);
+    pass_generic_ring_note(d->opc);
     /* §7.3 diag (PASS_CMPBUF=1): сверить спилы в BUF с фактическим
      * контекстом приложения. Спилы-инструкции вставлены ДО clean call
      * и регистров не меняют, поэтому app-контекст (сохранённый DR-шным

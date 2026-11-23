@@ -337,5 +337,22 @@ int main(int argc, char **argv)
     if (!GetExitCodeProcess(pi.hProcess, &code))
         code = 1;
     CloseHandle(pi.hProcess);
+    /* B-2016: STATUS_ILLEGAL_INSTRUCTION (0xC000001D) у приложения на CPU
+     * без SSE4.2/AVX — почти всегда значит «эмулятор не был активен в
+     * момент #UD»: баннер [P.A.S.S.] в выводе не появлялся, клиент не
+     * загрузился (натурный кейс: дамп bun_baseline.exe показал #UD на
+     * popcnt при dynamorio.dll в процессе, но pass_client.dll
+     * отсутствующем). Подсказка вместо тихой смерти. */
+    if (code == 0xC000001Du) {
+        print_utf8(
+            "pass.exe: приложение упало с STATUS_ILLEGAL_INSTRUCTION "
+            "(0xC000001D).\n"
+            "  Если в выводе выше НЕ было баннера '[P.A.S.S.] client base' — "
+            "эмулятор не подключился (клиент не загрузился), и инструкция "
+            "ушла в CPU без эмуляции.\n"
+            "  Что проверить: полную установку DynamoRIO (lib64\\release\\"
+            "dynamorio.dll рядом с bin64\\drrun.exe) и повторный запуск; "
+            "повторяющийся случай — пришлите лог целиком.\n");
+    }
     return (int)code;
 }

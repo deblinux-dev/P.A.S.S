@@ -220,6 +220,50 @@ static bool sc_pre(void *drcontext, int sysnum)
     if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
         nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
         return false;
+    /* ── B-2016: OOM-детектор ──
+     * Rust handle_alloc_error печатает «memory allocation of N bytes
+     * failed» и сразу abort() → __fastfail(7) → 0xC0000409, который
+     * ОБХОДИТ все user-mode обработчики (exception event не стреляет,
+     * итоги не печатаются). Пишемое сообщение — последняя точка, где
+     * мы ещё живы: сканируем буферы NtWriteFile(54) и
+     * NtDeviceIoControlFile(7, консольный WriteFile идёт через него).
+     * Срабатывание → полный дамп состояния (кольцо generic-опов,
+     * счётчики, регистры) — независимо от -strace. */
+    if (sysnum == 54 || sysnum == 7) {
+        static volatile long oom_dumps;
+        /* NtWriteFile: buffer=param5, len=param6;
+         * NtDeviceIoControlFile: inbuf=param5, insize=param6,
+         * outbuf=param7, outsize=param8 */
+        ptr_int_t b[2] = { dr_syscall_get_param(drcontext, 5),
+                           dr_syscall_get_param(drcontext, 7) };
+        ptr_int_t l[2] = { dr_syscall_get_param(drcontext, 6),
+                           dr_syscall_get_param(drcontext, 8) };
+        /* проверяем оба кандидата (NtWriteFile: params 7/8 = ByteOffset/Key —
+         * там NULL/0 → пропускаются сами; DeviceIoControl: param5 = inbuf,
+         * param7 = outbuf) */
+        for (int q = 0; q < 2; q++) {
+            uint8_t tmp[256];
+            size_t n = (l[q] > 0 && l[q] < (ptr_int_t)sizeof(tmp))
+                           ? (size_t)l[q] : sizeof(tmp);
+            if (n < 20 || b[q] == 0) continue;
+            if (!dr_safe_read((void *)b[q], n, tmp, NULL)) continue;
+            for (size_t i = 0; i + 20 <= n; i++) {
+                if (tmp[i]   == 'm' && tmp[i+1] == 'e' && tmp[i+2] == 'm' &&
+                    tmp[i+3] == 'o' && tmp[i+4] == 'r' && tmp[i+5] == 'y' &&
+                    tmp[i+16] == 'a' && tmp[i+17] == 'l' && tmp[i+18] == 'l') {
+                    if (oom_dumps < 3) {
+                        oom_dumps++;
+                        dr_fprintf(STDERR,
+                            "[P.A.S.S.][OOM] обнаружено сообщение 'memory "
+                            "allocation of ... failed' (fastfail обходит "
+                            "обработчики — ловлю в последнем окне):\n");
+                        pass_diag_dump("OOM-abort", drcontext);
+                    }
+                    break;
+                }
+            }
+        }
+    }
 #endif
     /* B-2015: СВОЙ гейт трейса. Ядро DR 11.91.20763 НЕ вызывает
      * instrument_filter_syscall вовсе (0 call sites в core: dispatch.c /

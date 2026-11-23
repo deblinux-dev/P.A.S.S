@@ -176,6 +176,10 @@ static void pass_exit(void)
             dr_fprintf(STDERR, "%s=%u ", opc_name(top[t]), g_stat_generic[top[t]]);
         dr_fprintf(STDERR, "\n");
     }
+    /* B-2016: последние generic-опы — если процесс умер без итогов
+     * (fastfail), у пользователя не будет и этой строки; здесь она для
+     * живых прогонов (быстрая видимость хвоста эмуляции). */
+    pass_diag_dump("exit", NULL);
     /* B-2012: топ-10 статических перезаписей per-opc (бисект inline-пути) */
     if (static_total > 0) {
         int stop[10] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
@@ -255,7 +259,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2015 (v0.2.5)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2016 (v0.2.6)\n");
 
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));

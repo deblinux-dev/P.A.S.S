@@ -348,6 +348,15 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
                            : 0,
                        (ptr_uint_t)exc->raw_mcontext->pc,
                        (ptr_uint_t)exc->mcontext->pc);
+        /* B-2016: при любом значимом исключении дампим последнее состояние
+         * (кольцо generic-опов + счётчики + регистры app-контекста). Для
+         * #UD это показывает, какая серия эмуляций шла перед срывом; для
+         * AV — что исполнялось перед падением памяти. */
+        if (exc->record != NULL && exc_is_diag(code) && code != 0xC0000409u)
+            pass_diag_dump((code == 0xC000001Du) ? "UD/#illegal"
+                          : (code == 0xC00000FDu) ? "stack-overflow"
+                          : "diag-exception",
+                          dc);
         /* глотание системных исключений: продолжение с доставленного RIP
          * (= адрес возврата из RaiseException) — контекст УЖЕ правильный,
          * править нечего. Возврат после redirect не важен. */

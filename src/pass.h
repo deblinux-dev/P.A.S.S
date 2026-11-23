@@ -266,6 +266,13 @@ void emu_vzeroall(void);                    /* clean call */
 extern uint64_t g_dyn_generic;
 extern uint64_t g_dyn_trap;
 
+/* ── B-2016: диагностика последних generic-опов (emu.c) ──
+ * fastfail (0xC0000409, Rust OOM abort) обходит user-mode обработчики —
+ * единственные окна увидеть состояние: OOM-детект в pre-syscall,
+ * diag-исключения (#UD) и итоги. */
+void pass_generic_ring_note(int opc);                 /* hot path, без блокировок */
+void pass_diag_dump(const char *why, void *dc);       /* dc=NULL → без регистров */
+
 /* ───────────────────────── rewrite.c ─────────────────────── */
 void pass_ensure_tls(void *dc);
 void pass_rewrite_init(void);
