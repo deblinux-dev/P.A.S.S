@@ -72,6 +72,7 @@
 | **Профиль `-target penryn` (B-2014)**: Merom + нативный SSE4.1 — легаси-SSE4.1 passthrough без стабов, CPUID честно светит SSE4.1 (profile ∩ host). Для реальных Penryn/Wolfdale CPU и приложений, собранных под SSE4.1 | ✅ Godot 4.5: `--headless --editor --quit` rc=0 за секунды под qemu TCG (раньше под core2 — 1.07 млрд clean call’ов ≈ 8+ мин «зависания») |
 | **VEX-SSE4.1 inline (B-2014)**: vpextrX (reg/mem-dst, VEX.256 — выбор половины по imm), vpinsrX (movaps merge + legacy), vpminsb/sd, vpmaxsb/sd, vpackusdw, vpmuldq, vpmulld, vroundps/pd, vptest | ✅ t_pinsv (микро-батарея форм), Godot 4.5 (288М vpextrd ушли из generic в inline) |
 | **bun-матрица (Linux, B-2013/2014)**: bun 1.2.14 — builtins/JSON/сортировка/regexp/кириллица ✅ (require — известный баг, см. ограничения); bun 1.3.14 **baseline** — полностью ✅ включая require+кириллицу; bun 1.4.5 — полностью ✅ включая require+кириллицу (рекомендация для пользователей) | ✅ qemu Penryn + клиент core2/penryn |
+| **Windows B-2015**: глотание системных исключений 0x406D1388/0x40010006/0x4001000A (thread-name/OutputDebugString — их поднимают драйверы NVIDIA/AMD/Intel и Vulkan-слой при инициализации графики; под DR <=v0.2.4 уводили процесс в unhandled → Godot 4.5 «окно появилось и закрылось», ExitStatus 0x406D1388) + исправлена семантика exception-пути (dr_redirect_execution) + [SC]-трейс гейтится -strace (фильтр syscall'ов мёртв в DR 11.91.20763 — 0 call sites в core) + modmap.txt только под -verbose 2 | ✅ tests/data/tname.c в CI (MSVC — обязательный, MinGW — диагностический); Godot 4.5 у пользователя доходит до окна и далее |
 
 ### Известные ограничения v0.2
 
@@ -84,6 +85,8 @@
   не транслируется в штатный SIGSEGV приложения.
 * **Linux + DR без клиента** — bun виснет на чистом DR (несовместимость DR 11.91 и bun на Linux, §7.2); под клиентом bun 1.2.14/1.3.14-baseline/1.4.5 исполняются (close_range-обход B-2013).
 * **bun 1.2.14 `require('fs')`** и **bun 1.3.14 (AVX2-сборка)** — детерминированная порча в стартап-путях (SIGSEGV/panic, класс B-2015: контекстозависимый дефект спец-танца/generic-пути). Воркараунды: bun **1.4.5** или baseline-сборки 1.2.14/1.3.14.
+* **Windows + `bun -e` (любая сборка)** — до B-2015 процесс висел на выходе: фильтр syscall'ов мёртв в DR 11.91.20763 (instrument_filter_syscall не вызывается core'ом — 0 call sites), каждый syscall гонял clean call с dr_fprintf; при завершении потоки убивались внутри clean call'ов с DR-локами → NtTerminateProcess не завершал процесс (CI §7.3: kill→exit(143) не умирал до -k). В B-2015 трейс гейтится самим клиентом — окно дедлока устранено; требуется перепроверка на реальном JS в CI.
+* **Windows + MinGW-клиент** — selftest ловит internal crash в DR (MSVC-клиент — зелёный); расследуется.
 * **Диагностические гейты на JS** (не продуктовый путь): `-nospecial` —
   hang после парсинга; `-nomsk` — 256-битный vpmovmskb остаётся left-native
   и читает верх реального ymm (мусор инварианта тени); `-expose_emulated 0`

@@ -282,21 +282,55 @@ static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
 }
 #else
 /* Windows: настоящий trap-fallback через exception event.
- * Сигнатура drmgr: bool (*)(dc, dr_exception_t*) — true = исключение
- * обработано (не доставлять приложению). exc->mcontext — RAW-контекст
- * в точке сбоя: правим регистры и pc += len, DR продолжит исполнение. */
+ * B-2015, контракт семантики (dr_events.h + drmgr.h, drmgr — passthrough):
+ *   true  = исключение ДОСТАВЛЯЕТСЯ приложению (app VEH/SEH-цепочке);
+ *   false = переисполнить инструкцию по raw_mcontext (для fault-фастпата);
+ *   «обработано и продолжить» = dr_redirect_execution() из колбэка.
+ * exc->mcontext — ТРАНСЛИРОВАННЫЙ app-контекст: правим регистры,
+ * pc += len и редиректим — DR продолжит с нового app-PC.            */
 #ifndef EXCEPTION_ILLEGAL_INSTRUCTION
 #define EXCEPTION_ILLEGAL_INSTRUCTION 0xC000001D
 #endif
+/* B-2015: программные исключения, которые НАТИВНАЯ Windows глотает тихо.
+ * RaiseException(code, 0, ...) идёт через RtlRaiseException, который
+ * кладёт в доставленный контекст RIP = АДРЕС ВОЗВРАТА (инструкция после
+ * вызова RaiseException) — «обработать» = продолжить оттуда: ровно то,
+ * что делает __except(EXECUTE_HANDLER)-обёртка MSVC-макроса SetThreadName
+ * и системная логика OutputDebugString.
+ * Под DR 11.91 эти коды уходили в unhandled → DR завершал процесс с кодом
+ * исключения (натурный репрод Godot 4.5: NtTerminateProcess(self,
+ * 0x406D1388) — «окно появилось и закрылось», exit 0x406D1388).
+ * 0x406D1388  — MSVC thread-name (драйверы NVIDIA/AMD/Intel, Vulkan-слой);
+ * 0x40010006  — DBG_PRINTEXCEPTION_C  (OutputDebugStringA);
+ * 0x4001000A  — DBG_PRINTEXCEPTION_WIDE_C (OutputDebugStringW, Win10+). */
+static bool exc_is_swallowed(unsigned int code)
+{
+    return code == 0x406D1388u || code == 0x40010006u || code == 0x4001000Au;
+}
+/* не-AV коды, всегда значимые для диагностики (редкие, не JIT-мусор) */
+static bool exc_is_diag(unsigned int code)
+{
+    return code == 0xC000001Du /* illegal instr */ ||
+           code == 0xC0000409u /* fast-fail (Zig panic → abort) */ ||
+           code == 0xC00000FDu /* stack overflow */ ||
+           exc_is_swallowed(code);
+}
 static bool pass_exception_event(void *dc, dr_exception_t *exc)
 {
     if (exc == NULL || exc->mcontext == NULL)
         return false;
     {
         static volatile int exclog = -1;
+        unsigned int code =
+            (exc->record != NULL) ? (unsigned)exc->record->ExceptionCode : 0;
         if (exclog == -1)
             exclog = (getenv("PASS_EXCLOG") != NULL) ? 1 : 0;
-        if (exclog && exc->record != NULL)
+        /* B-2015: не-AV коды логируются ВСЕГДА (getenv в инжектируемом
+         * процессе для гейта diag-потока ненадёжен — см. pass.c §7.3,
+         * но здесь getenv лишь РАСШИРЯЕТ всегда-включённый белый список);
+         * AV (0xC0000005) — только под PASS_EXCLOG: драйверы гоняют их
+         * пачками как часть штатного SEH-флоу. */
+        if (exc->record != NULL && (exc_is_diag(code) || exclog))
             dr_fprintf(STDERR,
                        "[EXC] code=0x%08x addr=" PIFX " rawpc=" PIFX
                        " apppc=" PIFX "\n",
@@ -307,6 +341,17 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
                            : 0,
                        (ptr_uint_t)exc->raw_mcontext->pc,
                        (ptr_uint_t)exc->mcontext->pc);
+        /* глотание системных исключений: продолжение с доставленного RIP
+         * (= адрес возврата из RaiseException) — контекст УЖЕ правильный,
+         * править нечего. Возврат после redirect не важен. */
+        if (exc_is_swallowed(code)) {
+            if (g_cfg.verbose)
+                dr_fprintf(STDERR,
+                           "[P.A.S.S.] swallow benign exception 0x%08x "
+                           "(нативно глотается системой)\n", code);
+            dr_redirect_execution(exc->mcontext);
+            return true;
+        }
     }
     if (exc->record == NULL ||
         exc->record->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
@@ -316,10 +361,20 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
                    (ptr_uint_t)exc->mcontext->pc);
     }
     if (trap_emulate(dc, exc->mcontext)) {
-        return true;   /* эмулировано — продолжить со следующим PC */
+        /* B-2015: СЕМАНТИКА ИСПРАВЛЕНА. Контракт DR (dr_events.h):
+         * «true = exception is DELIVERED to the application's handler»,
+         * «false = faulting instruction is RE-EXECUTED». Прежний код
+         * возвращал true после эмуляции → эмулированное #UD уходило в
+         * app-обработчик (продолжения не было), а «не наша» ветка с false
+         * переисполняла ту же инструкцию вечно. Правильное «handled,
+         * continue с продвинутым pc» — dr_redirect_execution. */
+        dr_redirect_execution(exc->mcontext);
+        return true;
     }
-    /* не наша инструкция — отдать приложению (громкое падение) */
-    return false;
+    /* не наша инструкция — ДОСТАВИТЬ приложению (true = deliver to app
+     * по контракту DR; нет обработчика → DR завершит с кодом 0xC000001D,
+     * как нативно). */
+    return true;
 }
 #endif
 

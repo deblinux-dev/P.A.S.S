@@ -11,7 +11,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.2.1            ║\n"
+        "  ║              Substitution  v0.2.5            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -241,28 +241,11 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     }
 #endif
 #ifdef WINDOWS
-    /* §7.3: карта модулей в ФАЙЛ рядом с клиентом (stderr-хвост 200Б
-     * её затирает): rерайты opc=675/662 @ 0x7ff7...d52/d56 — чей код? */
-    {
-        file_t f = dr_open_file("modmap.txt", DR_FILE_WRITE_OVERWRITE);
-        if (f != INVALID_FILE) {
-            dr_module_iterator_t *mi = dr_module_iterator_start();
-            while (dr_module_iterator_hasnext(mi)) {
-                module_data_t *md = dr_module_iterator_next(mi);
-                dr_fprintf(f, "[MOD] " PIFX ".." PIFX " %s\n",
-                           (ptr_uint_t)md->start, (ptr_uint_t)md->end,
-                           dr_module_preferred_name(md) != NULL
-                               ? dr_module_preferred_name(md) : "?");
-                dr_free_module_data(md);
-            }
-            dr_module_iterator_stop(mi);
-            dr_close_file(f);
-        }
-    }
+    /* B-2015: modmap переехал НИЖЕ (после parse_options, гейт -verbose 2) */
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2014 (v0.2.4)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2015 (v0.2.5)\n");
 
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));
@@ -326,6 +309,26 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     /* B-2013: безусловно — модуль содержит не только diag-трейсер
      * (-strace), но и постоянный фикс close_range (см. strace.c) */
     pass_strace_init();
+
+#ifdef WINDOWS
+    /* B-2015: modmap после parse_options (нужен g_cfg.verbose) */
+    if (g_cfg.verbose >= 2) {
+        file_t f = dr_open_file("modmap.txt", DR_FILE_WRITE_OVERWRITE);
+        if (f != INVALID_FILE) {
+            dr_module_iterator_t *mi = dr_module_iterator_start();
+            while (dr_module_iterator_hasnext(mi)) {
+                module_data_t *md = dr_module_iterator_next(mi);
+                dr_fprintf(f, "[MOD] " PIFX ".." PIFX " %s\n",
+                           (ptr_uint_t)md->start, (ptr_uint_t)md->end,
+                           dr_module_preferred_name(md) != NULL
+                               ? dr_module_preferred_name(md) : "?");
+                dr_free_module_data(md);
+            }
+            dr_module_iterator_stop(mi);
+            dr_close_file(f);
+        }
+    }
+#endif
 
     /* B-2009 diag: сэмплер app-PC (dr_set_itimer); getenv в инжектируемом
      * процессе ненадёжен — только клиентская опция -sampler <мс>. */

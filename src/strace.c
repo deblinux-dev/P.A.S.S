@@ -73,16 +73,94 @@ static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
 }
 #endif /* LINUX */
 
+#ifdef WINDOWS
+/* B-2015: имена NT-сисколлов (нумерация Win10 19041..22H2, таблица
+ * j00ru/windows-syscalls x64/csv/nt.csv, колонка Windows 10 (20H2);
+ * у пользователя bun сообщает "Windows v.win10_fe" = 19042 — совпадает).
+ * На других билдах номера могут отличаться — имя печатается как подсказка. */
+typedef struct { int num; const char *name; } ntname_t;
+static const ntname_t g_nt_names[] = {
+    { 5,   "NtQueryInformationProcess" },
+    { 15,  "NtClose" },
+    { 24,  "NtAllocateVirtualMemory" },
+    { 28,  "NtSetInformationProcess" },
+    { 30,  "NtFreeVirtualMemory" },
+    { 35,  "NtQueryVirtualMemory" },
+    { 37,  "NtQueryInformationThread" },
+    { 40,  "NtMapViewOfSection" },
+    { 42,  "NtUnmapViewOfSection" },
+    { 44,  "NtTerminateProcess" },
+    { 55,  "NtOpenSection" },
+    { 58,  "NtWriteVirtualMemory" },
+    { 60,  "NtDuplicateObject" },
+    { 67,  "NtContinue" },
+    { 74,  "NtCreateSection" },
+    { 80,  "NtProtectVirtualMemory" },
+    { 83,  "NtTerminateThread" },
+    { 118, "NtAllocateVirtualMemoryEx" },
+    { 157, "NtGetContextThread" },
+    { 193, "NtCreateThreadEx" },
+    { 200, "NtCreateUserProcess" },
+    { 414, "NtSetInformationVirtualMemory" },
+    { 460, "NtUnmapViewOfSectionEx" },
+};
+static const char *nt_name(int sysnum)
+{
+    unsigned k;
+    for (k = 0; k < sizeof(g_nt_names)/sizeof(g_nt_names[0]); k++)
+        if (g_nt_names[k].num == sysnum)
+            return g_nt_names[k].name;
+    return NULL;
+}
+/* аллокационное семейство: post-лог NTSTATUS обязателен для диагноза
+ * «memory allocation of N bytes failed» (Zig page_allocator = VirtualAlloc) */
+static bool nt_status_interesting(int sysnum)
+{
+    switch (sysnum) {
+    case 24: case 30: case 35: case 40: case 42: case 44:
+    case 74: case 80: case 118: case 193: case 200: case 414: case 460:
+        return true;
+    }
+    return false;
+}
+#endif /* WINDOWS */
+
 static bool sc_pre(void *drcontext, int sysnum)
 {
-    ptr_int_t a0 = dr_syscall_get_param(drcontext, 0);
-    ptr_int_t a1 = dr_syscall_get_param(drcontext, 1);
-    ptr_int_t a2 = dr_syscall_get_param(drcontext, 2);
+    ptr_int_t a0, a1, a2;
 #ifdef LINUX
+    a0 = dr_syscall_get_param(drcontext, 0);
+    a1 = dr_syscall_get_param(drcontext, 1);
     if (sysnum == PASS_SYS_CLOSE_RANGE &&
         a1 - a0 > PASS_CLOSE_RANGE_LIMIT)
         return true; /* уже обработан sc_pre_fix_close_range */
 #endif
+    /* B-2015: СВОЙ гейт трейса. Ядро DR 11.91.20763 НЕ вызывает
+     * instrument_filter_syscall вовсе (0 call sites в core: dispatch.c /
+     * kernel.c / os.c — регрессия этого cronbuild-тега), поэтому фильтр
+     * sc_filter мёртв и pre/post-события приходят для КАЖДОГО syscall.
+     * Без этого гейта клиент печатал [SC]-поток и без -strace (у пользователя
+     * на Windows так и было) + держал каждый syscall в clean call с
+     * dr_fprintf — потоки убивались внутри clean call'ов с DR-локами →
+     * дедлок экзита (HANG bun -e на CI §7.3, killed NtTerminateProcess(143)
+     * не завершал процесс). Гейт здесь обязателен. */
+    if (!g_strace)
+        return true;
+    a0 = dr_syscall_get_param(drcontext, 0);
+    a1 = dr_syscall_get_param(drcontext, 1);
+    a2 = dr_syscall_get_param(drcontext, 2);
+#ifdef WINDOWS
+    /* B-2015: write/execve-блоки ниже — Linux-нумерация (1/20/59):
+     * на NT-номерах они дали бы ложную печать (59 = NtReadVirtualMemory). */
+    {
+        const char *nm = nt_name(sysnum);
+        if (nm != NULL)
+            dr_fprintf(STDERR, "[SC %d %s] %p %p %p\n", sysnum, nm, a0, a1, a2);
+        else
+            dr_fprintf(STDERR, "[SC %d] %p %p %p\n", sysnum, a0, a1, a2);
+    }
+    return true;
+#else
     if (sysnum == 1 /*write*/ || sysnum == 20 /*writev*/) {
         dr_fprintf(STDERR, "[SC %d] %p %p %p", sysnum, a0, a1, a2);
         if (sysnum == 1 && (a0 == 1 || a0 == 2) && a1 && a2 && a2 <= 128) {
@@ -126,14 +204,27 @@ static bool sc_pre(void *drcontext, int sysnum)
     /* компактный поток прочих syscall'ов */
     dr_fprintf(STDERR, "[SC %d] %p %p %p\n", sysnum, a0, a1, a2);
     return true;
+#endif /* WINDOWS/Linux-разводка печати */
 }
 
 static void sc_post(void *drcontext, int sysnum)
 {
-    ptr_int_t res = dr_syscall_get_result(drcontext);
+    ptr_int_t res;
+    if (!g_strace)
+        return; /* гейт см. sc_pre: фильтр DR 11.91.20763 мёртв */
+    res = dr_syscall_get_result(drcontext);
+#ifdef LINUX
     if (sysnum == 1 || sysnum == 20 || sysnum == 231 /*exit_group*/ ||
         sysnum == 232 /*exit*/ || sysnum == 60)
         dr_fprintf(STDERR, "[SC %d ->] %p\n", sysnum, res);
+#else
+    /* B-2015: NTSTATUS аллокационного семейства — диагноз Zig-паники
+     * «memory allocation of N bytes failed»: видно, КАКОЙ VirtualAlloc
+     * и С КАКИМ статусом отказал (0xC0000017 = NO_MEMORY и т.п.). */
+    if (nt_status_interesting(sysnum))
+        dr_fprintf(STDERR, "[SC %d ->] %p (%s)\n", sysnum, res,
+                   (res == 0) ? "STATUS_SUCCESS" : "FAIL");
+#endif
 }
 
 void pass_strace_init(void)

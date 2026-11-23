@@ -199,6 +199,31 @@ jobs:
             tail -12 smoke.log || true
           fi
 
+      - name: Smoke — tname.exe (thread-name исключение, фикс Godot B-2015)
+        # 0x406D1388 без __try-обёртки: под DR <=v0.2.4 уходил в unhandled →
+        # процесс умирал с ExitStatus 0x406D1388 (репрод Godot 4.5 у
+        # пользователя). Клиент B-2015 обязан ГЛОТАТЬ это исключение.
+        # Нативный контроль — информационный (система может глотать сама
+        # или нет — драйверы всегда оборачивают в __except и не падают).
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
+        run: |
+          cl /O2 /Fe:tname.exe tests/data/tname.c
+          echo "── нативный контроль (информационный):"
+          timeout 60 ./tname.exe > tname_native.log 2>&1 && echo "native: TNAME-OK (система глотает)" \
+            || echo "native: rc=$? (умер — ожидаемо, если система не глотает unhandled)"
+          timeout 60 dynamorio/bin64/drrun.exe -c pass_client.dll -target penryn -- tname.exe > tname_dr.log 2>&1
+          rc=$?
+          echo "── под P.A.S.S.: rc=$rc"
+          tail -6 tname_dr.log || true
+          if [ $rc -ne 0 ] || ! grep -q "TNAME-OK" tname_dr.log; then
+            echo "FAIL: 0x406D1388 не проглочен — регрессия фикса Godot B-2015"
+            exit 1
+          fi
+          echo "tname под P.A.S.S.: TNAME-OK, rc=0 — фикс работает"
+
       - name: Package PASS-win-x64.zip
         shell: bash
         run: |
@@ -582,7 +607,8 @@ jobs:
           # GCC (в отличие от MSVC /arch:AVX2) не включает BMI1/BMI2/FMA/
           # LZCNT/AES/PCLMUL через -mavx2 — для KAT-интриnsics нужны явно:
           gcc -O2 -mavx2 -mbmi -mbmi2 -mlzcnt -mfma -maes -mpclmul -o selftest.exe tests/data/selftest.c
-          ls -l pass.exe selftest.exe
+          gcc -O2 -o tname.exe tests/data/tname.c
+          ls -l pass.exe selftest.exe tname.exe
 
       - name: Bun — download windows-x64 + baseline
         timeout-minutes: 5
@@ -637,6 +663,7 @@ jobs:
           echo "|---|---|---|---|" >> "$RES"
 
           echo "==== 1/5 selftest KAT ====";            run_case "selftest под -target core2 (якорь)" ./pass.exe -target core2 -- selftest.exe
+          echo "==== 1b/5 tname (фикс Godot B-2015) ===="; run_case "tname: 0x406D1388 глотается (MinGW-клиент)" ./pass.exe -target penryn -- tname.exe
           echo "==== 2/5 bun core2 ====";               run_case "pass(MinGW) -target core2 -- bun --version" ./pass.exe -target core2 -- "$BUN_X64" --version
           echo "==== 3/5 bun core2 ====";               run_case "pass(MinGW) -target core2 -- bun -e 'Hello from P.A.S.S.!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Hello from P.A.S.S.!')"
           echo "==== 4/5 кириллица ====";               run_case "pass(MinGW) -target core2 -- bun -e 'Привет от Bun!'" ./pass.exe -target core2 -- "$BUN_X64" -e "console.log('Привет от Bun!')"
