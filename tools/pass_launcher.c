@@ -6,6 +6,7 @@
  *     pass.exe [ключи] -- program.exe [аргументы...]
  *
  *   -target <имя>     профиль CPU: core2 (по умолчанию),
+ *                     penryn (SSE4.1 нативно — для Wolfdale/Penryn CPU),
  *                     nehalem, westmere, sandybridge, haswell, native
  *   -verbose <N>      диагностика 0..4
  *   -root <каталог>   каталог DynamoRIO (по умолчанию — автопоиск)
@@ -258,7 +259,11 @@ int main(int argc, char **argv)
                 "на старых CPU (по умолчанию профиль Core 2).\n\n"
                 "  pass.exe [ключи] -- program.exe [args...]\n\n"
                 "Ключи:\n"
-                "  -target <имя>   core2 | nehalem | westmere | sandybridge | haswell | native\n"
+                "  -target <имя>   core2 | penryn | nehalem | westmere | sandybridge | haswell | native\n"
+                "                  (для CPU с нативным SSE4.1 — Penryn/Wolfdale —\n"
+                "                   используйте -target penryn: SSE4.1 проходит без\n"
+                "                   эмуляции, Godot 4.5 и другие SSE4.1-приложения\n"
+                "                   запускаются быстро; core2 = Merom-класс)\n"
                 "  -root <каталог> каталог DynamoRIO (автопоиск по умолчанию)\n"
                 "  -verbose <N>    диагностика 0..4\n"
                 "  -no-download    не скачивать DynamoRIO автоматически\n"

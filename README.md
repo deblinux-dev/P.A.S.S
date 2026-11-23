@@ -69,6 +69,9 @@
 | GitHub Actions: сборка + тесты Linux/Windows, релизы по тегу | ✅ |
 | **ISA-базовая линия самого клиента (раунд #114)**: `__popcnt64` (MSVC) компилировался прямо в инструкцию POPCNT → `internal crash 0xc000001d` внутри pass_client.dll на реальном CPU без SSE4.2 (натурный репрод: bun_bl.exe, B-2003 — bun исполняет popcnt → trap → emu → падение самого эмулятора). Вся битовая математика emu (popcount/clz/ctz) переведена на SWAR без builtins/intrinsics (gcc при -mno-lzcnt кодирует `__builtin_ctzll` как «rep bsf» = байты TZCNT — тоже вычищено); CI-гвард `scripts/scan_baseline.py` сканирует объектники клиента на мнемоники вне SSE2 и ловит весь класс независимо от toolchain | ✅ гвард зелёный на обеих платформах, poisoned-объект отводится, батарея 27/27 (t_lztz бит-в-бит с нативом) |
 | **Флаги trap-пути и семантика VCMPSS/SD (раунд #115)**: trap_emulate вычислял flags_def по жёсткому списку (ptest/pcmpe-формы/adcx/adox) вместо IR-модели — ZF/PF/CF, вычисленные emu для trapped lzcnt/tzcnt/popcnt/bzhi/pdep/pext, не возвращались приложению (ветвление по stale-флагам — тот же механизм порчи, что «malloc(): corrupted top size»; симптом B-2004 на реальном CPU без AVX — паника Zig-аллокатора bun «memory allocation of N bytes failed», невидимая на CI-хостах с AVX, где trap-путь не исполняется). ФИКС: instr_get_eflags → EFLAGS_WRITE_* — как build_desc статического пути. Попутно железом опровергнута гипотеза «vcmpsd определяет ZF/PF/CF»: семья 0F C2 — mask-compare, флаги не пишет (probe: comisd eq → ZF=1, vcmpsd $0/$3/$13 → rflags нетронуты); установка флагов в emu убита до того, как попала в релиз. t_vcmp расширен контролем RFLAGS | ✅ 1536 кейсов × (RFLAGS+DEST) побайтно native vs pass, батарея 27/27 |
+| **Профиль `-target penryn` (B-2014)**: Merom + нативный SSE4.1 — легаси-SSE4.1 passthrough без стабов, CPUID честно светит SSE4.1 (profile ∩ host). Для реальных Penryn/Wolfdale CPU и приложений, собранных под SSE4.1 | ✅ Godot 4.5: `--headless --editor --quit` rc=0 за секунды под qemu TCG (раньше под core2 — 1.07 млрд clean call’ов ≈ 8+ мин «зависания») |
+| **VEX-SSE4.1 inline (B-2014)**: vpextrX (reg/mem-dst, VEX.256 — выбор половины по imm), vpinsrX (movaps merge + legacy), vpminsb/sd, vpmaxsb/sd, vpackusdw, vpmuldq, vpmulld, vroundps/pd, vptest | ✅ t_pinsv (микро-батарея форм), Godot 4.5 (288М vpextrd ушли из generic в inline) |
+| **bun-матрица (Linux, B-2013/2014)**: bun 1.2.14 — builtins/JSON/сортировка/regexp/кириллица ✅ (require — известный баг, см. ограничения); bun 1.3.14 **baseline** — полностью ✅ включая require+кириллицу; bun 1.4.5 — полностью ✅ включая require+кириллицу (рекомендация для пользователей) | ✅ qemu Penryn + клиент core2/penryn |
 
 ### Известные ограничения v0.2
 
@@ -79,8 +82,8 @@
 * **Fault-семантика gather/maskmov** — маскированные каналы корректно
   пропускаются, но отказ памяти на немаскированном канале внутри clean call
   не транслируется в штатный SIGSEGV приложения.
-* **Linux + bun** — bun виснет на старте под DR и без клиента (§7.2,
-  несовместимость DR и bun на Linux, вне клиента); на Windows совместим.
+* **Linux + DR без клиента** — bun виснет на чистом DR (несовместимость DR 11.91 и bun на Linux, §7.2); под клиентом bun 1.2.14/1.3.14-baseline/1.4.5 исполняются (close_range-обход B-2013).
+* **bun 1.2.14 `require('fs')`** и **bun 1.3.14 (AVX2-сборка)** — детерминированная порча в стартап-путях (SIGSEGV/panic, класс B-2015: контекстозависимый дефект спец-танца/generic-пути). Воркараунды: bun **1.4.5** или baseline-сборки 1.2.14/1.3.14.
 * **Диагностические гейты на JS** (не продуктовый путь): `-nospecial` —
   hang после парсинга; `-nomsk` — 256-битный vpmovmskb остаётся left-native
   и читает верх реального ymm (мусор инварианта тени); `-expose_emulated 0`

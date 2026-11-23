@@ -1,4 +1,4 @@
-# Покрытие инструкций P.A.S.S. v0.2.4 (§7.4–7.5 раунды #111–#115)
+# Покрытие инструкций P.A.S.S. v0.2.4 (§7.4–7.5 раунды #111–#115 + B-2009–B-2014: penryn-профиль, VEX-SSE4.1 inline, close_range)
 
 Легенда: **inline** — безветвевая последовательность в кодовом кэше (быстро);
 **generic** — clean-call C-эмулятор (~100 нс); **trap** — не эмулируется,
@@ -25,11 +25,11 @@ t_s41, t_lztz, t_r10; C: t_vx41 — VEX-алиасы/cvt/permil/maskmov, 6 ст�
 | Переменные сдвиги | vpsllv*, vpsrlv*, vpsrav* | generic |
 | Перестановки cross-lane | vpermd, vpermq, vperm2f128, vperm2i128 | generic |
 | Смешение | vpblendd, vblendps/pd (imm), vblendvps/pd (VEX: база = V srcs[0], маска = srcs[2]), blendv*, pblendvb/vpblendvb (B-2008: is_ymm смешивает ОБЕ половины; раньше верх = мусор тени → порча кириллицы в bun/simdutf), vtestps/pd | generic |
-| ROUND/DOT | vroundps/pd/ss/sd, vdpps/dppd, mpsadbw (ymm: у lane1 свои биты imm), phminposuw, insertps | generic |
+| ROUND/DOT | vroundps/pd — inline (B-2014); vroundss/sd, vdpps/dppd, mpsadbw (ymm: у lane1 свои биты imm), phminposuw, insertps | generic + inline |
 | maskmov/gather | vpmaskmovd/q (load: srcs=[маска, mem], незаскированные = 0; store: srcs=[данные, маска]), vmaskmovps/pd (store: srcs=[маска, данные] — порядок DR различается по семействам!), vgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd | generic (маскированные каналы пропускаются) |
-| min/max SSE4.1-набор | pminsb/sd/uw/ud, pmaxsb/sd/uw/ud + VEX-алиасы (vpmin*, vpmax*) | generic |
-| Расширения | pmovsx*, pmovzx* (12 вариантов + VEX-алиасы; 256-бит — lane1 читает вторую половину младших 128Б), packusdw, pmulld, pmuldq, pcmpeqq, pcmpgtq | generic |
-| Вставка/извлечение | pinsrb/d/q, pextrb/w/d/q, insertps (VEX IR = [imm, V, W]), extractps (VEX IR = [imm, xmm]) | generic |
+| min/max SSE4.1-набор | pminsb/sd/uw/ud, pmaxsb/sd/uw/ud; VEX-алиасы: vpminsb/sd, vpmaxsb/sd — inline (B-2014), остальные vpmin*/vpmax* | generic + inline |
+| Расширения | pmovsx*, pmovzx* (12 вариантов + VEX-алиасы; 256-бит — lane1 читает вторую половину младших 128Б), packusdw, pmulld, pmuldq, pcmpeqq, pcmpgtq; VEX: vpackusdw, vpmuldq, vpmulld — inline (B-2014) | generic + inline |
+| Вставка/извлечение | pinsrb/d/q, pextrb/w/d/q, insertps (VEX IR = [imm, V, W]), extractps (VEX IR = [imm, xmm]); VEX vpextrX r32/m, xmm, imm — inline (VF_EXTR, mem-dst напрямую, VEX.256 — выбор половины по imm), vpinsrX — inline (VF_INS: movaps merge + legacy pinsrX) (B-2014) | generic + inline |
 | Permil | vpermilps/pd (imm и reg; PD-селектор = бит 1 чётного dword) | generic (§7.4) |
 | FMA | vfmadd/fmsub/fnmadd/fnmsub 132/213/231 ps/pd/ss/sd (128 inline — двойное округление; 256 — generic) | inline+generic |
 | AES/PCLMUL | aesenc/dec/enclast/declast/imc/keygenassist + VEX-алиасы (vaes*), pclmulqdq/vpclmulqdq | generic |
@@ -40,7 +40,7 @@ t_s41, t_lztz, t_r10; C: t_vx41 — VEX-алиасы/cvt/permil/maskmov, 6 ст�
 
 | Опкоды | Способ |
 |---|---|
-| ptest/vptest | generic |
+| ptest | generic; vptest — inline (B-2014) |
 | pcmpestri/strm, pcmpistri/strm (+VEX): точная модель SDM §4.1 — SRC2 = индексируемая строка; валиден элемент строго ДО NUL (ISTR, сам NUL невалиден) или до \|EAX\|/\|EDX\| с насыщением (ESTR); BoolRes[j,i] форсируется ПО ПАРЕ (Table 4-7): any/ranges — любая невалидность пары → false, each — (inv,inv) → true (NUL-трюк $0x3a), ordered — невалидный needle → wildcard true; полярность: − = XOR всех, masked+ ≡ positive, masked− = XOR только валидных SRC2; ZF/SF: ESTR \|EDX\|/\|EAX\| < ne, ISTR — наличие NUL; CF=any(IntRes2), OF=IntRes2[0]; XMM0 — выход strm (bit/unit-mask). Дифф t_istr.S: 230 кейсов × (ECX+EFLAGS+XMM0) побайтно, включая strcspn-паттерн glibc (регресс CI #111 закрыт раундом #112) | generic (§7.4, не «экспериментально») |
 | pcmpeqq, pcmpgtq, pmulld, pmuldq, packusdw, mpsadbw, phminposuw, dpps/d, blendps/d, blendv*, pblendvb, pminsb/sd/uw/ud, pmaxsb/sd/uw/ud, pmovsx*, pmovzx*, insertps, extractps, crc32 r8/16/32/64 (CRC-32C) | generic |
 
