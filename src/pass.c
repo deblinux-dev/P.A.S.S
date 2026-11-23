@@ -218,6 +218,16 @@ static void pass_exit(void)
     }
     dr_fprintf(STDERR, "  recreate: ours=%u skipTG=%u restored=%u nobuf=%u\n",
                g_rs_ours, g_rs_skip_tg, g_rs_restored, g_rs_nobuf);
+#ifdef WINDOWS
+    {
+        extern int g_n_raise_swallowed; /* strace.c: pre-syscall глотание */
+        if (g_n_raise_swallowed > 0)
+            dr_fprintf(STDERR,
+                       "  исключений thread-name/ODS проглочено: %d "
+                       "(B-2015: без этого Godot и драйверы графики умирали)\n",
+                       g_n_raise_swallowed);
+    }
+#endif
     dr_fprintf(STDERR, "[P.A.S.S.] ─────────────────────────────────────────\n\n");
 }
 

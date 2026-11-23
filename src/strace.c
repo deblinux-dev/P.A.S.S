@@ -125,6 +125,56 @@ static bool nt_status_interesting(int sysnum)
 }
 #endif /* WINDOWS */
 
+/* B-2015: глотание системных исключений НА УРОВНЕ PRE-SYSCALL NtRaiseException.
+ * Хронология попыток:
+ *  (1) drmgr exception event — НЕ стреляет: instrument.c "Note: not called
+ *      for RaiseException" (подтверждено по тегу cronbuild-11.91.20763);
+ *  (2) наш VEH (первый в цепочке, EXCEPTION_CONTINUE_EXECUTION) — тоже
+ *      мимо: DR не доводит software-исключения до app-диспетчерии (CI:
+ *      tname умирал с ExitStatus 0x406D1388, ни [EXC], ни VEH-следа);
+ *  (3) ЭТОТ путь — единственный, до которого DR нас допускает: pre-syscall
+ *      событие (в DR 11.91 фильтр мёртв — события стреляют на КАЖДЫЙ
+ *      syscall, чем успешно пользуется и close_range-фикс на Linux).
+ * Для кодов, которые нативно глотает raiser (__except-обёртка MSVC-макроса
+ * SetThreadName — их поднимают драйверы NVIDIA/AMD/Intel и Vulkan-слой на
+ * каждом новом потоке) фейкуем STATUS_SUCCESS: RtlRaiseException видит
+ * успех и просто возвращается — приложение продолжает ПОСЛЕ вызова
+ * RaiseException, ровно как при тихом проглатывании. Нативная Windows не
+ * глотает unhandled 0x406D1388 (CI: native rc=136 = код&0xFF) — под DR
+ * до v0.2.4 процесс умирал с этим кодом (Godot 4.5 «окно появилось и
+ * закрылось», crash.txt: NtTerminateProcess(self, 0x406D1388)).
+ * C++-исключения (0xE06D7363) и прочие коды НЕ трогаются.
+ * Номер NtRaiseException плавает по билдам (Win10 1507..1909: 332–352,
+ * 2004..21H1: 358, 21H2+: 360, Win11: 365–372 — j00ru CSV), поэтому
+ * проверяем ДИАПАЗОН 330..380: ложное попадание безопасно — arg0 чужого
+ * syscall читается на 4 байта (dr_safe_read), не-наш код → обычное
+ * исполнение без всяких модификаций. */
+#define PASS_SYS_RAISE_LO 330
+#define PASS_SYS_RAISE_HI 380
+static int g_n_raise_swallowed;
+#ifdef WINDOWS
+static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
+{
+    unsigned code = 0;
+    if (excrec == 0)
+        return false;
+    /* EXCEPTION_RECORD.ExceptionCode — DWORD по смещению 0 */
+    if (!dr_safe_read((void *)excrec, sizeof(code), &code, NULL))
+        return false;
+    if (code != 0x406D1388u /* MSVC thread-name */ &&
+        code != 0x40010006u /* DBG_PRINTEXCEPTION_C (OutputDebugStringA) */ &&
+        code != 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C (ODS W, Win10+) */)
+        return false;
+    if (g_cfg.verbose)
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] swallow RaiseException 0x%08x "
+                   "(thread-name/ODS — нативно глотается raiser'ом)\n", code);
+    g_n_raise_swallowed++;
+    dr_syscall_set_result(drcontext, 0); /* STATUS_SUCCESS */
+    return true;
+}
+#endif /* WINDOWS */
+
 static bool sc_pre(void *drcontext, int sysnum)
 {
     ptr_int_t a0, a1, a2;
@@ -134,6 +184,13 @@ static bool sc_pre(void *drcontext, int sysnum)
     if (sysnum == PASS_SYS_CLOSE_RANGE &&
         a1 - a0 > PASS_CLOSE_RANGE_LIMIT)
         return true; /* уже обработан sc_pre_fix_close_range */
+#endif
+#ifdef WINDOWS
+    /* ДО гейта трейса: глотание работает и без -strace (постоянный фикс,
+     * как close_range на Linux). false = syscall не исполнять. */
+    if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
+        nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
+        return false;
 #endif
     /* B-2015: СВОЙ гейт трейса. Ядро DR 11.91.20763 НЕ вызывает
      * instrument_filter_syscall вовсе (0 call sites в core: dispatch.c /
