@@ -180,6 +180,9 @@ static int exc_swallow(unsigned int code)
     return code == 0x406D1388u || code == 0x40010006u || code == 0x4001000Au;
 }
 
+static unsigned long long rip_unused_marker(void) { return 0; }
+static unsigned long long acc_unused_marker(void) { return 0; }
+
 static long NTAPI veh_log(PEXCEPTION_POINTERS ep)
 {
     if (ep == NULL || ep->ExceptionRecord == NULL ||
@@ -190,8 +193,14 @@ static long NTAPI veh_log(PEXCEPTION_POINTERS ep)
     /* B-2015: глотание ДО любого лога/кольца — тихо и дёшево.
      * Драйверы/Vulkan поднимают thread-name на КАЖДОМ новом потоке:
      * без раннего выхода лог бы распухал. */
-    if (exc_swallow(code))
+    if (exc_swallow(code)) {
+        /* B-2015 diag: доказательство того, что доставка ДОШЛА до VEH */
+        if (veh_budget < 24) {
+            veh_budget++;
+            veh_line("[VEH-SWALLOW]", code, rip_unused_marker(), acc_unused_marker());
+        }
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     unsigned long long rip = (unsigned long long)ep->ContextRecord->Rip;
     unsigned long long acc = 0;

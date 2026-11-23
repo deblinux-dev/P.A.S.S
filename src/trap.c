@@ -405,6 +405,13 @@ static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
                                            SIZE_T nargs, const ULONG_PTR *args)
 {
     unsigned uc = (unsigned)code;
+    {   /* B-2015 diag: замена жива? печатаем КАЖДЫЙ вызов (кап 30) */
+        static volatile long repl_seen;
+        if (repl_seen < 30) {
+            repl_seen++;
+            dr_fprintf(STDERR, "[P.A.S.S.][REPL] RaiseException code=0x%08x\n", uc);
+        }
+    }
     if (uc == 0x406D1388u || uc == 0x40010006u || uc == 0x4001000Au) {
         extern int g_n_raise_swallowed; /* strace.c */
         if (g_n_raise_swallowed < 50)
@@ -432,26 +439,50 @@ static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
 
 void pass_raise_hook_install(void)
 {
+    module_data_t *k32md, *ntdmd;
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE kbase = GetModuleHandleA("kernelbase.dll");
     HMODULE ntd = GetModuleHandleA("ntdll.dll");
-    void *orig, *rtl;
-    if (k32 == NULL || ntd == NULL)
+    void *rtl;
+    void *a1, *a2, *a3;
+    if (ntd == NULL)
         return;
-    orig = (void *)GetProcAddress(k32, "RaiseException");
     rtl = (void *)GetProcAddress(ntd, "RtlRaiseException");
-    if (orig == NULL)
-        return;
     g_pfn_RtlRaiseException = (VOID (NTAPI *)(PEXCEPTION_RECORD))rtl;
     if (!drwrap_init()) {
         dr_fprintf(STDERR, "[P.A.S.S.] drwrap_init FAILED\n");
         return;
     }
-    if (drwrap_replace(orig, (void *)pass_RaiseException_repl, false))
-        dr_fprintf(STDERR,
-                   "[P.A.S.S.] RaiseException hook installed (B-2015: "
-                   "0x406D1388/ODS глотаются в источнике)\n");
-    else
-        dr_fprintf(STDERR, "[P.A.S.S.] drwrap_replace(RaiseException) FAILED\n");
+    /* B-2015 diag: регистрируем ВСЕ возможные адреса RaiseException:
+     * kernel32 (может быть форвардер-стаб), kernelbase (реальное тело)
+     * и dr_get_proc_address (LSB-нормализация DR). */
+    a1 = (void *)GetProcAddress(k32, "RaiseException");
+    a2 = (kbase != NULL) ? (void *)GetProcAddress(kbase, "RaiseException") : NULL;
+    k32md = dr_lookup_module_by_name("KERNEL32.DLL");
+    a3 = (k32md != NULL) ? (void *)dr_get_proc_address(k32md->handle, "RaiseException") : NULL;
+    if (k32md != NULL)
+        dr_free_module_data(k32md);
+    dr_fprintf(STDERR,
+               "[P.A.S.S.] RaiseException addrs: k32=" PIFX " kbase=" PIFX
+               " drpa=" PIFX " rtl=" PIFX "\n",
+               (ptr_uint_t)a1, (ptr_uint_t)a2, (ptr_uint_t)a3, (ptr_uint_t)rtl);
+    {
+        int ok = 0;
+        if (a1 != NULL && drwrap_replace(a1, (void *)pass_RaiseException_repl, false))
+            ok++;
+        if (a2 != NULL && a2 != a1 &&
+            drwrap_replace(a2, (void *)pass_RaiseException_repl, false))
+            ok++;
+        if (a3 != NULL && a3 != a1 && a3 != a2 &&
+            drwrap_replace(a3, (void *)pass_RaiseException_repl, false))
+            ok++;
+        if (ok > 0)
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] RaiseException hook installed x%d (B-2015: "
+                       "0x406D1388/ODS глотаются в источнике)\n", ok);
+        else
+            dr_fprintf(STDERR, "[P.A.S.S.] drwrap_replace(RaiseException) FAILED\n");
+    }
 }
 #endif
 
