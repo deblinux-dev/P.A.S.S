@@ -151,7 +151,7 @@ static bool nt_status_interesting(int sysnum)
  * исполнение без всяких модификаций. */
 #define PASS_SYS_RAISE_LO 330
 #define PASS_SYS_RAISE_HI 380
-static int g_n_raise_swallowed;
+int g_n_raise_swallowed; /* не static: печатается в итогах pass.c (Windows) */
 #ifdef WINDOWS
 static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
 {
