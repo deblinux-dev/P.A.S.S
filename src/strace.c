@@ -74,6 +74,11 @@ static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
 #endif /* LINUX */
 
 #ifdef WINDOWS
+/* счётчик проглоченных thread-name/ODS исключений (печатается в итогах
+ * pass.c); не static — extern из pass.c (Windows)
+ */
+int g_n_raise_swallowed;
+
 /* B-2015: имена NT-сисколлов (нумерация Win10 19041..22H2, таблица
  * j00ru/windows-syscalls x64/csv/nt.csv, колонка Windows 10 (20H2);
  * у пользователя bun сообщает "Windows v.win10_fe" = 19042 — совпадает).
@@ -192,7 +197,6 @@ static bool terminate_swallow(void *drcontext)
  * исполнение без всяких модификаций. */
 #define PASS_SYS_RAISE_LO 330
 #define PASS_SYS_RAISE_HI 380
-int g_n_raise_swallowed; /* не static: печатается в итогах pass.c (Windows) */
 #ifdef WINDOWS
 static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
 {
