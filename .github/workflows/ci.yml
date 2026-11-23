@@ -227,9 +227,13 @@ jobs:
           if [ $rc -ne 0 ] || ! grep -q "TNAME-OK" tname_dr.log; then
             echo "── ДИАГНОСТИКА: syscall-трейс (номера 300-400 + хвост):"
             timeout 60 dynamorio/bin64/drrun.exe -c pass_client.dll -target penryn -verbose 1 -strace -- tname.exe > tname_strace.log 2>&1 || true
-            grep -E "SC 3[0-9][0-9]|swallow|RaiseException|EXC\]" tname_strace.log | head -40
+            echo "строк в трейсе: $(wc -l < tname_strace.log || echo 0)"
+            (grep -E "SC 3[0-9][0-9]" tname_strace.log | head -40) || true
+            (grep -E "swallow|EXC\]" tname_strace.log | head -20) || true
             echo "── последние 15 syscall'ов перед смертью:"
-            grep "\[SC" tname_strace.log | tail -15
+            (grep "\[SC" tname_strace.log | tail -15) || true
+            echo "── хвост трейса целиком:"
+            (tail -25 tname_strace.log) || true
             echo "FAIL: 0x406D1388 не проглочен — регрессия фикса Godot B-2015"
             exit 1
           fi
