@@ -152,7 +152,7 @@ static bool terminate_swallow(void *drcontext)
 {
     ptr_int_t h = dr_syscall_get_param(drcontext, 0);
     ptr_int_t st = dr_syscall_get_param(drcontext, 1);
-    if (h != -1 /* NtCurrentProcess */ && h != 0)
+    if (h != -1 && h != 0)   /* -1 = NtCurrentProcess */
         return false;
     if (!exc_code_swallow((unsigned)(st & 0xffffffff)))
         return false;
@@ -162,7 +162,7 @@ static bool terminate_swallow(void *drcontext)
                    "thread-name/ODS не должен убивать процесс\n",
                    (unsigned)(st & 0xffffffff));
     g_n_raise_swallowed++;
-    dr_syscall_set_result(drcontext, 0); /* STATUS_SUCCESS */
+    dr_syscall_set_result(drcontext, 0);   /* STATUS_SUCCESS */
     return true;
 }
  *

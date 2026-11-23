@@ -419,7 +419,7 @@ static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
         EXCEPTION_RECORD rec;
         SIZE_T n = nargs;
         memset(&rec, 0, sizeof(rec));
-        rec.ExceptionCode = (NTSTATUS)code;
+        rec.ExceptionCode = code;   /* DWORD, NTSTATUS-тип не нужен */
         rec.ExceptionFlags = flags & EXCEPTION_NONCONTINUABLE;
         if (n > EXCEPTION_MAXIMUM_PARAMETERS)
             n = EXCEPTION_MAXIMUM_PARAMETERS;
