@@ -165,7 +165,9 @@ static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
         code != 0x40010006u /* DBG_PRINTEXCEPTION_C (OutputDebugStringA) */ &&
         code != 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C (ODS W, Win10+) */)
         return false;
-    if (g_cfg.verbose)
+    /* B-2015: печать ВСЕГДА (не verbose-гейт) — это ЖИЗНЕННО важные события
+     * (без них процесс умирает); кап 50 строк — thread-name бывает пачками. */
+    if (g_n_raise_swallowed < 50)
         dr_fprintf(STDERR,
                    "[P.A.S.S.] swallow RaiseException 0x%08x "
                    "(thread-name/ODS — нативно глотается raiser'ом)\n", code);
@@ -173,6 +175,8 @@ static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
     dr_syscall_set_result(drcontext, 0); /* STATUS_SUCCESS */
     return true;
 }
+#else
+/* Linux: переменная нужна только для счётчика — держим единый символ */
 #endif /* WINDOWS */
 
 static bool sc_pre(void *drcontext, int sysnum)
