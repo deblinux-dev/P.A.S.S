@@ -142,31 +142,13 @@ static bool exc_code_swallow(unsigned code)
            code == 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C (ODS W, Win10+) */;
 }
 
-/* Последний рубеж: NtTerminateProcess(self, код) — ТОЧКА НЕОБРАТИМОСТИ,
- * НО фейк здесь даёт БЕСКОНЕЧНЫЙ ЦИКЛ (fake → ntdll переразводит через
- * RtlRaiseStatus → шорт-кат снова → terminate → fake...; CI: 3+ итерации
- * по ~20с). Оставлено ВЫКЛЮЧЕННЫМ — активный перехват теперь в источнике
- * (drwrap-замена RaiseException, см. trap.c/pass_raise_hook_install).
- *
-static bool terminate_swallow(void *drcontext)
-{
-    ptr_int_t h = dr_syscall_get_param(drcontext, 0);
-    ptr_int_t st = dr_syscall_get_param(drcontext, 1);
-    if (h != -1 && h != 0)   /* -1 = NtCurrentProcess */
-        return false;
-    if (!exc_code_swallow((unsigned)(st & 0xffffffff)))
-        return false;
-    if (g_n_raise_swallowed < 50)
-        dr_fprintf(STDERR,
-                   "[P.A.S.S.] swallow NtTerminateProcess(self, 0x%08x) — "
-                   "thread-name/ODS не должен убивать процесс\n",
-                   (unsigned)(st & 0xffffffff));
-    g_n_raise_swallowed++;
-    dr_syscall_set_result(drcontext, 0);   /* STATUS_SUCCESS */
-    return true;
-}
- *
- * end: terminate_swallow (выключен — цикл) */
+/* B-2015, ЗАМЕТКА: NtTerminateProcess(self, код) — точка необратимости,
+ * но fake-success там даёт БЕСКОНЕЧНЫЙ ЦИКЛ (fake → ntdll переразводит
+ * через RtlRaiseStatus → шорт-кат → terminate → fake...; CI: 3+ итерации,
+ * re-raise никогда не доходит до доставки). Уровень ВЫКЛЮЧЕН — активный
+ * перехват перенесён В ИСТОЧНИК: drwrap-замена kernel32!RaiseException
+ * (trap.c: pass_raise_hook_install) — для кодов-глотаторов тихий выход
+ * до ЛЮБОЙ OS-механики.                                      */
 #endif /* WINDOWS */
 
 /* B-2015: глотание системных исключений НА УРОВНЕ PRE-SYSCALL NtRaiseException.
