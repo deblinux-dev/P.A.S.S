@@ -80,9 +80,11 @@ static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
  * На других билдах номера могут отличаться — имя печатается как подсказка. */
 typedef struct { int num; const char *name; } ntname_t;
 static const ntname_t g_nt_names[] = {
-    { 5,   "NtQueryInformationProcess" },
+    { 5,   "NtCallbackReturn" },
+    { 7,   "NtDeviceIoControlFile" },
     { 15,  "NtClose" },
     { 24,  "NtAllocateVirtualMemory" },
+    { 25,  "NtQueryInformationProcess" },
     { 28,  "NtSetInformationProcess" },
     { 30,  "NtFreeVirtualMemory" },
     { 35,  "NtQueryVirtualMemory" },
@@ -117,11 +119,50 @@ static const char *nt_name(int sysnum)
 static bool nt_status_interesting(int sysnum)
 {
     switch (sysnum) {
-    case 24: case 30: case 35: case 40: case 42: case 44:
+    case 24: case 25: case 28: case 30: case 35: case 40: case 42: case 44:
     case 74: case 80: case 118: case 193: case 200: case 414: case 460:
         return true;
     }
     return false;
+}
+
+/* B-2015: коды, которые нативно глотает raiser (__except-обёртка MSVC
+ * SetThreadName-макроса) и которые НЕ должны уводить процесс в смерть.
+ * Общий список для всех уровней перехвата. */
+static bool exc_code_swallow(unsigned code)
+{
+    return code == 0x406D1388u /* MSVC thread-name: драйверы NVIDIA/AMD/
+                                  Intel, Vulkan-слой на каждом новом потоке */ ||
+           code == 0x40010006u /* DBG_PRINTEXCEPTION_C (OutputDebugStringA) */ ||
+           code == 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C (ODS W, Win10+) */;
+}
+
+/* Последний рубеж: NtTerminateProcess(self, код) — точка необратимости.
+ * На Server 2022/2025 RaiseException(0x406D1388) вообще НЕ доходит до
+ * NtRaiseException: трасса показывает DebugPort-проверку →
+ * NtSetInformationProcess(0x3F) → image-queries → NtTerminateProcess(self,
+ * 0x406D1388) без единого raise-syscall и без доставки (CI-трейс 2c4fdb0).
+ * Для кодов-глотаторов фейкуем SUCCESS: механизм «необработанного»
+ * завершения продолжает работу и переразводит исключение через
+ * RtlRaiseStatus — уже с реальной доставкой, которую глотает наш VEH
+ * (EXCEPTION_CONTINUE_EXECUTION). На Win10 19042 (пользователь) raise
+ * происходит и доставляется штатно — там работает VEH-уровень. */
+static bool terminate_swallow(void *drcontext)
+{
+    ptr_int_t h = dr_syscall_get_param(drcontext, 0);
+    ptr_int_t st = dr_syscall_get_param(drcontext, 1);
+    if (h != -1 /* NtCurrentProcess */ && h != 0)
+        return false;
+    if (!exc_code_swallow((unsigned)(st & 0xffffffff)))
+        return false;
+    if (g_n_raise_swallowed < 50)
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] swallow NtTerminateProcess(self, 0x%08x) — "
+                   "thread-name/ODS не должен убивать процесс\n",
+                   (unsigned)(st & 0xffffffff));
+    g_n_raise_swallowed++;
+    dr_syscall_set_result(drcontext, 0); /* STATUS_SUCCESS */
+    return true;
 }
 #endif /* WINDOWS */
 
@@ -194,6 +235,8 @@ static bool sc_pre(void *drcontext, int sysnum)
      * как close_range на Linux). false = syscall не исполнять. */
     if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
         nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
+        return false;
+    if (sysnum == 44 /* NtTerminateProcess */ && terminate_swallow(drcontext))
         return false;
 #endif
     /* B-2015: СВОЙ гейт трейса. Ядро DR 11.91.20763 НЕ вызывает
