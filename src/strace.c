@@ -220,43 +220,86 @@ static bool sc_pre(void *drcontext, int sysnum)
     if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
         nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
         return false;
-    /* ── B-2016: OOM-детектор ──
+    /* ── B-2016/B-2017: OOM-детектор ──
      * Rust handle_alloc_error печатает «memory allocation of N bytes
      * failed» и сразу abort() → __fastfail(7) → 0xC0000409, который
      * ОБХОДИТ все user-mode обработчики (exception event не стреляет,
      * итоги не печатаются). Пишемое сообщение — последняя точка, где
      * мы ещё живы: сканируем буферы NtWriteFile(54) и
      * NtDeviceIoControlFile(7, консольный WriteFile идёт через него).
-     * Срабатывание → полный дамп состояния (кольцо generic-опов,
-     * счётчики, регистры) — независимо от -strace. */
+     * Срабатывание → полный дамп состояния (кольцо generic-опов+PC,
+     * счётчики, регистры) — независимо от -strace.
+     * B-2017: ИСПРАВЛЕНА карта параметров NtDeviceIoControlFile —
+     * буферы лежат в param6/param8 (InputBuffer/OutputBuffer), длины
+     * в param7/param9; раньше читались param5/param7 — это IoControlCode
+     * и InputBufferLength, т.е. dr_safe_read уходил по адресу-коду IOCTL
+     * (мусорный адрес) и детектор НИКОГДА не срабатывал (у пользователя
+     * v0.2.6 дамп [OOM] не появлялся). Плюс: скан UTF-16LE-паттерна
+     * (WriteConsoleW-путь) и парсинг размера из сообщения.          */
     if (sysnum == 54 || sysnum == 7) {
         static volatile long oom_dumps;
-        /* NtWriteFile: buffer=param5, len=param6;
-         * NtDeviceIoControlFile: inbuf=param5, insize=param6,
-         * outbuf=param7, outsize=param8 */
-        ptr_int_t b[2] = { dr_syscall_get_param(drcontext, 5),
-                           dr_syscall_get_param(drcontext, 7) };
-        ptr_int_t l[2] = { dr_syscall_get_param(drcontext, 6),
-                           dr_syscall_get_param(drcontext, 8) };
-        /* проверяем оба кандидата (NtWriteFile: params 7/8 = ByteOffset/Key —
-         * там NULL/0 → пропускаются сами; DeviceIoControl: param5 = inbuf,
-         * param7 = outbuf) */
+        ptr_int_t b[2], l[2];
+        if (sysnum == 54) {
+            /* NtWriteFile: buffer=param5, len=param6 */
+            b[0] = dr_syscall_get_param(drcontext, 5);
+            l[0] = dr_syscall_get_param(drcontext, 6);
+            b[1] = 0; l[1] = 0;
+        } else {
+            /* NtDeviceIoControlFile: ioctl=param5, inbuf=param6,
+             * insize=param7, outbuf=param8, outsize=param9 */
+            b[0] = dr_syscall_get_param(drcontext, 6);
+            l[0] = dr_syscall_get_param(drcontext, 7);
+            b[1] = dr_syscall_get_param(drcontext, 8);
+            l[1] = dr_syscall_get_param(drcontext, 9);
+        }
         for (int q = 0; q < 2; q++) {
             uint8_t tmp[256];
-            size_t n = (l[q] > 0 && l[q] < (ptr_int_t)sizeof(tmp))
-                           ? (size_t)l[q] : sizeof(tmp);
-            if (n < 20 || b[q] == 0) continue;
+            size_t n;
+            if (b[q] == 0) continue;
+            n = (l[q] > 0 && l[q] < (ptr_int_t)sizeof(tmp))
+                    ? (size_t)l[q] : sizeof(tmp);
             if (!dr_safe_read((void *)b[q], n, tmp, NULL)) continue;
             for (size_t i = 0; i + 20 <= n; i++) {
+                bool hit = false;
+                bool utf16 = false;
                 if (tmp[i]   == 'm' && tmp[i+1] == 'e' && tmp[i+2] == 'm' &&
                     tmp[i+3] == 'o' && tmp[i+4] == 'r' && tmp[i+5] == 'y' &&
                     tmp[i+16] == 'a' && tmp[i+17] == 'l' && tmp[i+18] == 'l') {
+                    hit = true;
+                } else if (tmp[i] == 'm' && tmp[i+1] == 0 &&
+                           tmp[i+2] == 'e' && tmp[i+3] == 0 &&
+                           tmp[i+4] == 'm' && tmp[i+5] == 0 &&
+                           tmp[i+14] == 'a' && tmp[i+15] == 0 &&
+                           tmp[i+16] == 'l' && tmp[i+17] == 0) {
+                    /* UTF-16LE: m\0e\0m\0o\0r\0y\0 \0a\0l\0 — WriteConsoleW-путь */
+                    hit = true;
+                    utf16 = true;
+                }
+                if (hit) {
                     if (oom_dumps < 3) {
                         oom_dumps++;
+                        /* B-2017: размер из сообщения — «memory allocation
+                         * of <десятичное> bytes failed»; размер = запрошенный
+                         * mimalloc'ом объём (у пользователя детерминированный
+                         * 5085 — примерно env-блок) */
+                        unsigned long long sz = 0;
+                        size_t j = i + (utf16 ? 42 : 21);
+                        bool any = false;
+                        while (j + (utf16 ? 1 : 0) < n &&
+                               tmp[j] >= '0' && tmp[j] <= '9') {
+                            sz = sz * 10 + (unsigned long long)(tmp[j] - '0');
+                            any = true;
+                            j += utf16 ? 2 : 1;
+                        }
                         dr_fprintf(STDERR,
                             "[P.A.S.S.][OOM] обнаружено сообщение 'memory "
-                            "allocation of ... failed' (fastfail обходит "
-                            "обработчики — ловлю в последнем окне):\n");
+                            "allocation of %s failed' (fastfail обходит "
+                            "обработчики — ловлю в последнем окне):\n",
+                            any ? "…" : "");
+                        if (any)
+                            dr_fprintf(STDERR,
+                                "[P.A.S.S.][OOM] запрошенный размер: %llu\n",
+                                sz);
                         pass_diag_dump("OOM-abort", drcontext);
                     }
                     break;

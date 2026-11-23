@@ -2237,12 +2237,16 @@ int emu_generic(emu_desc_t *d)
  * «memory allocation of» — пишется ДО fastfail, ловится в user-mode). */
 #define GENERIC_RING_N 32
 static int          g_generic_ring[GENERIC_RING_N];
+static app_pc       g_generic_pc_ring[GENERIC_RING_N]; /* B-2017: app-PC каждого опа —
+        * по дампу модуль+RVA сразу указывает функцию-виновника (simdutf?
+        * mimalloc? JSC?) — без этого кольцо опкодов не привязать к коду */
 static volatile unsigned g_generic_ring_idx;
 
-void pass_generic_ring_note(int opc)
+void pass_generic_ring_note(int opc, app_pc pc)
 {
     unsigned i = g_generic_ring_idx++ & (GENERIC_RING_N - 1);
-    g_generic_ring[i] = opc;
+    g_generic_ring[i]    = opc;
+    g_generic_pc_ring[i] = pc;
 }
 
 /* дамп «последнее состояние» + регистры текущего потока. why — причина
@@ -2256,8 +2260,19 @@ void pass_diag_dump(const char *why, void *dc)
                                                        : GENERIC_RING_N;
     for (unsigned k = 0; k < n; k++) {
         unsigned i = (base + GENERIC_RING_N - n + k) & (GENERIC_RING_N - 1);
-        dr_fprintf(STDERR, " %s", (k % 8 == 0) ? "  " : "");
-        dr_fprintf(STDERR, "op#%d", g_generic_ring[i]);
+        dr_fprintf(STDERR, " %s", (k % 4 == 0) ? "  " : "");
+        /* B-2017: печатаем модуль+RVA — дамп сразу привязан к коду */
+        app_pc pc = g_generic_pc_ring[i];
+        module_data_t *md = (pc != NULL) ? dr_lookup_module(pc) : NULL;
+        if (md != NULL) {
+            const char *nm = dr_module_preferred_name(md);
+            dr_fprintf(STDERR, "op#%d@%s+0x%08x", g_generic_ring[i],
+                       (nm != NULL) ? nm : "?",
+                       (unsigned)(pc - md->start));
+            dr_free_module_data(md);
+        } else {
+            dr_fprintf(STDERR, "op#%d@%p", g_generic_ring[i], pc);
+        }
     }
     dr_fprintf(STDERR, "\n");
     /* топ-10 по счётчикам */
@@ -2313,7 +2328,7 @@ int emu_generic_impl(emu_desc_t *d)
         PASS_ATOMIC_INC32(&g_stat_generic[d->opc]);
     }
     PASS_ATOMIC_INC32(&g_dyn_generic);
-    pass_generic_ring_note(d->opc);
+    pass_generic_ring_note(d->opc, d->pc_next);
     /* §7.3 diag (PASS_CMPBUF=1): сверить спилы в BUF с фактическим
      * контекстом приложения. Спилы-инструкции вставлены ДО clean call
      * и регистров не меняют, поэтому app-контекст (сохранённый DR-шным
