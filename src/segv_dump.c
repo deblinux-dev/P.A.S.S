@@ -164,12 +164,35 @@ static void veh_dump_ring(const char *why)
     }
 }
 
+/* B-2015: системные исключения, которые надо ГЛОТАТЬ (см. trap.c):
+ * MSVC thread-name 0x406D1388 + OutputDebugString 0x40010006/0x4001000A.
+ * ВАЖНО: клиентское exception-событие DR на них НЕ вызывается —
+ * instrument.c: "Note: not called for RaiseException" (проверено по тегу
+ * cronbuild-11.91.20763). Единственная точка до app-SEH — наш VEH:
+ * он стоит первым в цепочке и видит ВСЕ исключения, включая
+ * software-поднятые. EXCEPTION_CONTINUE_EXECUTION с НЕТРОНУТЫМ контекстом
+ * = продолжение с ContextRecord->Rip, куда RtlRaiseException кладёт адрес
+ * возврата из RaiseException — эквивалент тихого __except(EXECUTE_HANDLER)
+ * макроса SetThreadName. Под DR <=v0.2.4 эти коды уходили в unhandled →
+ * DR завершал процесс (Godot 4.5: NtTerminateProcess(self, 0x406D1388)). */
+static int exc_swallow(unsigned int code)
+{
+    return code == 0x406D1388u || code == 0x40010006u || code == 0x4001000Au;
+}
+
 static long NTAPI veh_log(PEXCEPTION_POINTERS ep)
 {
     if (ep == NULL || ep->ExceptionRecord == NULL ||
         ep->ContextRecord == NULL)
         return EXCEPTION_CONTINUE_SEARCH;
     unsigned int code = (unsigned int)ep->ExceptionRecord->ExceptionCode;
+
+    /* B-2015: глотание ДО любого лога/кольца — тихо и дёшево.
+     * Драйверы/Vulkan поднимают thread-name на КАЖДОМ новом потоке:
+     * без раннего выхода лог бы распухал. */
+    if (exc_swallow(code))
+        return EXCEPTION_CONTINUE_EXECUTION;
+
     unsigned long long rip = (unsigned long long)ep->ContextRecord->Rip;
     unsigned long long acc = 0;
     int is_av = (code == 0xC0000005);

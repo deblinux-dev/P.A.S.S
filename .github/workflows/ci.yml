@@ -212,12 +212,18 @@ jobs:
         run: |
           cl /O2 /Fe:tname.exe tests/data/tname.c
           echo "── нативный контроль (информационный):"
-          timeout 60 ./tname.exe > tname_native.log 2>&1 && echo "native: TNAME-OK (система глотает)" \
-            || echo "native: rc=$? (умер — ожидаемо, если система не глотает unhandled)"
-          timeout 60 dynamorio/bin64/drrun.exe -c pass_client.dll -target penryn -- tname.exe > tname_dr.log 2>&1
-          rc=$?
-          echo "── под P.A.S.S.: rc=$rc"
-          tail -6 tname_dr.log || true
+          rc=0
+          timeout 60 ./tname.exe > tname_native.log 2>&1 || rc=$?
+          if [ $rc -eq 0 ]; then
+            echo "native: TNAME-OK (система глотает unhandled)"
+          else
+            echo "native: rc=$rc (умер — unhandled 0x406D1388 не глотается системой; драйверы всегда оборачивают в __except)"
+          fi
+          echo "── под P.A.S.S.:"
+          rc=0
+          timeout 60 dynamorio/bin64/drrun.exe -c pass_client.dll -target penryn -- tname.exe > tname_dr.log 2>&1 || rc=$?
+          echo "rc=$rc; полный лог:"
+          cat tname_dr.log
           if [ $rc -ne 0 ] || ! grep -q "TNAME-OK" tname_dr.log; then
             echo "FAIL: 0x406D1388 не проглочен — регрессия фикса Godot B-2015"
             exit 1

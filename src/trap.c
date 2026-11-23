@@ -323,14 +323,21 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
         static volatile int exclog = -1;
         unsigned int code =
             (exc->record != NULL) ? (unsigned)exc->record->ExceptionCode : 0;
+        int log_av = 0;
         if (exclog == -1)
             exclog = (getenv("PASS_EXCLOG") != NULL) ? 1 : 0;
-        /* B-2015: не-AV коды логируются ВСЕГДА (getenv в инжектируемом
-         * процессе для гейта diag-потока ненадёжен — см. pass.c §7.3,
-         * но здесь getenv лишь РАСШИРЯЕТ всегда-включённый белый список);
-         * AV (0xC0000005) — только под PASS_EXCLOG: драйверы гоняют их
-         * пачками как часть штатного SEH-флоу. */
-        if (exc->record != NULL && (exc_is_diag(code) || exclog))
+        /* B-2015: не-AV значимые коды — ВСЕГДА (гейт getenv ненадёжен в
+         * инжектируемом процессе — см. pass.c §7.3); AV (0xC0000005) —
+         * только под PASS_EXCLOG, но при нём первые 32 всё равно дают
+         * полный breadcrumbs-фотофинал фатального AV. */
+        if (code == 0xC0000005u) {
+            static volatile long av_logged;
+            if (exclog && av_logged < 32) {
+                av_logged++;
+                log_av = 1;
+            }
+        }
+        if (exc->record != NULL && (exc_is_diag(code) || log_av))
             dr_fprintf(STDERR,
                        "[EXC] code=0x%08x addr=" PIFX " rawpc=" PIFX
                        " apppc=" PIFX "\n",
