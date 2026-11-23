@@ -33,6 +33,7 @@ add_library(pass_client SHARED
 
 configure_DynamoRIO_client(pass_client)
 use_DynamoRIO_extension(pass_client drmgr)
+use_DynamoRIO_extension(pass_client drwrap)
 
 target_include_directories(pass_client PRIVATE src)
 

@@ -383,6 +383,76 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
      * как нативно). */
     return true;
 }
+
+/* ── B-2015: перехват В ИСТОЧНИКЕ — drwrap-замена kernel32!RaiseException ──
+ * Хронология недостижимых уровней (CI-циклы):
+ *  (1) drmgr exception event — «Note: not called for RaiseException»;
+ *  (2) наш VEH (первый в цепочке, CONTINUE_EXECUTION) — на Server 2025
+ *      доставки НЕ существует вовсе;
+ *  (3) pre-syscall NtRaiseException — raiser до syscall НЕ доходит;
+ *  (4) fake-success NtTerminateProcess — БЕСКОНЕЧНЫЙ ЦИКЛ: fake → ntdll
+ *      переразводит через RtlRaiseStatus → шорт-кат → terminate → fake...
+ * Замена ФУНКЦИИ — единственный уровень до всей OS-механики: для кодов-
+ * глотаторов просто ВЫХОДИМ (эквивалент тихого __except макроса
+ * SetThreadName), для остальных честно реплицируем kernel32!RaiseException
+ * через ntdll!RtlRaiseException (сама RaiseException заменена — прямой
+ * вызов ntdll избегает рекурсии).                                   */
+#include "drwrap.h"
+
+static VOID (NTAPI *g_pfn_RtlRaiseException)(PEXCEPTION_RECORD);
+
+static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
+                                           SIZE_T nargs, const ULONG_PTR *args)
+{
+    unsigned uc = (unsigned)code;
+    if (uc == 0x406D1388u || uc == 0x40010006u || uc == 0x4001000Au) {
+        extern int g_n_raise_swallowed; /* strace.c */
+        if (g_n_raise_swallowed < 50)
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] swallow RaiseException(0x%08x) — "
+                       "thread-name/ODS (drwrap-replace, B-2015)\n", uc);
+        g_n_raise_swallowed++;
+        return; /* тихое продолжение: приложение видит обычный возврат */
+    }
+    /* честная реплика kernel32!RaiseException для остальных кодов */
+    if (g_pfn_RtlRaiseException != NULL) {
+        EXCEPTION_RECORD rec;
+        SIZE_T n = nargs;
+        memset(&rec, 0, sizeof(rec));
+        rec.ExceptionCode = (NTSTATUS)code;
+        rec.ExceptionFlags = flags & EXCEPTION_NONCONTINUABLE;
+        if (n > EXCEPTION_MAXIMUM_PARAMETERS)
+            n = EXCEPTION_MAXIMUM_PARAMETERS;
+        rec.NumberParameters = (ULONG)n;
+        for (SIZE_T i = 0; i < n; i++)
+            rec.ExceptionInformation[i] = args[i];
+        g_pfn_RtlRaiseException(&rec);
+    }
+}
+
+void pass_raise_hook_install(void)
+{
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE ntd = GetModuleHandleA("ntdll.dll");
+    void *orig, *rtl;
+    if (k32 == NULL || ntd == NULL)
+        return;
+    orig = (void *)GetProcAddress(k32, "RaiseException");
+    rtl = (void *)GetProcAddress(ntd, "RtlRaiseException");
+    if (orig == NULL)
+        return;
+    g_pfn_RtlRaiseException = (VOID (NTAPI *)(PEXCEPTION_RECORD))rtl;
+    if (!drwrap_init()) {
+        dr_fprintf(STDERR, "[P.A.S.S.] drwrap_init FAILED\n");
+        return;
+    }
+    if (drwrap_replace(orig, (void *)pass_RaiseException_repl, false))
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] RaiseException hook installed (B-2015: "
+                   "0x406D1388/ODS глотаются в источнике)\n");
+    else
+        dr_fprintf(STDERR, "[P.A.S.S.] drwrap_replace(RaiseException) FAILED\n");
+}
 #endif
 
 void trap_init(void)

@@ -282,6 +282,12 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
         if (!g_no_veh)
             pass_veh_install((void *)dr_get_client_base(id), 0x30000);
     }
+    /* B-2015: перехват RaiseException в источнике (drwrap-замена):
+     * 0x406D1388/ODS глотаются до любой OS-механики (фикс Godot) */
+    {
+        extern void pass_raise_hook_install(void);
+        pass_raise_hook_install();
+    }
 #endif
 
     features_init();

@@ -142,16 +142,12 @@ static bool exc_code_swallow(unsigned code)
            code == 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C (ODS W, Win10+) */;
 }
 
-/* Последний рубеж: NtTerminateProcess(self, код) — точка необратимости.
- * На Server 2022/2025 RaiseException(0x406D1388) вообще НЕ доходит до
- * NtRaiseException: трасса показывает DebugPort-проверку →
- * NtSetInformationProcess(0x3F) → image-queries → NtTerminateProcess(self,
- * 0x406D1388) без единого raise-syscall и без доставки (CI-трейс 2c4fdb0).
- * Для кодов-глотаторов фейкуем SUCCESS: механизм «необработанного»
- * завершения продолжает работу и переразводит исключение через
- * RtlRaiseStatus — уже с реальной доставкой, которую глотает наш VEH
- * (EXCEPTION_CONTINUE_EXECUTION). На Win10 19042 (пользователь) raise
- * происходит и доставляется штатно — там работает VEH-уровень. */
+/* Последний рубеж: NtTerminateProcess(self, код) — ТОЧКА НЕОБРАТИМОСТИ,
+ * НО фейк здесь даёт БЕСКОНЕЧНЫЙ ЦИКЛ (fake → ntdll переразводит через
+ * RtlRaiseStatus → шорт-кат снова → terminate → fake...; CI: 3+ итерации
+ * по ~20с). Оставлено ВЫКЛЮЧЕННЫМ — активный перехват теперь в источнике
+ * (drwrap-замена RaiseException, см. trap.c/pass_raise_hook_install).
+ *
 static bool terminate_swallow(void *drcontext)
 {
     ptr_int_t h = dr_syscall_get_param(drcontext, 0);
@@ -169,6 +165,8 @@ static bool terminate_swallow(void *drcontext)
     dr_syscall_set_result(drcontext, 0); /* STATUS_SUCCESS */
     return true;
 }
+ *
+ * end: terminate_swallow (выключен — цикл) */
 #endif /* WINDOWS */
 
 /* B-2015: глотание системных исключений НА УРОВНЕ PRE-SYSCALL NtRaiseException.
@@ -239,8 +237,6 @@ static bool sc_pre(void *drcontext, int sysnum)
      * как close_range на Linux). false = syscall не исполнять. */
     if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
         nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
-        return false;
-    if (sysnum == 44 /* NtTerminateProcess */ && terminate_swallow(drcontext))
         return false;
 #endif
     /* B-2015: СВОЙ гейт трейса. Ядро DR 11.91.20763 НЕ вызывает
