@@ -6,6 +6,7 @@
  * процессе ненадёжен — см. pass.c).
  * B-2013: содержит и ПОСТОЯННЫЙ фикс close_range (не diag!). */
 #include "pass.h"
+#include "drwrap.h" /* B-2018: зонд IsProcessorFeaturePresent (только Windows-вызовы) */
 #ifdef LINUX
 #include <sys/syscall.h> /* SYS_close_range; MSVC не знает этот заголовок */
 #endif
@@ -85,9 +86,14 @@ int g_n_raise_swallowed;
  * На других билдах номера могут отличаться — имя печатается как подсказка. */
 typedef struct { int num; const char *name; } ntname_t;
 static const ntname_t g_nt_names[] = {
+    { 4,   "NtWaitForSingleObject" },
     { 5,   "NtCallbackReturn" },
+    { 6,   "NtReadFile" },
     { 7,   "NtDeviceIoControlFile" },
+    { 8,   "NtWriteFile" },      /* B-2018: НЕ 54! см. разбор OOM-детектора */
     { 15,  "NtClose" },
+    { 18,  "NtOpenKey" },        /* реестр: (PHANDLE, DesiredAccess, OBJATTR) */
+    { 23,  "NtQueryValueKey" },
     { 24,  "NtAllocateVirtualMemory" },
     { 25,  "NtQueryInformationProcess" },
     { 28,  "NtSetInformationProcess" },
@@ -97,10 +103,12 @@ static const ntname_t g_nt_names[] = {
     { 40,  "NtMapViewOfSection" },
     { 42,  "NtUnmapViewOfSection" },
     { 44,  "NtTerminateProcess" },
+    { 54,  "NtQuerySystemInformation" }, /* B-2018: 0x36=54 — НЕ NtWriteFile */
     { 55,  "NtOpenSection" },
     { 58,  "NtWriteVirtualMemory" },
     { 60,  "NtDuplicateObject" },
     { 67,  "NtContinue" },
+    { 73,  "NtQueryVolumeInformationFile" },
     { 74,  "NtCreateSection" },
     { 80,  "NtProtectVirtualMemory" },
     { 83,  "NtTerminateThread" },
@@ -129,6 +137,141 @@ static bool nt_status_interesting(int sysnum)
         return true;
     }
     return false;
+}
+
+/* ── B-2018: скан стека на адреса возврата — печать модуль+RVA ──
+ * fastfail (0xC0000409) недостижим, но в окне записи паники
+ * (NtWriteFile с текстом) и NtTerminateProcess(self) стек ещё жив:
+ * кадры от точки смерти до входа в панику видны как кандидаты адресов
+ * возврата. RVA бун-фреймов позже символизируются офлайн (по .pdata,
+ * как в разборе дампов B-2016). Шумные совпадения (остатки на стеке)
+ * идут вперемешку с настоящими кадрами — это приемлемо: дубли
+ * подряд гасятся, лимит 40 строк. */
+void pass_diag_stack_scan(void *dc)
+{
+    dr_mcontext_t mc;
+    int shown = 0;
+    app_pc prev = NULL;
+    memset(&mc, 0, sizeof(mc));
+    mc.size = sizeof(mc);
+    mc.flags = DR_MC_INTEGER | DR_MC_CONTROL;
+    if (dc == NULL || !dr_get_mcontext(dc, &mc))
+        return;
+    dr_fprintf(STDERR, "[P.A.S.S.][STACK] rsp=" PIFX " — кандидаты адресов возврата:\n",
+               (ptr_uint_t)mc.xsp);
+    for (size_t off = 0; off < 0x4000 && shown < 40; off += 8) {
+        app_pc val = NULL;
+        module_data_t *md;
+        const char *nm;
+        if (!dr_safe_read((void *)(mc.xsp + off), sizeof(val), &val, NULL))
+            continue;
+        if (val == prev || (ptr_uint_t)val < 0x10000)
+            continue;
+        md = dr_lookup_module(val);
+        if (md == NULL)
+            continue;
+        nm = dr_module_preferred_name(md);
+        dr_fprintf(STDERR, "  [+0x%04x] %s+0x%06x\n",
+                   (unsigned)off, nm != NULL ? nm : "?",
+                   (unsigned)(val - md->start));
+        shown++;
+        prev = val;
+        dr_free_module_data(md);
+    }
+}
+
+/* ── B-2018: паттерны паники Zig-аллокатора «memory allocation of …» ──
+ * B-2017-ФИКС (баг ASCII-ветки): раньше проверялись 'a','l','l' по
+ * смещениям +16..18 — но в строке «memory allocation of …» там стоят
+ * 'n',' ','o' («allocatio n…»), т.е. ASCII-ветка НЕ МОГЛА сработать
+ * НИКОГДА. Верно: 'a' в +7 (после «memory '), 'l','l' в +8,+9. */
+static bool mem_ascii_hit(const uint8_t *t, size_t i)
+{
+    return t[i + 0] == 'm' && t[i + 1] == 'e' && t[i + 2] == 'm' &&
+           t[i + 3] == 'o' && t[i + 4] == 'r' && t[i + 5] == 'y' &&
+           t[i + 6] == ' ' && t[i + 7] == 'a' && t[i + 8] == 'l';
+}
+
+/* UTF-16LE: m\0e\0m\0o\0r\0y\0 \0a\0l\0 (WriteConsoleW-путь condrv) */
+static bool mem_utf16_hit(const uint8_t *t, size_t i)
+{
+    return t[i + 0] == 'm' && t[i + 1] == 0 && t[i + 2] == 'e' &&
+           t[i + 3] == 0 && t[i + 4] == 'm' && t[i + 5] == 0 &&
+           t[i + 6] == 'o' && t[i + 7] == 0 && t[i + 8] == 'r' &&
+           t[i + 9] == 0 && t[i + 10] == 'y' && t[i + 11] == 0 &&
+           t[i + 12] == ' ' && t[i + 13] == 0 && t[i + 14] == 'a' &&
+           t[i + 15] == 0 && t[i + 16] == 'l' && t[i + 17] == 0;
+}
+
+static void oom_print_chunk(const uint8_t *t, size_t n, bool utf16)
+{
+    dr_fprintf(STDERR, "[P.A.S.S.][OOM] запись: \"");
+    if (!utf16) {
+        for (size_t k = 0; k < n && k < 64; k++)
+            dr_fprintf(STDERR, "%c", (t[k] >= 0x20 && t[k] < 0x7f) ? t[k] : '.');
+    } else {
+        for (size_t k = 0; k + 1 < n && k / 2 < 64; k += 2)
+            dr_fprintf(STDERR, "%c", (t[k] >= 0x20 && t[k] < 0x7f) ? t[k] : '.');
+    }
+    dr_fprintf(STDERR, "\"\n");
+}
+
+/* ── B-2018: зонд IsProcessorFeaturePresent ──
+ * Часть рантаймов спрашивает фичи CPU НЕ через CPUID, а через
+ * IsProcessorFeaturePresent — она читает KUSER_SHARED_DATA, заполненный
+ * ядром по НАСТОЯЩЕМУ CPU при загрузке: спуф CPUID сюда не доходит.
+ * Кандидат на объяснение «CPU lacks AVX support» у baseline-bun 1.2.14
+ * (наш CPUID-спуф согласован — OSXSAVE/XSAVE/leaf-D выставляются
+ * вместе с AVX, XCR0=0x7; значит запрос шёл МИМО CPUID).
+ * Под -strace логируем пары (код → нативный ответ); спуф добавим
+ * отдельным шагом, когда увидим, какие коды и что о них думает ОС.
+ * Документированные коды: 6=SSE, 10=SSE2, 13=SSE3, 17=XSAVE_ENABLED,
+ * 14=CMPXCHG16B; SSE4.2/POPCNT/AVX — недокументированные (20+). */
+static int      g_ifp_codes[32];
+static unsigned g_ifp_n;
+
+static void ifp_pre(void *wrapc, void **user_data)
+{
+    /* drwrap_get_arg гарантирован только в pre — захватываем arg0
+     * (код фичи) в user_data для post-колбэка */
+    *user_data = (void *)(ptr_int_t)drwrap_get_arg(wrapc, 0);
+}
+
+static void ifp_post(void *wrapc, void **user_data)
+{
+    ptr_int_t code = (ptr_int_t)*user_data;
+    ptr_int_t res;
+    (void)wrapc;
+    if (!g_strace)
+        return;
+    res  = (ptr_int_t)drwrap_get_retval(wrapc);
+    for (unsigned k = 0; k < g_ifp_n; k++)
+        if (g_ifp_codes[k] == (int)code)
+            return;
+    if (g_ifp_n < 32) {
+        g_ifp_codes[g_ifp_n++] = (int)code;
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][IFP] IsProcessorFeaturePresent(%d) -> %d"
+                   " (нативный ответ; KUSER_SHARED_DATA не спуфится CPUID-хуком)\n",
+                   (int)code, (int)res);
+    }
+}
+
+void pass_ifp_probe_install(void)
+{
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE kbase = GetModuleHandleA("kernelbase.dll");
+    void *a1 = k32 ? (void *)GetProcAddress(k32, "IsProcessorFeaturePresent") : NULL;
+    void *a2 = kbase ? (void *)GetProcAddress(kbase, "IsProcessorFeaturePresent") : NULL;
+    int n = 0;
+    if (!pass_drwrap_ensure())
+        return;
+    if (a1 != NULL && drwrap_wrap(a1, ifp_pre, ifp_post))
+        n++;
+    if (a2 != NULL && a2 != a1 && drwrap_wrap(a2, ifp_pre, ifp_post))
+        n++;
+    if (n > 0)
+        dr_fprintf(STDERR, "[P.A.S.S.] IFP-зонд установлен x%d (B-2018)\n", n);
 }
 
 /* B-2015: коды, которые нативно глотает raiser (__except-обёртка MSVC
@@ -220,26 +363,32 @@ static bool sc_pre(void *drcontext, int sysnum)
     if (sysnum >= PASS_SYS_RAISE_LO && sysnum <= PASS_SYS_RAISE_HI &&
         nt_raise_swallow(drcontext, dr_syscall_get_param(drcontext, 0)))
         return false;
-    /* ── B-2016/B-2017: OOM-детектор ──
-     * Rust handle_alloc_error печатает «memory allocation of N bytes
-     * failed» и сразу abort() → __fastfail(7) → 0xC0000409, который
-     * ОБХОДИТ все user-mode обработчики (exception event не стреляет,
-     * итоги не печатаются). Пишемое сообщение — последняя точка, где
-     * мы ещё живы: сканируем буферы NtWriteFile(54) и
-     * NtDeviceIoControlFile(7, консольный WriteFile идёт через него).
-     * Срабатывание → полный дамп состояния (кольцо generic-опов+PC,
+    /* ── B-2016/B-2017/B-2018: OOM-детектор ──
+     * Zig-аллокатор bun паникует «memory allocation of N bytes failed»
+     * и сразу abort() → __fastfail(7) → 0xC0000409, который ОБХОДИТ все
+     * user-mode обработчики (exception event не стреляет, итоги не
+     * печатаются). Пишемое сообщение — последняя точка, где мы ещё живы.
+     *
+     * B-2018, ГЛАВНЫЙ ФИКС: сообщение паники bun пишет через
+     * NtWriteFile, а он на Win10/11 x64 = SC 8 (j00ru 20H2: 0x08),
+     * НЕ 54! SC 54 = NtQuerySystemInformation — его param5/6 мусорны,
+     * детектор B-2016/B-2017 сканировал НЕ ТОТ сисколл и молчал.
+     * Натурный лог B-2017 подтверждает: куски сообщения перемешаны
+     * ровно с [SC 8] 0x58 (NtWriteFile на консольный хэндл).
+     * NtDeviceIoControlFile (SC 7, condrv-ioctl) оставлен как второй
+     * источник (WriteConsoleW-путь). Карта параметров SC 7 из B-2017:
+     * inbuf=param6/insize=param7 + outbuf=param8/outsize=param9;
+     * у NtWriteFile буфер=param5/длина=param6 (0-based N-й аргумент).
+     * Срабатывание → стек-скан + полный дамп (кольцо generic-опов+PC,
      * счётчики, регистры) — независимо от -strace.
-     * B-2017: ИСПРАВЛЕНА карта параметров NtDeviceIoControlFile —
-     * буферы лежат в param6/param8 (InputBuffer/OutputBuffer), длины
-     * в param7/param9; раньше читались param5/param7 — это IoControlCode
-     * и InputBufferLength, т.е. dr_safe_read уходил по адресу-коду IOCTL
-     * (мусорный адрес) и детектор НИКОГДА не срабатывал (у пользователя
-     * v0.2.6 дамп [OOM] не появлялся). Плюс: скан UTF-16LE-паттерна
-     * (WriteConsoleW-путь) и парсинг размера из сообщения.          */
-    if (sysnum == 54 || sysnum == 7) {
+     * Плюс B-2017-фикс ASCII-паттерна: 'a','l','l' должны проверяться
+     * в +7/+8/+9 («memory al…»), а не в +16..18 (там «n o»).
+     * Окно скана 256→512 (в condrv-сообщении текст может лежать
+     * за пределами первых 256 байт). */
+    if (sysnum == 8 || sysnum == 7) {
         static volatile long oom_dumps;
         ptr_int_t b[2], l[2];
-        if (sysnum == 54) {
+        if (sysnum == 8) {
             /* NtWriteFile: buffer=param5, len=param6 */
             b[0] = dr_syscall_get_param(drcontext, 5);
             l[0] = dr_syscall_get_param(drcontext, 6);
@@ -253,35 +402,29 @@ static bool sc_pre(void *drcontext, int sysnum)
             l[1] = dr_syscall_get_param(drcontext, 9);
         }
         for (int q = 0; q < 2; q++) {
-            uint8_t tmp[256];
+            uint8_t tmp[512];
             size_t n;
             if (b[q] == 0) continue;
             n = (l[q] > 0 && l[q] < (ptr_int_t)sizeof(tmp))
                     ? (size_t)l[q] : sizeof(tmp);
             if (!dr_safe_read((void *)b[q], n, tmp, NULL)) continue;
-            for (size_t i = 0; i + 20 <= n; i++) {
+            for (size_t i = 0; i + 18 <= n; i++) {
                 bool hit = false;
                 bool utf16 = false;
-                if (tmp[i]   == 'm' && tmp[i+1] == 'e' && tmp[i+2] == 'm' &&
-                    tmp[i+3] == 'o' && tmp[i+4] == 'r' && tmp[i+5] == 'y' &&
-                    tmp[i+16] == 'a' && tmp[i+17] == 'l' && tmp[i+18] == 'l') {
+                if (mem_ascii_hit(tmp, i)) {
                     hit = true;
-                } else if (tmp[i] == 'm' && tmp[i+1] == 0 &&
-                           tmp[i+2] == 'e' && tmp[i+3] == 0 &&
-                           tmp[i+4] == 'm' && tmp[i+5] == 0 &&
-                           tmp[i+14] == 'a' && tmp[i+15] == 0 &&
-                           tmp[i+16] == 'l' && tmp[i+17] == 0) {
-                    /* UTF-16LE: m\0e\0m\0o\0r\0y\0 \0a\0l\0 — WriteConsoleW-путь */
+                } else if (mem_utf16_hit(tmp, i)) {
                     hit = true;
                     utf16 = true;
                 }
                 if (hit) {
                     if (oom_dumps < 3) {
                         oom_dumps++;
-                        /* B-2017: размер из сообщения — «memory allocation
-                         * of <десятичное> bytes failed»; размер = запрошенный
-                         * mimalloc'ом объём (у пользователя детерминированный
-                         * 5085 — примерно env-блок) */
+                        /* размер из сообщения — «memory allocation of
+                         * <десятичное> bytes failed»; это запрошенный
+                         * объём, который аллокатор НЕ смог выдать
+                         * (у пользователя детерминированный 5085 ≈
+                         * env-блок в UTF-8) */
                         unsigned long long sz = 0;
                         size_t j = i + (utf16 ? 42 : 21);
                         bool any = false;
@@ -292,19 +435,39 @@ static bool sc_pre(void *drcontext, int sysnum)
                             j += utf16 ? 2 : 1;
                         }
                         dr_fprintf(STDERR,
-                            "[P.A.S.S.][OOM] обнаружено сообщение 'memory "
-                            "allocation of %s failed' (fastfail обходит "
-                            "обработчики — ловлю в последнем окне):\n",
-                            any ? "…" : "");
+                            "[P.A.S.S.][OOM] паника 'memory allocation of N bytes"
+                            " failed' поймана В ЗАПИСИ (fastfail обходит"
+                            " обработчики — это последнее окно; SC %d, %s):\n",
+                            sysnum, utf16 ? "UTF-16LE" : "ASCII");
+                        oom_print_chunk(tmp + i, n - i, utf16);
                         if (any)
                             dr_fprintf(STDERR,
-                                "[P.A.S.S.][OOM] запрошенный размер: %llu\n",
-                                sz);
+                                "[P.A.S.S.][OOM] запрошенный размер: %llu\n", sz);
+                        pass_diag_stack_scan(drcontext);
                         pass_diag_dump("OOM-abort", drcontext);
                     }
                     break;
                 }
             }
+        }
+    }
+    /* ── B-2018: дамп на NtTerminateProcess(self) ──
+     * Уровень необратимости: всё, что выходит через ExitProcess/Zig
+     * std.process.exit/RtlExitUserProcess, доходит сюда ПОСЛЕДНИМ.
+     * Дамп (стек-скан + кольцо + регистры) печатается и при НОРМАЛЬНОМ
+     * выходе (шум в 5 строк), и при смерти с кодом — у пользователя
+     * это второе гарантированное окно рядом с OOM-детектором. */
+    if (sysnum == 44) {
+        static volatile long term_dumps;
+        ptr_int_t h = dr_syscall_get_param(drcontext, 0);
+        ptr_int_t code = dr_syscall_get_param(drcontext, 1);
+        if ((h == -1 || h == -2) && term_dumps < 2) {
+            term_dumps++;
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.][EXIT] NtTerminateProcess(self, %p) —"
+                       " дамп перед смертью:\n", (void *)code);
+            pass_diag_stack_scan(drcontext);
+            pass_diag_dump("terminate", drcontext);
         }
     }
 #endif
@@ -331,6 +494,36 @@ static bool sc_pre(void *drcontext, int sysnum)
             dr_fprintf(STDERR, "[SC %d %s] %p %p %p\n", sysnum, nm, a0, a1, a2);
         else
             dr_fprintf(STDERR, "[SC %d] %p %p %p\n", sysnum, a0, a1, a2);
+    }
+    /* B-2018: расшифровка аллокационной семьи — дерефы размеров/защиты.
+     * Без этого по [SC 118/24] не видно, ЧТО резервирует mimalloc
+     * (сегменты 64МБ? коммиты page-map?) — а это ключевая улика
+     * для «page-map lookup → NULL» из разбора дампов B-2016. */
+    if (sysnum == 24 || sysnum == 118 || sysnum == 30 || sysnum == 80) {
+        ptr_int_t p1 = dr_syscall_get_param(drcontext, 1);
+        ptr_int_t p2 = dr_syscall_get_param(drcontext, 2);
+        ptr_int_t p3 = dr_syscall_get_param(drcontext, 3);
+        ptr_int_t p4 = dr_syscall_get_param(drcontext, 4);
+        ptr_int_t p5 = dr_syscall_get_param(drcontext, 5);
+        ptr_int_t sz = 0, base = 0;
+        if (p1 >= 0x10000)
+            (void)dr_safe_read((void *)p1, sizeof(base), &base, NULL);
+        if (sysnum == 30) {
+            /* NtFreeVirtualMemory(P, *BaseAddress, *RegionSize, FreeType) */
+            if (p2 >= 0x10000)
+                (void)dr_safe_read((void *)p2, sizeof(sz), &sz, NULL);
+            dr_fprintf(STDERR, "[SC %d ·] base=%p sz=%p type=%p\n",
+                       sysnum, (void *)base, (void *)sz, (void *)p3);
+        } else {
+            /* NtAllocateVirtualMemory(Ex)(P, *BaseAddress, ZeroBits,
+             * *RegionSize, Type, Protect[, Params, Count]) и
+             * NtProtectVirtualMemory(P, *BaseAddress, *RegionSize,
+             * NewProtect, *OldProtect) */
+            if (p3 >= 0x10000)
+                (void)dr_safe_read((void *)p3, sizeof(sz), &sz, NULL);
+            dr_fprintf(STDERR, "[SC %d ·] base=%p size=%p type=%p prot=%p\n",
+                       sysnum, (void *)base, (void *)sz, (void *)p4, (void *)p5);
+        }
     }
     return true;
 #else
@@ -408,4 +601,12 @@ void pass_strace_init(void)
 #endif
     drmgr_register_pre_syscall_event(sc_pre);
     drmgr_register_post_syscall_event(sc_post);
+#ifdef WINDOWS
+    /* B-2018: зонд IsProcessorFeaturePresent — данные для решения о
+     * спуфе KUSER_SHARED_DATA (кандидат на «CPU lacks AVX support»
+     * у baseline-bun). Под -strace: хуки не должны трогать живой
+     * дефолтный путь без диагностической задачи. */
+    if (g_strace)
+        pass_ifp_probe_install();
+#endif
 }

@@ -446,6 +446,22 @@ static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
     }
 }
 
+/* B-2018: единая точка инициализации drwrap — trap.c (RaiseException) и
+ * strace.c (зонд IsProcessorFeaturePresent) делят один drwrap-инстанс;
+ * повторный drwrap_init() при живых хуках небезопасен, поэтому гардим. */
+static int g_drwrap_ready;
+int pass_drwrap_ensure(void)
+{
+    if (g_drwrap_ready)
+        return 1;
+    if (!drwrap_init()) {
+        dr_fprintf(STDERR, "[P.A.S.S.] drwrap_init FAILED\n");
+        return 0;
+    }
+    g_drwrap_ready = 1;
+    return 1;
+}
+
 void pass_raise_hook_install(void)
 {
     module_data_t *k32md, *ntdmd;
@@ -458,10 +474,8 @@ void pass_raise_hook_install(void)
         return;
     rtl = (void *)GetProcAddress(ntd, "RtlRaiseException");
     g_pfn_RtlRaiseException = (VOID (NTAPI *)(PEXCEPTION_RECORD))rtl;
-    if (!drwrap_init()) {
-        dr_fprintf(STDERR, "[P.A.S.S.] drwrap_init FAILED\n");
+    if (!pass_drwrap_ensure())
         return;
-    }
     /* B-2015 diag: регистрируем ВСЕ возможные адреса RaiseException:
      * kernel32 (может быть форвардер-стаб), kernelbase (реальное тело)
      * и dr_get_proc_address (LSB-нормализация DR). */

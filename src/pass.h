@@ -305,6 +305,8 @@ const vex_map_ent_t *vex_map_all(int *count);
 const void *fma_tab_all(int *count);   /* fma_ent_t* — тип объявлен ниже */
 void pass_fuzz_run(void);
 void pass_strace_init(void);  /* B-2010 diag: syscall-трейсер            */
+void pass_diag_stack_scan(void *dc); /* B-2018 (Windows): скан стека
+                                      * на module+RVA перед смертью    */
 int  try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i);
 int  try_rewrite_special(void *dc, instrlist_t *bb, instr_t *i);
 int  special_req_ok(int opc);   /* есть ли вообще обработчик */
@@ -312,6 +314,9 @@ int  special_req_ok(int opc);   /* есть ли вообще обработчи
 /* ────────────────────────── trap.c ────────────────────────── */
 void trap_init(void);
 void trap_exit(void);
+/* B-2018: идемпотентная инициализация drwrap — используется и
+ * pass_raise_hook_install, и зондом IsProcessorFeaturePresent (strace.c) */
+int  pass_drwrap_ensure(void);
 
 /* ── трассировка доступа к операндам (диагностика краша NULL dsts) ──
  * Клиент зовёт DR-экспорт instr_get_dst/instr_get_src; в релизной
