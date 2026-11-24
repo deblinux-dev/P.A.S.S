@@ -19,6 +19,12 @@
  * прокси-путём доставки. Linux-сборка использует тот же механизм. */
 #include <math.h>
 
+/* B-2020: bitrace битовых операций (pass_b2020.c) — ловушка на путь
+ * claim/scan битовой карты аллокатора bun (OOM 5085). */
+extern void pass_b2020_bitop(uint32_t opc, uint64_t pc, uint32_t w,
+                             uint64_t s1, uint64_t s2, uint64_t res,
+                             uint32_t fl0, uint32_t fl1);
+
 typedef struct {
     uint8_t *buf;   /* per-thread BUF (спилы GPR/XMM, флаги, CPUID) */
     uint8_t *raw;   /* RAW TLS base (YHI-shadow)                    */
@@ -2033,10 +2039,14 @@ static void gpr_popcnt64(estate_t *st, emu_desc_t *d)
     int w = (opnd_get_size(d->srcs[0]) == OPSZ_8) ? 64 :
             (opnd_get_size(d->srcs[0]) == OPSZ_4 ? 32 : 16);
     uint64_t mask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+    uint32_t b2_f0 = (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0;   /* B-2020 */
     uint64_t res = PASS_POPCNT64(v & mask);
     /* результат — нул-расширенный до полного регистра */
     put_gpr_val(st, opnd_create_reg(gpr_norm(opnd_get_reg(d->dsts[0]))), res);
     flags_count(st, res, w, 0);
+    pass_b2020_bitop(539, (uint64_t)(uintptr_t)d->pc_next, (uint32_t)w, v, 0, res,
+                     b2_f0,
+                     (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0);
 }
 
 static void gpr_lzcnt(estate_t *st, emu_desc_t *d)
@@ -2047,12 +2057,16 @@ static void gpr_lzcnt(estate_t *st, emu_desc_t *d)
     uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
     uint64_t res;
     int cf = (v == 0);
+    uint32_t b2_f0 = (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0;   /* B-2020 */
     if (cf)
         res = (uint64_t)w;                          /* LZCNT(0) = ширина */
     else
         res = (uint64_t)(pass_clz64(v) - (64 - w)); /* clz в разрядности w */
     put_gpr_val(st, opnd_create_reg(gpr_norm(opnd_get_reg(d->dsts[0]))), res);
     flags_count(st, res, w, cf);
+    pass_b2020_bitop(544, (uint64_t)(uintptr_t)d->pc_next, (uint32_t)w, v, 0, res,
+                     b2_f0,
+                     (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0);
 }
 
 static void gpr_tzcnt(estate_t *st, emu_desc_t *d)
@@ -2063,12 +2077,16 @@ static void gpr_tzcnt(estate_t *st, emu_desc_t *d)
     uint64_t v = get_gpr_val(st, d->srcs[0]) & mask;
     uint64_t res;
     int cf = (v == 0);
+    uint32_t b2_f0 = (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0;   /* B-2020 */
     if (cf)
         res = (uint64_t)w;                          /* TZCNT(0) = ширина */
     else
         res = (uint64_t)pass_ctz64(v);
     put_gpr_val(st, opnd_create_reg(gpr_norm(opnd_get_reg(d->dsts[0]))), res);
     flags_count(st, res, w, cf);
+    pass_b2020_bitop(1059, (uint64_t)(uintptr_t)d->pc_next, (uint32_t)w, v, 0, res,
+                     b2_f0,
+                     (st->buf != NULL) ? *(uint32_t *)(st->buf + BUF_FLAGS) : 0);
 }
 
 /* ══════════════════ VTESTPS/PD ══════════════════ */

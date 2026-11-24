@@ -80,6 +80,12 @@ static bool sc_pre_fix_close_range(void *drcontext, int sysnum)
  */
 int g_n_raise_swallowed;
 
+/* B-2020: дамп кольца бит-опов на поимке OOM + захват коммита 0x10000
+ * (pass_b2020.c) */
+extern void pass_b2020_oom_dump(void);
+extern void pass_b2020_note_commit(uint64_t base, uint64_t size);
+static ptr_int_t g_b2_last_sc24_sz = 0;   /* запрошенный size последнего SC 24 */
+
 /* B-2015: имена NT-сисколлов (нумерация Win10 19041..22H2, таблица
  * j00ru/windows-syscalls x64/csv/nt.csv, колонка Windows 10 (20H2);
  * у пользователя bun сообщает "Windows v.win10_fe" = 19042 — совпадает).
@@ -443,6 +449,7 @@ static bool sc_pre(void *drcontext, int sysnum)
                         if (any)
                             dr_fprintf(STDERR,
                                 "[P.A.S.S.][OOM] запрошенный размер: %llu\n", sz);
+                        pass_b2020_oom_dump();   /* B-2020: кольцо бит-опов + дизасм-байты */
                         pass_diag_stack_scan(drcontext);
                         pass_diag_dump("OOM-abort", drcontext);
                     }
@@ -513,7 +520,8 @@ static bool sc_pre(void *drcontext, int sysnum)
             if (p2 >= 0x10000)
                 (void)dr_safe_read((void *)p2, sizeof(sz), &sz, NULL);
             dr_fprintf(STDERR, "[SC %d ·] base=%p sz=%p type=%p\n",
-                       sysnum, (void *)base, (void *)sz, (void *)p3);
+                       sysnum, (void *)base, (void *)sz,
+                       (void *)(p3 & 0xffffffff));
         } else if (sysnum == 118) {
             /* B-2019: NtAllocateVirtualMemoryEx на Win10 19041+/Win11 —
              * сигнатура БЕЗ ZeroBits: (P, *Base, *RegionSize, Type,
@@ -535,8 +543,25 @@ static bool sc_pre(void *drcontext, int sysnum)
              * NewProtect, *OldProtect) */
             if (p3 >= 0x10000)
                 (void)dr_safe_read((void *)p3, sizeof(sz), &sz, NULL);
-            dr_fprintf(STDERR, "[SC %d ·] base=%p size=%p type=%p prot=%p\n",
-                       sysnum, (void *)base, (void *)sz, (void *)p4, (void *)p5);
+            if (sysnum == 80) {
+                /* B-2020: у NtProtectVirtualMemory p3 = NewProtect (ЧИСЛО),
+                 * p4 = *OldProtect (УКАЗАТЕЛЬ — у B-2019 он печатался как
+                 * prot, что и давало «кодовый адрес» 0x7ff6529eb750).
+                 * Старшие dword слотов stack-аргументов протухшие
+                 * (32-битная запись не чистит верх qword) — маскируем,
+                 * как в SC 118. */
+                dr_fprintf(STDERR,
+                           "[SC %d ·] base=%p size=%p newprot=%p oldprot_ptr=%p\n",
+                           sysnum, (void *)base, (void *)sz,
+                           (void *)(p3 & 0xffffffff), (void *)p4);
+            } else {
+                dr_fprintf(STDERR,
+                           "[SC %d ·] base=%p size=%p type=%p prot=%p\n",
+                           sysnum, (void *)base, (void *)sz,
+                           (void *)(p4 & 0xffffffff), (void *)(p5 & 0xffffffff));
+            }
+            if (sysnum == 24)
+                g_b2_last_sc24_sz = sz;   /* для захвата коммита в sc_post */
         }
     }
     return true;
@@ -616,6 +641,11 @@ static void sc_post(void *drcontext, int sysnum)
         if (p1 >= 0x10000 &&
             dr_safe_read((void *)p1, sizeof(out), &out, NULL) && out != 0)
             dr_fprintf(STDERR, "[SC %d retbase] %p\n", sysnum, (void *)out);
+        /* B-2020: коммит страницы сегмента (запрошенный size 0x10000,
+         * база вида segbase+0x…0000) — адрес для seg-форензики на
+n         * отказе segget (pass_b2020.c) */
+        if (sysnum == 24 && g_b2_last_sc24_sz == 0x10000 && out != 0)
+            pass_b2020_note_commit((uint64_t)out, (uint64_t)g_b2_last_sc24_sz);
     }
 #endif
 }

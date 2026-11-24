@@ -28,6 +28,7 @@ add_library(pass_client SHARED
     src/segv_dump.c
     src/strace.c
     src/probe.c
+    src/pass_b2020.c
     src/sampler.c
     src/fuzz.c
     )

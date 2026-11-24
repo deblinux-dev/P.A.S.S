@@ -344,7 +344,12 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2019 (v0.2.9)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2020 (v0.3.0-diag)\n");
+    /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
+    {
+        extern void pass_b2020_enable(void);
+        pass_b2020_enable();
+    }
 
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));

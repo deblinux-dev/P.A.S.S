@@ -29,6 +29,14 @@
 #include "drwrap.h"
 #include <string.h>
 
+/* B-2020: bitrace + сегментная форензика (pass_b2020.c) */
+extern void pass_b2020_prb(const char* name, uint64_t rcx, uint64_t rdx,
+                           uint64_t r8, uint64_t r9, uint64_t xsp);
+extern void pass_b2020_probe_addr(const char* name, uint64_t addr);
+extern void pass_b2020_seg_dump(uint64_t heap_ptr, uint64_t seg_base,
+                                uint64_t commit_addr);
+static uint64_t g_b2_last_seg = 0;   /* база сегмента из зонда findpg */
+
 typedef struct {
     int         rva;
     const char *name;
@@ -78,6 +86,8 @@ static void probe_heap_dump(app_pc heap)
 static void probe_print_args(int idx, dr_mcontext_t *mc)
 {
     const probe_ent_t *p = &g_probe_rvas[idx];
+    if (idx == 6)   /* findpg: rcx = база сегмента (для seg-форензики) */
+        g_b2_last_seg = (uint64_t)(uintptr_t)mc->rcx;
     dr_fprintf(STDERR, "[P.A.S.S.][PROBE] %s(heap=" PIFX,
                p->name, (ptr_uint_t)mc->rcx);
     if (p->is_report) {
@@ -99,6 +109,12 @@ static void probe_print_args(int idx, dr_mcontext_t *mc)
         dr_fprintf(STDERR, ")");
     }
     dr_fprintf(STDERR, "\n");
+    /* B-2020: сырые аргументы + retaddr — переотображение конвенций
+     * вызовов и граф вызовов (retaddr зонда grow = место аллокации 5085). */
+    pass_b2020_prb(p->name,
+                   (uint64_t)(uintptr_t)mc->rcx, (uint64_t)(uintptr_t)mc->rdx,
+                   (uint64_t)(uintptr_t)mc->r8,  (uint64_t)(uintptr_t)mc->r9,
+                   (uint64_t)(uintptr_t)mc->xsp);
 }
 
 static void probe_pre(void *wrapcxt, void **user_data, int idx)
@@ -134,6 +150,11 @@ static void probe_post(void *wrapcxt, void *user_data, int idx)
     dr_fprintf(STDERR, "[P.A.S.S.][PROBE] %s -> NULL (вызов #%d, отказ #%d)\n",
                g_probe_rvas[idx].name, g_probe_calls[idx], nulls + 1);
     probe_heap_dump((app_pc)(ptr_uint_t)user_data);
+    /* B-2020: сегментная форензика на первом отказе segget —
+     * состояние битовой карты страниц/заголовков сегмента аллокатора. */
+    if (idx == 5)
+        pass_b2020_seg_dump((uint64_t)(uintptr_t)user_data,
+                            g_b2_last_seg, 0);
 }
 
 /* Генерация пар cb на каждый зонд (drwrap не сообщает индекс зонда). */
@@ -186,6 +207,8 @@ static void probe_install_for(module_data_t *md)
     }
     for (unsigned k = 0; k < PROBE_N; k++) {
         app_pc fn = md->start + g_probe_rvas[k].rva;
+        pass_b2020_probe_addr(g_probe_rvas[k].name,
+                              (uint64_t)(uintptr_t)fn);   /* B-2020: code-дамп */
         if (drwrap_wrap(fn, g_pre[k], g_post[k]))
             n_ok++;
     }
