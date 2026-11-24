@@ -28,6 +28,7 @@
 #ifdef WINDOWS
 #include "drwrap.h"
 #include <string.h>
+#include <stdint.h>   /* B-2020: uint64_t для extern-объявлений pass_b2020_* */
 
 /* B-2020: bitrace + сегментная форензика (pass_b2020.c) */
 extern void pass_b2020_prb(const char* name, uint64_t rcx, uint64_t rdx,
