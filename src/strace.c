@@ -514,9 +514,23 @@ static bool sc_pre(void *drcontext, int sysnum)
                 (void)dr_safe_read((void *)p2, sizeof(sz), &sz, NULL);
             dr_fprintf(STDERR, "[SC %d ·] base=%p sz=%p type=%p\n",
                        sysnum, (void *)base, (void *)sz, (void *)p3);
+        } else if (sysnum == 118) {
+            /* B-2019: NtAllocateVirtualMemoryEx на Win10 19041+/Win11 —
+             * сигнатура БЕЗ ZeroBits: (P, *Base, *RegionSize, Type,
+             * Protect[, ExtParams, Count]). Лог B-2018: r9 (param2) —
+             * УКАЗАТЕЛЬ на RegionSize, а param3 = Type (число —
+             * дerefa проваливалась и печатала 0). Печатаем: base=*p1,
+             * size=*p2, type=p3, prot=p4 (младшие dword — старшие
+             * половины слотов — мусор соседних данных). */
+            if (p2 >= 0x10000)
+                (void)dr_safe_read((void *)p2, sizeof(sz), &sz, NULL);
+            dr_fprintf(STDERR,
+                       "[SC %d ·] base=%p size=%p type=%p prot=%p\n",
+                       sysnum, (void *)base, (void *)sz,
+                       (void *)(p3 & 0xffffffff), (void *)(p4 & 0xffffffff));
         } else {
-            /* NtAllocateVirtualMemory(Ex)(P, *BaseAddress, ZeroBits,
-             * *RegionSize, Type, Protect[, Params, Count]) и
+            /* NtAllocateVirtualMemory(P, *BaseAddress, ZeroBits,
+             * *RegionSize, Type, Protect) и
              * NtProtectVirtualMemory(P, *BaseAddress, *RegionSize,
              * NewProtect, *OldProtect) */
             if (p3 >= 0x10000)
@@ -590,6 +604,19 @@ static void sc_post(void *drcontext, int sysnum)
     if (nt_status_interesting(sysnum))
         dr_fprintf(STDERR, "[SC %d ->] %p (%s)\n", sysnum, res,
                    (res == 0) ? "STATUS_SUCCESS" : "FAIL");
+    /* B-2019: фактическая база результата аллокационного семейства.
+     * Для SC 24/118 — куда встал резерв/коммит (у B-2018 было видно
+     * только ЗАПРОШЕННОЕ base, но 1GB-резерв шёл с base=0 = выбор ОС,
+     * и где он приземлился — из лога не следовало); для SC 30 — что
+     * именно разкоммитили; для SC 80 — старая защита (*OldProtect). */
+    if (res == 0 &&
+        (sysnum == 24 || sysnum == 118 || sysnum == 30 || sysnum == 80)) {
+        ptr_int_t p1 = dr_syscall_get_param(drcontext, 1);
+        ptr_int_t out = 0;
+        if (p1 >= 0x10000 &&
+            dr_safe_read((void *)p1, sizeof(out), &out, NULL) && out != 0)
+            dr_fprintf(STDERR, "[SC %d retbase] %p\n", sysnum, (void *)out);
+    }
 #endif
 }
 

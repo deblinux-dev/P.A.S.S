@@ -236,6 +236,7 @@ extern int g_stage_override;  /* -stage N: переопределяет PASS_STA
 extern int g_sampler_ms;      /* -sampler <мс>: PC-сэмплинг (diag)        */
 extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */
 extern int g_strace;          /* -strace: трассировка syscall'ов (diag)  */
+extern int g_probe_alloc;     /* -probealloc/-noprobealloc (B-2019); -1=авто */
 extern int g_special_only;    /* -specialonly N: special только для opc N (diag) */
 featset_t exposed_features(void);
 void emu_cpuid(void);                                   /* clean call */
@@ -269,9 +270,15 @@ extern uint64_t g_dyn_trap;
 /* ── B-2016/B-2017: диагностика последних generic-опов (emu.c) ──
  * fastfail (0xC0000409, Rust OOM abort) обходит user-mode обработчики —
  * единственные окна увидеть состояние: OOM-детект в pre-syscall,
- * diag-исключения (#UD) и итоги. */
+ * diag-исключения (#UD) и итоги.
+ * B-2019: кольцо per-thread (TLS в pass.c) — глобальное перемешивало
+ * нити; pass_diag_dump печатает кольцо ТЕКУЩЕЙ (паникующей) нити. */
+#define PASS_GENERIC_RING_N 32
 void pass_generic_ring_note(int opc, app_pc pc);      /* hot path, без блокировок */
 void pass_diag_dump(const char *why, void *dc);       /* dc=NULL → без регистров */
+/* доступ к кольцу ТЕКУЩЕЙ нити (dc) или к общему fallback (is_global=1) */
+void pass_diag_ring_get(void *dc, int **opc, app_pc **pc, unsigned *idx,
+                        unsigned *is_global);
 
 /* ───────────────────────── rewrite.c ─────────────────────── */
 void pass_ensure_tls(void *dc);

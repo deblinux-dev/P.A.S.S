@@ -27,6 +27,7 @@ add_library(pass_client SHARED
     src/trap.c
     src/segv_dump.c
     src/strace.c
+    src/probe.c
     src/sampler.c
     src/fuzz.c
     )

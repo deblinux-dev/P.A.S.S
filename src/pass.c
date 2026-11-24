@@ -11,7 +11,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.2.8            ║\n"
+        "  ║              Substitution  v0.2.9            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -82,6 +82,10 @@ static void parse_options(int argc, const char *argv[])
             }
         } else if (strcmp(a, "-strace") == 0) {
             g_strace = 1;
+        } else if (strcmp(a, "-probealloc") == 0) {
+            g_probe_alloc = 1;
+        } else if (strcmp(a, "-noprobealloc") == 0) {
+            g_probe_alloc = 0;
         } else if (strcmp(a, "-sampler") == 0 && k + 1 < argc) {
             /* B-2009 diag: PC-сэмплинг (dr_set_itimer), мс */
             g_sampler_ms = atoi(argv[++k]);
@@ -98,6 +102,73 @@ int g_sampler_ms = 0;     /* -sampler <мс>: PC-сэмплинг (diag B-2009) 
 int g_do_fuzz = 0;       /* -fuzz: перебор карт рерайтера */
 int g_strace = 0;        /* -strace: syscall-трейсер (diag B-2010) */
 int g_special_only = -1; /* -specialonly N: спец-путь только для одного opc */
+int g_probe_alloc = -1;  /* B-2019: -probealloc/-noprobealloc; -1 = авто
+                          * (включаются вместе с -strace на Windows)  */
+
+/* ════ B-2019: per-thread кольцо последних generic-опов ════
+ * (переезд из emu.c: глобальное кольцо перемешивало нити — в логе
+ * B-2018 кольцо «перед паникой» содержало опы watcher-потока с
+ * NtDeviceIoControlFile, а не паникующей нити.)                   */
+#define GENERIC_RING_N 32
+typedef struct {
+    int    opc[GENERIC_RING_N];
+    app_pc pc[GENERIC_RING_N];   /* app-PC каждого опа (B-2017) */
+    unsigned idx;                /* глобальный счётчик записей нити */
+} diag_ring_t;
+static int g_tls_idx_ring;
+static diag_ring_t *g_main_ring;   /* первое аллоцированное кольцо */
+static diag_ring_t *g_last_active; /* последнее кольцо, куда писали —
+ * для exit-дампа: DR на exit/init даёт dcontext, отличный от
+ * execution-контекста (натурно: ноты шли в 0x...dc0, а ensure на
+ * init в 0x...3c8), поэтому dc==NULL берём последнее активное */
+static int          g_fallback_ring_opc[GENERIC_RING_N];
+static app_pc       g_fallback_ring_pc[GENERIC_RING_N];
+static volatile unsigned g_fallback_ring_idx;
+
+void pass_generic_ring_note(int opc, app_pc pc)
+{
+    void *dc = dr_get_current_drcontext();
+    diag_ring_t *r = (dc != NULL)
+        ? (diag_ring_t *)drmgr_get_tls_field(dc, g_tls_idx_ring) : NULL;
+    if (r == NULL) {
+        /* нить без TLS (ранний trap) — общий fallback */
+        unsigned i = g_fallback_ring_idx++ & (GENERIC_RING_N - 1);
+        g_fallback_ring_opc[i] = opc;
+        g_fallback_ring_pc[i]  = pc;
+        return;
+    }
+    unsigned i = r->idx++ & (GENERIC_RING_N - 1);
+    r->opc[i] = opc;
+    r->pc[i]  = pc;
+    g_last_active = r; /* без блокировки: гонка = чужое кольцо в exit-дампе,
+                        * что и раньше давал глобальный буфер B-2016 */
+}
+
+void pass_diag_ring_get(void *dc, int **opc, app_pc **pc, unsigned *idx,
+                        unsigned *is_global)
+{
+    static diag_ring_t fallback_dummy;
+    diag_ring_t *r = NULL;
+    if (dc != NULL)
+        r = (diag_ring_t *)drmgr_get_tls_field(dc, g_tls_idx_ring);
+    else
+        r = (g_last_active != NULL) ? g_last_active : g_main_ring;
+    if (r != NULL) {
+        *opc = r->opc; *pc = r->pc; *idx = r->idx; *is_global = 0;
+    } else {
+        /* fallback-кольцо — копия в dummy, чтобы вернуть стабильные
+         * указатели (печать идёт сразу после вызова — без гонок важнее
+         * целостность: snapshot без блокировки, как и раньше).     */
+        for (int k = 0; k < GENERIC_RING_N; k++) {
+            fallback_dummy.opc[k] = g_fallback_ring_opc[k];
+            fallback_dummy.pc[k]  = g_fallback_ring_pc[k];
+        }
+        fallback_dummy.idx = g_fallback_ring_idx;
+        *opc = fallback_dummy.opc; *pc = fallback_dummy.pc;
+        *idx = fallback_dummy.idx; *is_global = 1;
+    }
+}
+/* ════ конец B-2019 кольца ════ */
 
 /* Ленивая инициализация TLS: thread-init не вызывается для главного
  * потока (он уже под DR до регистрации события), поэтому первый
@@ -116,6 +187,12 @@ void pass_ensure_tls(void *dc)
     drmgr_set_tls_field(dc, g_tls_idx_raw,
                         (uint8_t *)raw_base + g_tls_raw_off);
     drmgr_set_tls_field(dc, g_tls_idx_buf, buf);
+    /* B-2019: per-thread кольцо generic-опов; первая нить = главная */
+    diag_ring_t *ring = (diag_ring_t *)dr_thread_alloc(dc, sizeof(diag_ring_t));
+    memset(ring, 0, sizeof(*ring));
+    drmgr_set_tls_field(dc, g_tls_idx_ring, ring);
+    if (g_main_ring == NULL)
+        g_main_ring = ring;
 }
 
 static void pass_thread_init(void *dc)
@@ -128,6 +205,11 @@ static void pass_thread_exit(void *dc)
     uint8_t *buf = (uint8_t *)drmgr_get_tls_field(dc, g_tls_idx_buf);
     if (buf != NULL)
         dr_thread_free(dc, buf, BUF_SIZE);
+    /* B-2019: кольцо НЕ освобождаем — DR вызывает thread-exit РАНЬШЕ
+     * exit-события, и dr_thread_free затирает первые 8 байт блока
+     * (free-list заголовок): exit-дамп читал opc[0..1]=0 при живых
+     * pcs (натурный репрод t_flags). Утечка одного кольца (540Б) на
+     * нить до конца процесса — дешевле, чем UAF-дамп.              */
 }
 
 static const char *opc_name(int opc)
@@ -179,6 +261,9 @@ static void pass_exit(void)
     /* B-2016: последние generic-опы — если процесс умер без итогов
      * (fastfail), у пользователя не будет и этой строки; здесь она для
      * живых прогонов (быстрая видимость хвоста эмуляции). */
+    /* B-2019: dc=NULL → кольцо = последнее активное (g_last_active):
+     * DR на exit-событии даёт dcontext, отличный от execution — ноты
+     * уходили в другое кольцо и exit-дамп печатал пустоту.          */
     pass_diag_dump("exit", NULL);
     /* B-2012: топ-10 статических перезаписей per-opc (бисект inline-пути) */
     if (static_total > 0) {
@@ -259,7 +344,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2018 (v0.2.8)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2019 (v0.2.9)\n");
 
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));
@@ -301,6 +386,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_init();
     g_tls_idx_raw = drmgr_register_tls_field();
     g_tls_idx_buf = drmgr_register_tls_field();
+    g_tls_idx_ring = drmgr_register_tls_field(); /* B-2019: кольцо diag */
     uint align = 16;
     if (!dr_raw_tls_calloc(&g_tls_seg, &g_tls_raw_off,
                            RAW_SIZE / 8, align)) {
@@ -329,6 +415,18 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     /* B-2013: безусловно — модуль содержит не только diag-трейсер
      * (-strace), но и постоянный фикс close_range (см. strace.c) */
     pass_strace_init();
+
+#ifdef WINDOWS
+    /* B-2019: точечные зонды аллокатора bun (drwrap по RVA стандартной
+     * сборки 1.4.5). Авто = вместе с -strace; форс -probealloc / гейт
+     * -noprobealloc. Тело pass_probe_install: только Windows.        */
+    {
+        extern void pass_probe_install(void);
+        int on = (g_probe_alloc < 0) ? (g_strace ? 1 : 0) : g_probe_alloc;
+        if (on)
+            pass_probe_install();
+    }
+#endif
 
 #ifdef WINDOWS
     /* B-2015: modmap после parse_options (нужен g_cfg.verbose) */

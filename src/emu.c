@@ -2236,45 +2236,47 @@ int emu_generic(emu_desc_t *d)
  * syscall-событии (strace.c: NtWriteFile/NtDeviceIoControlFile с текстом
  * «memory allocation of» — пишется ДО fastfail, ловится в user-mode). */
 #define GENERIC_RING_N 32
-static int          g_generic_ring[GENERIC_RING_N];
-static app_pc       g_generic_pc_ring[GENERIC_RING_N]; /* B-2017: app-PC каждого опа —
-        * по дампу модуль+RVA сразу указывает функцию-виновника (simdutf?
-        * mimalloc? JSC?) — без этого кольцо опкодов не привязать к коду */
-static volatile unsigned g_generic_ring_idx;
+/* B-2019: хранение переезжает в pass.c (per-thread TLS) — глобальное
+ * кольцо B-2016/B-2018 перемешивало опы всех нитей (в логе B-2018
+ * паника основного потока печаталась вперемешку с NtDeviceIoControlFile
+ * watcher-потока, и последние generic-опы принадлежали ДРУГОЙ нити).
+ * pass_diag_dump печатает теперь ТОЛЬКО кольцо текущей (паникующей)
+ * нити — глобальная статистика top generic осталась общей.          */
 
-void pass_generic_ring_note(int opc, app_pc pc)
-{
-    unsigned i = g_generic_ring_idx++ & (GENERIC_RING_N - 1);
-    g_generic_ring[i]    = opc;
-    g_generic_pc_ring[i] = pc;
-}
+void pass_generic_ring_note(int opc, app_pc pc);   /* реализация в pass.c */
 
 /* дамп «последнее состояние» + регистры текущего потока. why — причина
  * (OOM/UD/EXIT); dc может быть NULL (печать без регистров).          */
 void pass_diag_dump(const char *why, void *dc)
 {
-    unsigned base = g_generic_ring_idx & (GENERIC_RING_N - 1);
-    dr_fprintf(STDERR, "[P.A.S.S.][DIAG] %s — последние generic-опы:\n", why);
+    /* B-2019: кольцо текущей нити (fallback — общее, если TLS ещё нет) */
+    int    *ring_opc;
+    app_pc *ring_pc;
+    unsigned idx, ring_n;
+    pass_diag_ring_get(dc, &ring_opc, &ring_pc, &idx, &ring_n);
+    unsigned base = idx & (GENERIC_RING_N - 1);
+    dr_fprintf(STDERR, "[P.A.S.S.][DIAG] %s — последние generic-опы%s:\n", why,
+               ring_n == 0 ? "" : " (общее кольцо)");
     /* хронологический порядок: от старого к новому */
-    unsigned n = (g_generic_ring_idx < GENERIC_RING_N) ? g_generic_ring_idx
-                                                       : GENERIC_RING_N;
+    unsigned n = (idx < GENERIC_RING_N) ? idx : GENERIC_RING_N;
     for (unsigned k = 0; k < n; k++) {
         unsigned i = (base + GENERIC_RING_N - n + k) & (GENERIC_RING_N - 1);
         dr_fprintf(STDERR, " %s", (k % 4 == 0) ? "  " : "");
         /* B-2017: печатаем модуль+RVA — дамп сразу привязан к коду */
-        app_pc pc = g_generic_pc_ring[i];
+        app_pc pc = ring_pc[i];
         module_data_t *md = (pc != NULL) ? dr_lookup_module(pc) : NULL;
         if (md != NULL) {
             const char *nm = dr_module_preferred_name(md);
-            dr_fprintf(STDERR, "op#%d@%s+0x%08x", g_generic_ring[i],
+            dr_fprintf(STDERR, "op#%d@%s+0x%08x", ring_opc[i],
                        (nm != NULL) ? nm : "?",
                        (unsigned)(pc - md->start));
             dr_free_module_data(md);
         } else {
-            dr_fprintf(STDERR, "op#%d@%p", g_generic_ring[i], pc);
+            dr_fprintf(STDERR, "op#%d@%p", ring_opc[i], pc);
         }
     }
     dr_fprintf(STDERR, "\n");
+    (void)ring_n;
     /* топ-10 по счётчикам */
     {
         int taken[10] = { 0 };
