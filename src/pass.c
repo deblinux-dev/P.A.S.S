@@ -4,6 +4,13 @@
 #include "pass.h"
 #include <stdlib.h>
 
+/* B-2022: прямой патч опций mimalloc в памяти bun (pass_b2022.c).
+ * Вызывается СРАЗУ при разборе опций (см. parse_options) — клиент
+ * инициализируется до CRT-старта приложения, патч гарантированно
+ * раньше первого malloc; работает независимо от env и глушения
+ * вывода writer'а mimalloc. */
+extern void pass_b2022_mifix(const char *spec);
+
 /* ── профиль → human-readable сводка ── */
 static void print_banner(void)
 {
@@ -11,7 +18,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.2.9            ║\n"
+        "  ║              Substitution  v0.3.2            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -82,6 +89,11 @@ static void parse_options(int argc, const char *argv[])
             }
         } else if (strcmp(a, "-strace") == 0) {
             g_strace = 1;
+        } else if (strncmp(a, "-mifix=", 7) == 0) {
+            /* B-2022: патч опций mimalloc СРАЗУ — до любой прочей
+             * инициализации. Один токен без пробелов (лаунчер
+             * передаёт кавыченный аргумент как есть).              */
+            pass_b2022_mifix(a + 7);
         } else if (strcmp(a, "-probealloc") == 0) {
             g_probe_alloc = 1;
         } else if (strcmp(a, "-noprobealloc") == 0) {
@@ -344,7 +356,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2020 (v0.3.0-diag)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2022 (v0.3.2-diag)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);

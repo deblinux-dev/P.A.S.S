@@ -49,7 +49,8 @@
 
 #define B2_RING_MAX     128
 #define B2_PC_MAX       8
-#define B2_PROBE_MAX    16
+/* B-2022: 9 зондов B-2019 + 8 барьер-зондов B-2022 = 17 > 16 */
+#define B2_PROBE_MAX    32
 
 typedef struct {
     uint32_t opc;

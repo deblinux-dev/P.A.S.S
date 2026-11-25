@@ -38,6 +38,19 @@ extern void pass_b2020_seg_dump(uint64_t heap_ptr, uint64_t seg_base,
                                 uint64_t commit_addr);
 static uint64_t g_b2_last_seg = 0;   /* база сегмента из зонда findpg */
 
+/* B-2022: барьер-зонды mimalloc (pass_b2022.c): 4 ветки отказа внутри
+ * mi_arenas_page_alloc_fresh + 4 входа (pagereg/submap/osalloc/oscommit).
+ * Точки mid-function — бранч-таргеты и пост-коллы => начала BB DR,
+ * поэтому drwrap-чистый вызов срабатывает; post-колбэк осмыслен только
+ * для настоящих входов ([rsp] в середине функции — не ret-адрес). */
+extern int          pass_b2022_probe_count(void);
+extern const char *pass_b2022_probe_tag(int i);
+extern unsigned long pass_b2022_probe_rva(int i);
+#define B2P_MAX        8
+#define B2P_PRINT_CAP  32   /* строк печати на барьер-зонд */
+#define B2P_NULL_CAP   24   /* строк "-> NULL" на входовой зонд */
+#define BUN145_TIMESTAMP 0x6afea993ull  /* TimeDateStamp bun 1.4.5 std */
+
 typedef struct {
     int         rva;
     const char *name;
@@ -64,6 +77,11 @@ static const probe_ent_t g_probe_rvas[] = {
 static volatile int g_probe_calls[PROBE_N];
 static volatile int g_probe_printed[PROBE_N];
 static volatile int g_probe_nulls[PROBE_N];
+
+/* B-2022: счётчики/капы барьер-зондов (размер фикс. B2P_MAX) */
+static volatile int g_b2p_calls[B2P_MAX];
+static volatile int g_b2p_printed[B2P_MAX];
+static volatile int g_b2p_nulls[B2P_MAX];
 
 /* Дамп состояния heap-структуры аллокатора (см. поля из анализа):
  *  +0x410 cur page, +0x430 avail, +0x438/0x440 хвосты, +0x530 счётчик
@@ -182,6 +200,86 @@ static const post_cb_t g_post[PROBE_N] = {
     post_pageget, post_pagemake, post_segget,
     post_findpg, post_claim, post_scan };
 
+/* B-2022: pre-колбэк барьер-зонда — печать rcx/rdx/r8/r9 + PRB-rawargs.
+ * pass_b2020_prb под тем же капом печати (иначе горячие osalloc/oscommit
+ * зальют и лог, и следующий вывод).
+ * ret для mid-function точек = [rsp] (верх стека, НЕ ret-адрес) — при
+ * разборе лога учитывать; для *-enter — настоящий ret-адрес.        */
+static void b2p_pre(void *wrapcxt, void **user_data, int idx)
+{
+    dr_mcontext_t *mc;
+    if (wrapcxt == NULL || idx < 0 || idx >= B2P_MAX)
+        return;
+    mc = drwrap_get_mcontext(wrapcxt);
+    if (mc == NULL)
+        return;
+    *user_data = (void *)(ptr_uint_t)mc->rcx;
+    if (dr_atomic_add32_return_sum((volatile int *)&g_b2p_printed[idx], 1)
+        <= B2P_PRINT_CAP) {
+        const char *tag = pass_b2022_probe_tag(idx);
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][PROBE2] %s(rcx=" PIFX " rdx=" PIFX
+                   " r8=" PIFX " r9=" PIFX ")\n",
+                   tag,
+                   (ptr_uint_t)mc->rcx, (ptr_uint_t)mc->rdx,
+                   (ptr_uint_t)mc->r8,  (ptr_uint_t)mc->r9);
+        pass_b2020_prb(tag,
+                       (uint64_t)(uintptr_t)mc->rcx,
+                       (uint64_t)(uintptr_t)mc->rdx,
+                       (uint64_t)(uintptr_t)mc->r8,
+                       (uint64_t)(uintptr_t)mc->r9,
+                       (uint64_t)(uintptr_t)mc->xsp);
+    }
+}
+
+/* B-2022: post только для *-enter-зондов: ret==0 (NULL/false) —
+ * решающий сигнал (osalloc/oscommit/pagereg/submap отвергли). */
+static void b2p_post(void *wrapcxt, void *user_data, int idx)
+{
+    ptr_int_t ret;
+    int nulls;
+    if (wrapcxt == NULL || idx < 0 || idx >= B2P_MAX)
+        return;
+    ret = drwrap_get_retval(wrapcxt);
+    if (ret != 0)
+        return;
+    nulls = g_b2p_nulls[idx];
+    if (nulls >= B2P_NULL_CAP)
+        return;
+    dr_atomic_add32_return_sum((volatile int *)&g_b2p_nulls[idx], 1);
+    dr_fprintf(STDERR,
+               "[P.A.S.S.][PROBE2] %s -> NULL/false (вызов #%d, отказ #%d)\n",
+               pass_b2022_probe_tag(idx),
+               g_b2p_calls[idx], nulls + 1);
+}
+
+static void b2p_count(void *wrapcxt, void **user_data, int idx)
+{
+    if (wrapcxt != NULL && idx >= 0 && idx < B2P_MAX)
+        g_b2p_calls[idx]++;
+    (void)user_data;
+}
+
+/* Генерация пар cb на каждый барьер-зонд (drwrap не сообщает индекс). */
+#define B2P_CBS(i)                                                  \
+    static void pre2_##i(void *w, void **ud)                       \
+    { b2p_count(w, ud, (i)); b2p_pre(w, ud, (i)); }                \
+    static void post2_##i(void *w, void *ud) { b2p_post(w, ud, (i)); }
+B2P_CBS(0)
+B2P_CBS(1)
+B2P_CBS(2)
+B2P_CBS(3)
+B2P_CBS(4)
+B2P_CBS(5)
+B2P_CBS(6)
+B2P_CBS(7)
+static const pre_cb_t g_pre2[B2P_MAX] = {
+    pre2_0, pre2_1, pre2_2, pre2_3,
+    pre2_4, pre2_5, pre2_6, pre2_7 };
+static const post_cb_t g_post2[B2P_MAX] = {
+    post2_0, post2_1, post2_2, post2_3,
+    post2_4, post2_5, post2_6, post2_7 };
+
 /* Отпечаток сборки: SizeOfImage стандартной bun-windows-x64 1.4.5. */
 #define BUN145_SIZEOF_IMAGE 0x6fef000ull
 
@@ -216,6 +314,34 @@ static void probe_install_for(module_data_t *md)
     dr_fprintf(STDERR,
                "[P.A.S.S.] probe-alloc: %u/%u зондов установлено (B-2019)\n",
                n_ok, (unsigned)PROBE_N);
+
+    /* B-2022: 8 барьер-зондов mimalloc — только при совпадении И
+     * SizeOfImage, И TimeDateStamp: точки сидят ВНУТРИ функций
+     * (бранч-таргеты/пост-коллы), привязка жёстче входовой.       */
+    {
+        int cnt = pass_b2022_probe_count();
+        unsigned n2 = 0, n2_ok = 0;
+        if (ts == (unsigned)BUN145_TIMESTAMP && cnt > 0 && cnt <= B2P_MAX) {
+            for (int k = 0; k < cnt; k++) {
+                app_pc fn = md->start + (ptr_uint_t)pass_b2022_probe_rva(k);
+                const char *tag = pass_b2022_probe_tag(k);
+                bool is_entry = strstr(tag, "-enter") != NULL;
+                pass_b2020_probe_addr(tag, (uint64_t)(uintptr_t)fn);
+                if (drwrap_wrap(fn, g_pre2[k], is_entry ? g_post2[k] : NULL))
+                    n2_ok++;
+                n2++;
+            }
+        } else if (cnt > 0) {
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] probe-alloc: барьер-зонды B-2022 SKIPPED"
+                       " — TimeDateStamp 0x%x != 0x%llx\n",
+                       ts, BUN145_TIMESTAMP);
+        }
+        if (n2 > 0)
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] probe-alloc: %u/%u барьер-зондов mimalloc"
+                       " установлено (B-2022)\n", n2_ok, n2);
+    }
 }
 
 void pass_probe_install(void)
