@@ -12,10 +12,18 @@
  *     по RVA 0x69B7860: count=1, capacity=0x38 (56 байт — только
  *     заголовок; pre-seeded субмапы в [0/2/3/5] недостижимы, т.к.
  *     count=1 отсекает всё, кроме top_idx 0).
- *  2. Динамическая карта (576 КиБ, VA до 2^47) создаётся ТОЛЬКО в
- *     _mi_process_init (0x1320) -> call 0x2500 (0x16A6). Под
- *     P.A.S.S. эта цепочка не доходит до аллокации карты (0x268D):
- *     в strace нет osalloc 0x90000, oscommit для карты не звался.
+ *  2. ВАЖНО (уточнение по логам CI B-2023): mi_init выполняется на
+ *     ФАЗЕ ЛОАДЕРА, ДО инициализации DR-клиента (диагностика в
+ *     баннере: procinit-lock/flag/pmstate уже ==1 в момент
+ *     dr_client_main; старый указатель карты != статическому).
+ *     Поэтому strace не видел osalloc 0x90000 (сисколлы лоадера
+ *     раньше установки strace-хуков), а зонды init-цепочки (PROBE3)
+ *     после старта клиента не срабатывают никогда — оставлены как
+ *     страховка на повторный init.
+ *     Что было СЛОМАНО: созданная mi_init карта под P.A.S.S.
+ *     недостаточна (на машине юзера регистрация top_idx~3190
+ *     отказывала: grow вставал на пред-проверке capacity, коммит
+ *     карты не вызывался; submap-enter не звался).
  *  3. _mi_page_map_register (0xB7A0): top_idx = page_start >> 29
  *     (512 МиБ на запись верхнего уровня). top_idx >= count ->
  *     map_grow (0x120DFD0) -> ПРЕД-ПРОВЕРКА (capacity-0x38)/8 =
@@ -125,9 +133,11 @@ static int b23_verify_bun(uintptr_t base)
 void pass_b2023_pagemap_install(void)
 {
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
-    unsigned long long old_map, old_cnt, old_cap, st1, st2, st3;
+    unsigned long long old_map, old_cnt = 0, old_cap = 0, st1, st2, st3;
+    unsigned long long stat_cnt, stat_cap, migrate_n, k;
     unsigned char* map;
     unsigned long long* q;
+    char quiet = 0;
 
     if (base == 0) { b23_out("[P.A.S.S.][PAGEMAP] главный модуль не найден\r\n"); return; }
     if (!b23_verify_bun(base)) {
@@ -136,12 +146,31 @@ void pass_b2023_pagemap_install(void)
         return;
     }
 
-    old_map = *(volatile unsigned long long*)(base + RVA_MAP_GLOBAL);
-    old_cnt = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x00);
-    old_cap = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x08);
-    st1     = *(volatile unsigned long long*)(base + RVA_G_PROCINIT);
-    st2     = *(volatile unsigned long long*)(base + RVA_G_FLAG);
-    st3     = *(volatile unsigned long long*)(base + RVA_G_PMSTATE);
+    old_map  = *(volatile unsigned long long*)(base + RVA_MAP_GLOBAL);
+    st1      = *(volatile unsigned long long*)(base + RVA_G_PROCINIT);
+    st2      = *(volatile unsigned long long*)(base + RVA_G_FLAG);
+    st3      = *(volatile unsigned long long*)(base + RVA_G_PMSTATE);
+    stat_cnt = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x00);
+    stat_cap = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x08);
+    if (old_map != 0) {
+        old_cnt = *(volatile unsigned long long*)(old_map + 0x00);
+        old_cap = *(volatile unsigned long long*)(old_map + 0x08);
+    }
+
+    /* карта уже достаточна? (покрывает хотя бы 2 ТиБ: 4096 top-записей)
+     * — не трогаем: замена ИЛИ миграция могли бы осиротить страницы,
+     * зарегистрированные лоадером до нас.                              */
+    if (old_map != 0 && old_cnt >= 4096) {
+        quiet = 1;
+        b23_out("[P.A.S.S.][PAGEMAP] B-2023: карта уже достаточна — замена не нужна\r\n");
+        b23_log_ll("  текущая карта: map=", old_map, "");
+        b23_log_ll(" count=", old_cnt, "");
+        b23_log_ll(" cap=", old_cap, "\r\n");
+        b23_log_ll("  диагностика init: procinit-lock=", st1, "");
+        b23_log_ll(" flag=", st2, "");
+        b23_log_ll(" pmstate=", st3, "\r\n");
+        return;
+    }
 
     map = (unsigned char*)VirtualAlloc(NULL, (SIZE_T)PM_ALLOC,
                                        MEM_RESERVE | MEM_COMMIT,
@@ -151,32 +180,48 @@ void pass_b2023_pagemap_install(void)
         return;
     }
     /* VirtualAlloc вернул уже занулённую память: memid/SRWLOCK/
-     * субмапы[1..] остаются нулями — валидное начальное состояние. */
+     * субмапы остаются нулями — валидное начальное состояние. */
     q = (unsigned long long*)map;
     q[0x00 / 8] = PM_COUNT;              /* count                          */
     q[0x08 / 8] = PM_CAP;                /* capacity                       */
-    /* +0x10..0x27: memid (нули); +0x28: SRWLOCK (нули = валидный)     */
     q[0x30 / 8] = (unsigned long long)(uintptr_t)(map + (size_t)PM_CAP);
                                          /* submaps[0] = встроенная субмапа */
-    /* замена указателя (один поток — клиент инъекции, приложение
-     * ещё не стартовало)                                              */
+    /* МИГРАЦИЯ: переносим указатели субмап из старой карты (страницы,
+     * зарегистрированные до нас — например лоадером — остаются
+     * достижимыми). Указатели остаются валидными (память тех карт
+     * никто не освобождал).                                            */
+    migrate_n = 0;
+    if (old_map != 0 && old_cnt > 0) {
+        migrate_n = (old_cnt < PM_COUNT) ? old_cnt : PM_COUNT;
+        for (k = 0; k < migrate_n; k++) {
+            unsigned long long e = *(volatile unsigned long long*)
+                (old_map + 0x30 + k * 8);
+            if (e != 0)
+                *(volatile unsigned long long*)(map + 0x30 + k * 8) = e;
+        }
+    }
     *(volatile unsigned long long*)(base + RVA_MAP_GLOBAL) =
         (unsigned long long)(uintptr_t)map;
 
-    b23_out("[P.A.S.S.][PAGEMAP] B-2023: динамическая page-map карта установлена\r\n");
-    b23_log_ll("  старый указатель: ", old_map, "\r\n");
-    b23_log_ll("  статическая карта: count=", old_cnt, "");
-    b23_log_ll(" cap=", old_cap, " (0x38 = только заголовок, рост невозможен)\r\n");
+    b23_out("[P.A.S.S.][PAGEMAP] B-2023: динамическая page-map карта установлена (замена недостаточной)\r\n");
+    b23_log_ll("  старая карта: map=", old_map, "");
+    b23_log_ll(" count=", old_cnt, "");
+    b23_log_ll(" cap=", old_cap, "\r\n");
+    b23_log_ll("  статическая в .data: count=", stat_cnt, "");
+    b23_log_ll(" cap=", stat_cap, " (0x38 = только заголовок, рост невозможен)\r\n");
     b23_log_ll("  новая: map=", (unsigned long long)(uintptr_t)map, "");
     b23_log_ll(" count=", PM_COUNT, "");
     b23_log_ll(" cap=", PM_CAP, " (VA до ~132 ТиБ, субмапы on-demand)\r\n");
+    b23_log_ll("  мигрировано субмап: ", migrate_n, "\r\n");
     b23_log_ll("  диагностика init: procinit-lock=", st1, "");
     b23_log_ll(" flag=", st2, "");
-    b23_log_ll(" pmstate=", st3, "\r\n");
+    b23_log_ll(" pmstate=", st3, "  (pmstate=1 при статической карте = init отказал и отравил state)\r\n");
 }
 
 /* ------------------------------------------------------------
- * Зонды цепочки init (pre-only; порядок = индексы колбэков probe.c)
+ * Зонды цепочки init (pre-only; порядок = индексы колбэков probe.c).
+ * НЮАНС: mi_init идёт на фазе лоадера ДО client init, поэтому в
+ * нормальном прогоне эти зонды молчат (страховка на повторный init).
  */
 typedef struct {
     unsigned long rva;
