@@ -243,9 +243,15 @@ static void ifp_pre(void *wrapc, void **user_data)
     *user_data = (void *)(ptr_int_t)drwrap_get_arg(wrapc, 0);
 }
 
-static void ifp_post(void *wrapc, void **user_data)
+static void ifp_post(void *wrapc, void *user_data)
 {
-    ptr_int_t code = (ptr_int_t)*user_data;
+    /* drwrap передаёт в post ЗНАЧЕНИЕ, записанное pre в *user_data
+     * (код фичи, сохранённый как указатель) — НЕ указатель на слот.
+     * Прежняя pre-сигнатура (void**) была и типо-ошибкой (gcc 14 на
+     * mingw-раннере: incompatible-pointer-types = error, до этого
+     * молча предупреждение), и рантайм-багом: *user_data читала
+     * память по адресу 6..17 (код фичи как указатель).            */
+    ptr_int_t code = (ptr_int_t)(uintptr_t)user_data;
     ptr_int_t res;
     (void)wrapc;
     if (!g_strace)
