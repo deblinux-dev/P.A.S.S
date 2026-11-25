@@ -46,6 +46,18 @@ static uint64_t g_b2_last_seg = 0;   /* база сегмента из зонд�
 extern int          pass_b2022_probe_count(void);
 extern const char *pass_b2022_probe_tag(int i);
 extern unsigned long pass_b2022_probe_rva(int i);
+
+/* B-2023: зонды цепочки init page-map (pass_b2023.c) — доказать,
+ * где обрывается _mi_process_init -> 0x2500 под P.A.S.S. Точки
+ * редкие (стартовые), pre-only; фикс карты ставится клиентом в
+ * dr_client_main, зонды фиксируют поведение ШТАТНОЙ цепочки. */
+extern int          pass_b2023_probe_count(void);
+extern const char *pass_b2023_probe_tag(int i);
+extern unsigned long pass_b2023_probe_rva(int i);
+#define B3P_MAX        8
+#define B3P_PRINT_CAP  64
+static volatile int g_b3p_calls[B3P_MAX];
+static volatile int g_b3p_printed[B3P_MAX];
 #define B2P_MAX        8
 #define B2P_PRINT_CAP  32   /* строк печати на барьер-зонд */
 #define B2P_NULL_CAP   24   /* строк "-> NULL" на входовой зонд */
@@ -280,6 +292,49 @@ static const post_cb_t g_post2[B2P_MAX] = {
     post2_0, post2_1, post2_2, post2_3,
     post2_4, post2_5, post2_6, post2_7 };
 
+/* B-2023: pre-колбэк зондов init-цепочки (печать rcx/rdx/r8/r9). */
+static void b3p_pre(void *wrapcxt, void **user_data, int idx)
+{
+    dr_mcontext_t *mc;
+    if (wrapcxt == NULL || idx < 0 || idx >= B3P_MAX)
+        return;
+    mc = drwrap_get_mcontext(wrapcxt);
+    if (mc == NULL)
+        return;
+    *user_data = (void *)(ptr_uint_t)mc->rcx;
+    (void)dr_atomic_add32_return_sum((volatile int *)&g_b3p_calls[idx], 1);
+    if (dr_atomic_add32_return_sum((volatile int *)&g_b3p_printed[idx], 1)
+        <= B3P_PRINT_CAP) {
+        const char *tag = pass_b2023_probe_tag(idx);
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][PROBE3] %s(rcx=" PIFX " rdx=" PIFX
+                   " r8=" PIFX " r9=" PIFX ")\n",
+                   tag,
+                   (ptr_uint_t)mc->rcx, (ptr_uint_t)mc->rdx,
+                   (ptr_uint_t)mc->r8,  (ptr_uint_t)mc->r9);
+        pass_b2020_prb(tag,
+                       (uint64_t)(uintptr_t)mc->rcx,
+                       (uint64_t)(uintptr_t)mc->rdx,
+                       (uint64_t)(uintptr_t)mc->r8,
+                       (uint64_t)(uintptr_t)mc->r9,
+                       (uint64_t)(uintptr_t)mc->xsp);
+    }
+}
+
+#define B3P_CBS(i)                                                  \
+    static void pre3_##i(void *w, void **ud) { b3p_pre(w, ud, (i)); }
+B3P_CBS(0)
+B3P_CBS(1)
+B3P_CBS(2)
+B3P_CBS(3)
+B3P_CBS(4)
+B3P_CBS(5)
+B3P_CBS(6)
+B3P_CBS(7)
+static const pre_cb_t g_pre3[B3P_MAX] = {
+    pre3_0, pre3_1, pre3_2, pre3_3,
+    pre3_4, pre3_5, pre3_6, pre3_7 };
+
 /* Отпечаток сборки: SizeOfImage стандартной bun-windows-x64 1.4.5. */
 #define BUN145_SIZEOF_IMAGE 0x6fef000ull
 
@@ -341,6 +396,30 @@ static void probe_install_for(module_data_t *md)
             dr_fprintf(STDERR,
                        "[P.A.S.S.] probe-alloc: %u/%u барьер-зондов mimalloc"
                        " установлено (B-2022)\n", n2_ok, n2);
+    }
+
+    /* B-2023: 8 зондов init-цепочки page-map (procinit -> pm-gate ->
+     * pm-call -> pminit -> claim/lose/alloc/done). Решающие сигналы:
+     * procinit НЕ сработал = _mi_process_init не запускался;
+     * pminit-lose = cmpxchg state проигран (тихий выход БЕЗ карты);
+     * pminit-alloc = аллокация карты достигнута (далее osalloc). */
+    {
+        int cnt3 = pass_b2023_probe_count();
+        unsigned n3 = 0, n3_ok = 0;
+        if (ts == (unsigned)BUN145_TIMESTAMP && cnt3 > 0 && cnt3 <= B3P_MAX) {
+            for (int k = 0; k < cnt3; k++) {
+                app_pc fn = md->start + (ptr_uint_t)pass_b2023_probe_rva(k);
+                const char *tag = pass_b2023_probe_tag(k);
+                pass_b2020_probe_addr(tag, (uint64_t)(uintptr_t)fn);
+                if (drwrap_wrap(fn, g_pre3[k], NULL))
+                    n3_ok++;
+                n3++;
+            }
+        }
+        if (n3 > 0)
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] probe-alloc: %u/%u зондов init-цепочки"
+                       " page-map установлено (B-2023)\n", n3_ok, n3);
     }
 }
 

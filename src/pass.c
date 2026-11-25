@@ -11,6 +11,13 @@
  * вывода writer'а mimalloc. */
 extern void pass_b2022_mifix(const char *spec);
 
+/* B-2023: pagemap-fix (pass_b2023.c) — замена статической page-map
+ * карты bun (count=1/capacity=0x38: регистрация любой страницы с
+ * VA >= 512 МиБ всегда false -> OOM) на динамическую (2 МиБ+64К,
+ * VA до ~132 ТиБ, субмапы on-demand). Ставится в dr_client_main
+ * сразу после parse_options; -nopagemapfix отключает (бисекция). */
+extern void pass_b2023_pagemap_install(void);
+
 /* ── профиль → human-readable сводка ── */
 static void print_banner(void)
 {
@@ -18,7 +25,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.3.2            ║\n"
+        "  ║              Substitution  v0.3.3            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -94,6 +101,8 @@ static void parse_options(int argc, const char *argv[])
              * инициализации. Один токен без пробелов (лаунчер
              * передаёт кавыченный аргумент как есть).              */
             pass_b2022_mifix(a + 7);
+        } else if (strcmp(a, "-nopagemapfix") == 0) {
+            extern int g_no_pagemapfix; g_no_pagemapfix = 1;
         } else if (strcmp(a, "-probealloc") == 0) {
             g_probe_alloc = 1;
         } else if (strcmp(a, "-noprobealloc") == 0) {
@@ -116,6 +125,7 @@ int g_strace = 0;        /* -strace: syscall-трейсер (diag B-2010) */
 int g_special_only = -1; /* -specialonly N: спец-путь только для одного opc */
 int g_probe_alloc = -1;  /* B-2019: -probealloc/-noprobealloc; -1 = авто
                           * (включаются вместе с -strace на Windows)  */
+int g_no_pagemapfix = 0; /* B-2023: -nopagemapfix (бисекция pagemap-fix) */
 
 /* ════ B-2019: per-thread кольцо последних generic-опов ════
  * (переезд из emu.c: глобальное кольцо перемешивало нити — в логе
@@ -356,7 +366,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2022 (v0.3.2-diag)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2023 (v0.3.3-diag)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);
@@ -366,6 +376,15 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     /* СНАЧАЛА опции: гейты (-noveh/-noproxy/-stage) влияют на всё ниже */
     memset(&g_cfg, 0, sizeof(g_cfg));
     parse_options(argc, argv);
+
+#ifdef WINDOWS
+    /* B-2023: pagemap-fix — до первого malloc приложения (клиент
+     * инициализируется на инъекции). Статическая карта bun
+     * (count=1/cap=0x38) не может регистрировать страницы с
+     * VA >= 512 МиБ — корень OOM bun под P.A.S.S. (B-2022 логи). */
+    if (!g_no_pagemapfix)
+        pass_b2023_pagemap_install();
+#endif
 
 #ifdef LINUX
     /* временная диагностика: перехват SIGSEGV для скана стека краша —
