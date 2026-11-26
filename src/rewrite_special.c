@@ -720,7 +720,22 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
      * (RAW_S15) — clang-код держит живые данные в callee-saved xmm15 через
      * всё тело функции (натурный симптом: bun builtin-возвраты = undefined).
      * reg-S2 идёт в RAW_YHI напрямую (носитель не нужен); mem-S2 — через
-     * носитель со спилом. s2==dst (reg): hi приёмника не меняется. */
+     * носитель со спилом.
+     * B-2027: s2 == dst.lo — запись lo ниже ЗАТИРАЕТ s2-регистр до
+     * чтения hi (когда s1 != dst). B-2012 «решал» это пропуском записи
+     * hi (guard s2i != di) — семантически неверно: VINSERTF128/I128
+     * imm=1 ВСЕГДА пишет dst.hi := s2, включая алиас с младшим
+     * регистром приёмника. Натурный корень спина bun 1.4.5: bun_memset
+     * (bun+0x5245730) материализует fill-значение цепочкой
+     * movabs/imul/movq/punpcklqdq/vinsertf128 ymm0,ymm0,xmm0,1; YHI(0)
+     * к тому моменту 0 (vzeroupper) → fill 0xFF индекса ArrayHashMap
+     * писал нули в старшие 16 байт каждого 32Б-стора → SIMD group-scan
+     * не находил ни одного 0xFF → вечный спин (bun+0x1756040/0x2c40070).
+     * Фикс: запись hi идёт ПЕРВОЙ (reg→mem, s2 ещё жив), запись lo —
+     * второй (reg→reg; при s1==dst это no-op). Стейджинг не нужен:
+     * обе пары кодируемы (mem→mem в x86 нет — вариант через RAW_T0
+     * ловится UNENCODABLE на t_vinsfm). Для mem-S2 порядок не менялся:
+     * носитель xmm15 со спилом, память reg-записью не затирается. */
     if (imm == 0) {
         /* lo = S2, hi = S1.hi (mem→mem — только через носитель) */
         pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s2w));
@@ -735,12 +750,11 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
                 dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
         }
     } else {
-        /* lo = S1, hi = S2 */
-        pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s1w));
+        /* hi = S2 — ДО записи lo (B-2027: при s2 == dst.lo запись lo
+         * затёрла бы s2; всегда, включая алиас). lo = S1 — после. */
         if (s2i >= 0) {
-            if (s2i != di)
-                pass_ins(dc, bb, i, INSTR_CREATE_movups(
-                    dc, raw_opnd(RAW_YHI(di), OPSZ_16), s2w));
+            pass_ins(dc, bb, i, INSTR_CREATE_movups(
+                dc, raw_opnd(RAW_YHI(di), OPSZ_16), s2w));
         } else {
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, raw_opnd(RAW_S15, OPSZ_16), opnd_create_reg(X15)));
@@ -751,6 +765,7 @@ static int try_insert128(void *dc, instrlist_t *bb, instr_t *i)
             pass_ins(dc, bb, i, INSTR_CREATE_movups(
                 dc, opnd_create_reg(X15), raw_opnd(RAW_S15, OPSZ_16)));
         }
+        pass_ins(dc, bb, i, INSTR_CREATE_movups(dc, xw, s1w));
     }
     instrlist_remove(bb, i);
     instr_destroy(dc, i);

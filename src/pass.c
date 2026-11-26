@@ -418,7 +418,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2025 (v0.3.5-diag)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2027 (v0.3.6-fix)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);

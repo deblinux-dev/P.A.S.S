@@ -43,7 +43,8 @@ echo "── дифф-тесты (побайтно native vs pass)"
 gcc -O1 -msse4.1 "$DATA/t_r10.c" -o t_r10 || bad "сборка t_r10"
 # §7.4 #111: строковая SSE4.2 и VEX-алиасы (asm и C-варианты)
 # §7.5: скалярные сравнения VCMPSS/SD — 32 предиката, reg+mem формы
-for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp t_pinsv; do
+# B-2027: vinsertf128/i128 с алиасом s2==dst.lo (точная bun-цепочка fill)
+for t in t_lztz t_r10 t_bcast t_s41 t_istr t_vcmp t_pinsv t_vinsfm; do
     [ -x "$t" ] || continue
     "./$t" > n.bin 2>/dev/null
     run_pass -- "./$t" > p.bin 2>/dev/null
