@@ -47,6 +47,16 @@
  * Опции: авто-включение вместе с -strace; -spinwatch <мс> —
  * форсировать (интервал), -nospinwatch — выключить (бисекция).
  *
+ * B-2025 (v0.3.5-diag), по логу B-2024 (internal crash drwrap.dll
+ * +0x5534 в мс после первого suspend/resume-такта):
+ *  - старт-задержка первого такта 5 с (-spinwdelay <мс>, 0 = как
+ *    B-2024) — сэмплер не трогает окно drwrap-интенсивного старта
+ *    (зависание B-2023 наступало позже — наблюдение сохраняется);
+ *  - скан субмап: БЕЗ break по первому NULL (субмапы лежат по окнам
+ *    512 МиБ не по порядку: слот 0 — мигрированный, слот 3749 —
+ *    арена; старый скан недосчитывал nnsub=1 при реальных 2+),
+ *    окно скана 65536 слотов (VA до 32 ТиБ);
+ *
  * ПРАВИЛА АДРЕСНОЙ АРИФМЕТИКИ (как в pass_b2023.c): база
  * модуля — uintptr_t; RVA — unsigned long long. Нарушение =
  * усечение базы и AV внутри клиента.
@@ -71,13 +81,15 @@
 
 #define B24_ROUNDS       40            /* тактов до авто-финиша      */
 #define B24_STACK_Q      10            /* qword стека на поток       */
-#define B24_SUBMAP_SCAN  4096          /* субмап на скан за такт     */
+#define B24_SUBMAP_SCAN  65536         /* субмап на скан за такт     */
+#define B24_DELAY_CHUNK  250           /* мс чанк старт-задержки     */
 
 static uintptr_t g_b24_bun_base = 0;   /* 0 = не bun 1.4.5 std       */
 static uintptr_t g_b24_bun_end  = 0;
 static uintptr_t g_b24_cl_base  = 0;   /* база самой клиентской dll  */
 static unsigned long g_b24_cl_size = 0;
 static volatile long g_b24_ms   = 1000;
+static volatile long g_b24_delay_ms = 5000; /* B-2025: задержка 1-го такта */
 static volatile long g_b24_stop = 0;
 
 /* ── печать: всегда завершённый _snprintf ── */
@@ -135,11 +147,14 @@ static void b24_round(int round)
             cnt = *(unsigned long long*)(mapv + 0x00);
             cap = *(unsigned long long*)(mapv + 0x08);
             scanned = (cnt < B24_SUBMAP_SCAN) ? cnt : B24_SUBMAP_SCAN;
+            /* B-2025: БЕЗ break — субмапы раскиданы по окнам 512 МиБ
+             * не по порядку (лог B-2024: слот 0 мигрированный + слот
+             * 3749 арена, старый скан с break давал nnsub=1).       */
             for (unsigned long long i = 0; i < scanned; i++) {
                 unsigned long long e =
                     *(unsigned long long*)(mapv + 0x30 + i * 8);
-                if (e == 0) break;      /* субмапы выдаются по порядку */
-                nn++;
+                if (e != 0)
+                    nn++;
             }
         }
         b24_pc(b1, sizeof(b1), mapv);
@@ -202,6 +217,16 @@ static void b24_round(int round)
 static void b24_sampler(void *arg)
 {
     (void)arg;
+    /* B-2025: старт-задержка первого такта — не трогать окно
+     * drwrap-интенсивного старта (см. шапку); чанками по 250 мс,
+     * чтобы exit-флаг быстро останавливал поток. */
+    for (long d = 0; d < g_b24_delay_ms && !g_b24_stop;
+         d += B24_DELAY_CHUNK)
+        dr_sleep(B24_DELAY_CHUNK);
+    if (g_b24_stop) return;
+    dr_fprintf(STDERR,
+               "[P.A.S.S.][SPINW] B-2025: сэмплинг начат (задержка старта"
+               " %ldмс)\n", g_b24_delay_ms);
     for (int r = 1; r <= B24_ROUNDS && !g_b24_stop; r++) {
         dr_sleep(g_b24_ms);
         if (g_b24_stop) break;
@@ -216,8 +241,9 @@ static void b24_exit_cb(void) { g_b24_stop = 1; }
 
 /* ------------------------------------------------------------
  * Запуск: dr_client_main (авто с -strace / форс -spinwatch).
+ * B-2025: + delay_ms — старт-задержка первого такта.
  */
-void pass_b2024_spinwatch_start(long interval_ms)
+void pass_b2024_spinwatch_start(long interval_ms, long delay_ms)
 {
     module_data_t *md = dr_get_main_module();
     if (md != NULL) {
@@ -249,6 +275,9 @@ void pass_b2024_spinwatch_start(long interval_ms)
     if (interval_ms < 100)   interval_ms = 100;
     if (interval_ms > 10000) interval_ms = 10000;
     g_b24_ms = interval_ms;
+    if (delay_ms < 0)     delay_ms = 0;
+    if (delay_ms > 60000) delay_ms = 60000;
+    g_b24_delay_ms = delay_ms;
     dr_register_exit_event(b24_exit_cb);
     if (dr_create_client_thread(b24_sampler, NULL))
         dr_fprintf(STDERR,
@@ -264,9 +293,9 @@ void pass_b2024_spinwatch_start(long interval_ms)
 
 #else /* !WINDOWS: заглушка для Linux-сборки CI */
 
-void pass_b2024_spinwatch_start(long interval_ms)
+void pass_b2024_spinwatch_start(long interval_ms, long delay_ms)
 {
-    (void)interval_ms;
+    (void)interval_ms; (void)delay_ms;
 }
 
 #endif /* WINDOWS */

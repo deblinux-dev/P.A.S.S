@@ -372,11 +372,17 @@ static void probe_install_for(module_data_t *md)
 
     /* B-2022: 8 барьер-зондов mimalloc — только при совпадении И
      * SizeOfImage, И TimeDateStamp: точки сидят ВНУТРИ функций
-     * (бранч-таргеты/пост-коллы), привязка жёстче входовой.       */
+     * (бранч-таргеты/пост-коллы), привязка жёстче входовой.
+     * B-2025: -noprobe2 — бисекция краша drwrap.dll+0x5534. */
     {
         int cnt = pass_b2022_probe_count();
         unsigned n2 = 0, n2_ok = 0;
-        if (ts == (unsigned)BUN145_TIMESTAMP && cnt > 0 && cnt <= B2P_MAX) {
+        extern int g_no_probe2;
+        if (g_no_probe2) {
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] probe-alloc: барьер-зонды B-2022 SKIPPED"
+                       " (-noprobe2, бисекция B-2025)\n");
+        } else if (ts == (unsigned)BUN145_TIMESTAMP && cnt > 0 && cnt <= B2P_MAX) {
             for (int k = 0; k < cnt; k++) {
                 app_pc fn = md->start + (ptr_uint_t)pass_b2022_probe_rva(k);
                 const char *tag = pass_b2022_probe_tag(k);
@@ -402,11 +408,17 @@ static void probe_install_for(module_data_t *md)
      * pm-call -> pminit -> claim/lose/alloc/done). Решающие сигналы:
      * procinit НЕ сработал = _mi_process_init не запускался;
      * pminit-lose = cmpxchg state проигран (тихий выход БЕЗ карты);
-     * pminit-alloc = аллокация карты достигнута (далее osalloc). */
+     * pminit-alloc = аллокация карты достигнута (далее osalloc).
+     * B-2025: -noprobe3 — бисекция краша drwrap.dll+0x5534. */
     {
         int cnt3 = pass_b2023_probe_count();
         unsigned n3 = 0, n3_ok = 0;
-        if (ts == (unsigned)BUN145_TIMESTAMP && cnt3 > 0 && cnt3 <= B3P_MAX) {
+        extern int g_no_probe3;
+        if (g_no_probe3) {
+            dr_fprintf(STDERR,
+                       "[P.A.S.S.] probe-alloc: init-зонды B-2023 SKIPPED"
+                       " (-noprobe3, бисекция B-2025)\n");
+        } else if (ts == (unsigned)BUN145_TIMESTAMP && cnt3 > 0 && cnt3 <= B3P_MAX) {
             for (int k = 0; k < cnt3; k++) {
                 app_pc fn = md->start + (ptr_uint_t)pass_b2023_probe_rva(k);
                 const char *tag = pass_b2023_probe_tag(k);

@@ -276,6 +276,12 @@ void pass_ifp_probe_install(void)
     void *a1 = k32 ? (void *)GetProcAddress(k32, "IsProcessorFeaturePresent") : NULL;
     void *a2 = kbase ? (void *)GetProcAddress(kbase, "IsProcessorFeaturePresent") : NULL;
     int n = 0;
+    extern int g_no_ifp; /* B-2025: -noifp (бисекция краша drwrap) */
+    if (g_no_ifp) {
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] IFP-зонд SKIPPED (-noifp, бисекция B-2025)\n");
+        return;
+    }
     if (!pass_drwrap_ensure())
         return;
     if (a1 != NULL && drwrap_wrap(a1, ifp_pre, ifp_post))

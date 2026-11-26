@@ -21,8 +21,11 @@ extern void pass_b2023_pagemap_install(void);
 /* B-2024: SPINWATCH (pass_b2024.c) — клиентский поток, раз в интервал
  * suspend всех потоков + dr_get_mcontext (app-PC уже переведён DR):
  * ловит user-mode спин после NtTerminateThread (лог B-2023 v0.3.3-diag:
- * «зависает бесконечно, потребляя процессор»). Авто = с -strace. */
-extern void pass_b2024_spinwatch_start(long interval_ms);
+ * «зависает бесконечно, потребляя процессор»). Авто = с -strace.
+ * B-2025: старт-задержка первого такта (лог B-2024: internal crash
+ * drwrap.dll+0x5534 в мс после первого suspend/resume; сэмплер больше
+ * не трогает окно drwrap-интенсивного старта — 5 с по умолчанию).  */
+extern void pass_b2024_spinwatch_start(long interval_ms, long delay_ms);
 
 /* ── профиль → human-readable сводка ── */
 static void print_banner(void)
@@ -121,6 +124,21 @@ static void parse_options(int argc, const char *argv[])
             g_spinwatch_ms = atoi(argv[++k]);
         } else if (strcmp(a, "-nospinwatch") == 0) {
             g_no_spinwatch = 1;
+        } else if (strcmp(a, "-spinwdelay") == 0 && k + 1 < argc) {
+            /* B-2025: задержка первого такта SPINW, мс (0 = как B-2024) */
+            g_spinw_delay_ms = atoi(argv[++k]);
+        } else if (strcmp(a, "-noraisehook") == 0) {
+            /* B-2025: бисекция drwrap-замен RaiseException x3 (trap.c) */
+            g_no_raisehook = 1;
+        } else if (strcmp(a, "-noifp") == 0) {
+            /* B-2025: бисекция IFP-зонда x2 (strace.c) */
+            g_no_ifp = 1;
+        } else if (strcmp(a, "-noprobe2") == 0) {
+            /* B-2025: бисекция барьер-зондов B-2022 (probe.c) */
+            g_no_probe2 = 1;
+        } else if (strcmp(a, "-noprobe3") == 0) {
+            /* B-2025: бисекция init-зондов B-2023 (probe.c) */
+            g_no_probe3 = 1;
         } else if (strcmp(a, "-fuzz") == 0) {
             g_do_fuzz = 1;
         }
@@ -139,6 +157,11 @@ int g_special_only = -1; /* -specialonly N: спец-путь только дл�
 int g_probe_alloc = -1;  /* B-2019: -probealloc/-noprobealloc; -1 = авто
                           * (включаются вместе с -strace на Windows)  */
 int g_no_pagemapfix = 0; /* B-2023: -nopagemapfix (бисекция pagemap-fix) */
+int g_no_raisehook = 0;  /* B-2025: -noraisehook (RaiseException-replace x3) */
+int g_no_ifp = 0;        /* B-2025: -noifp (IFP-зонд x2) */
+int g_no_probe2 = 0;     /* B-2025: -noprobe2 (барьер-зонды B-2022) */
+int g_no_probe3 = 0;     /* B-2025: -noprobe3 (init-зонды B-2023) */
+int g_spinw_delay_ms = 5000; /* B-2025: задержка 1-го такта SPINW (0 = B-2024) */
 
 /* ════ B-2019: per-thread кольцо последних generic-опов ════
  * (переезд из emu.c: глобальное кольцо перемешивало нити — в логе
@@ -379,7 +402,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2024 (v0.3.4-diag)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2025 (v0.3.5-diag)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);
@@ -485,7 +508,8 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
                                        : (g_strace ? 1 : 0);
         if (on && !g_no_spinwatch)
             pass_b2024_spinwatch_start(
-                (g_spinwatch_ms > 0) ? g_spinwatch_ms : 1000);
+                (g_spinwatch_ms > 0) ? g_spinwatch_ms : 1000,
+                g_spinw_delay_ms);
     }
 #endif
 

@@ -470,6 +470,14 @@ void pass_raise_hook_install(void)
     HMODULE ntd = GetModuleHandleA("ntdll.dll");
     void *rtl;
     void *a1, *a2, *a3;
+    extern int g_no_raisehook; /* B-2025: -noraisehook (бисекция краша
+                                * drwrap.dll+0x5534 из лога B-2024) */
+    if (g_no_raisehook) {
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] RaiseException hook SKIPPED (-noraisehook,"
+                   " бисекция B-2025)\n");
+        return;
+    }
     if (ntd == NULL)
         return;
     rtl = (void *)GetProcAddress(ntd, "RtlRaiseException");
