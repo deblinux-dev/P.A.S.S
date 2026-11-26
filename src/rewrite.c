@@ -247,6 +247,11 @@ int pass_is_generic_opc(int opc) { return is_generic_opc(opc); }
 
 static int is_generic_opc(int opc)
 {
+    /* diag: -allgeneric — принудительно вести все special-опкоды в generic */
+    {
+        extern int g_all_generic;
+        if (g_all_generic && special_req_ok(opc)) return 1;
+    }
     for (int k = 0; generic_opcs[k] != 0; k++)
         if (generic_opcs[k] == opc) return 1;
     return 0;

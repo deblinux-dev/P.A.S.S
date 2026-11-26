@@ -41,6 +41,10 @@ static void print_banner(void)
         g_cfg.enable_generic, g_cfg.enable_trap);
 }
 
+int g_all_generic;       /* diag: -allgeneric (определение ниже) */
+int g_b26_hooks;         /* diag: -b26hooks (определение ниже)   */
+int g_no_repair;         /* diag: -norepair (определение ниже)   */
+
 static void parse_options(int argc, const char *argv[])
 {
     /* argv[0] — путь клиента, дальше ключи */
@@ -141,9 +145,21 @@ static void parse_options(int argc, const char *argv[])
             g_no_probe3 = 1;
         } else if (strcmp(a, "-fuzz") == 0) {
             g_do_fuzz = 1;
+        } else if (strcmp(a, "-allgeneric") == 0) {
+            /* diag: все special-опкоды -> generic (бисекция спина bun) */
+            g_all_generic = 1;
+        } else if (strcmp(a, "-b26hooks") == 0) {
+            g_b26_hooks = 1;
+        } else if (strcmp(a, "-norepair") == 0) {
+            g_no_repair = 1;
         }
     }
 }
+
+int g_all_generic = 0;   /* diag: -allgeneric */
+int g_b26_hooks = 0;     /* diag: -b26hooks (opt-in, drwrap-365 нестабилен) */
+int g_no_repair = 0;     /* diag: -norepair (SPINW-repair B-2026) */
+
 
 int g_no_veh = 0;        /* -noveh    */
 int g_no_proxy = 0;      /* -noproxy  */
@@ -483,6 +499,13 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     }
     if (g_cfg.enable_trap)
         trap_init();
+    /* B-2026 diag: SPINW-repair включён по умолчанию (см. pass_b2024.c).
+     * drwrap-хуки на 365 scan-функции — ТОЛЬКО по -b26hooks (известная
+     * нестабильность drwrap в этом окружении: B-2024).              */
+    if (g_b26_hooks) {
+        extern void pass_b2026_repair_install(void);
+        pass_b2026_repair_install();
+    }
     /* B-2010 diag: syscall-трейсер (опция -strace) */
     /* B-2013: безусловно — модуль содержит не только diag-трейсер
      * (-strace), но и постоянный фикс close_range (см. strace.c) */

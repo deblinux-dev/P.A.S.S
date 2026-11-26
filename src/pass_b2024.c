@@ -79,7 +79,7 @@
 #define RVA_G_FLAG       0x6AC8370ull  /* FLAG процесса (0/TEB/1)    */
 #define RVA_G_PMSTATE    0x6AC8300ull  /* state init page-map        */
 
-#define B24_ROUNDS       40            /* тактов до авто-финиша      */
+#define B24_ROUNDS       4000          /* тактов до авто-финиша (B-2026: был 40) */
 #define B24_STACK_Q      10            /* qword стека на поток       */
 #define B24_SUBMAP_SCAN  65536         /* субмап на скан за такт     */
 #define B24_DELAY_CHUNK  250           /* мс чанк старт-задержки     */
@@ -91,6 +91,38 @@ static unsigned long g_b24_cl_size = 0;
 static volatile long g_b24_ms   = 1000;
 static volatile long g_b24_delay_ms = 5000; /* B-2025: задержка 1-го такта */
 static volatile long g_b24_stop = 0;
+static uint64_t g_b24_last_pc = 0;     /* diag: PC предыдущего такта */
+static volatile unsigned g_b24_repaired = 0;
+
+/* B-2026: ремонт init-fill индекса (SIMD group scan) — см. pass_b2026.c */
+static void b24_repair_index(uint64_t meta, uint64_t mask)
+{
+    if (meta == 0) return;
+    uint64_t len = mask + 1;
+    if (len < 32 || len > 2048 || (len & (len - 1)) != 0) return;
+    unsigned char buf[2048 + 16];
+    unsigned int nbytes = (unsigned int)(len + 16);
+    if (nbytes > sizeof(buf)) return;
+    if (!dr_safe_read((void*)(uintptr_t)meta, nbytes, buf, NULL)) return;
+    unsigned int half = (unsigned int)(len / 2);
+    int broken = 0;
+    for (unsigned int i = half; i < len; i++)
+        if (buf[i] == 0) { broken = 1; break; }
+    if (!broken) {
+        for (unsigned int i = 0; i < 16; i++)
+            if (buf[len + i] != buf[i] && buf[len + i] == 0) { broken = 1; break; }
+        if (!broken) return;
+    }
+    for (unsigned int i = 0; i < len; i++)
+        if (buf[i] == 0) buf[i] = 0xff;
+    for (unsigned int i = 0; i < 16; i++)
+        buf[len + i] = buf[i];
+    if (!dr_safe_write((void*)(uintptr_t)meta, nbytes, buf, NULL)) return;
+    unsigned n = ++g_b24_repaired;
+    if (n <= 64)
+        dr_fprintf(STDERR, "[P.A.S.S.][SPINW] index repaired #%u meta=%llx len=%llu\n",
+                   n, (unsigned long long)meta, (unsigned long long)len);
+}
 
 /* ── печать: всегда завершённый _snprintf ── */
 static void b24_snp(char* buf, size_t n, const char* fmt, ...)
@@ -193,9 +225,13 @@ static void b24_round(int round)
         b24_pc(b7, sizeof(b7), (uint64_t)(uintptr_t)mc.xsp);
         dr_fprintf(STDERR,
                    "[P.A.S.S.][SPINW] tid=%llu pc=%s w=%d tag=%s"
-                   " rcx=%s rdx=%s rax=%s r8=%s rsp=%s\n",
+                   " rcx=%s rdx=%s rax=%s r8=%s rsp=%s"
+                   " rsi=%llx rdi=%llx rbx=%llx r10=%llx r12=%llx r13=%llx\n",
                    (unsigned long long)tid,
-                   b1, w, b2, b3, b4, b5, b6, b7);
+                   b1, w, b2, b3, b4, b5, b6, b7,
+                   (unsigned long long)mc.xsi, (unsigned long long)mc.xdi,
+                   (unsigned long long)mc.xbx, (unsigned long long)mc.r10,
+                   (unsigned long long)mc.r12, (unsigned long long)mc.r13);
         dr_fprintf(STDERR, "[P.A.S.S.][SPINW]   ст:");
         for (int q = 0; q < B24_STACK_Q; q++) {
             uint64_t v = 0;
@@ -208,6 +244,69 @@ static void b24_round(int round)
             }
         }
         dr_fprintf(STDERR, "\n");
+        /* diag: повтор PC в bun — дамп 256 байт по r10 (метаданные
+         * хеш-групп спин-лупа) и по rsi/rdi.                      */
+        if (g_b24_bun_base != 0 &&
+            (uint64_t)(uintptr_t)mc.pc >= (uint64_t)g_b24_bun_base &&
+            (uint64_t)(uintptr_t)mc.pc < (uint64_t)g_b24_bun_end) {
+            {
+                /* B-2026: ремонт индекса на КАЖДОМ такте в bun (PC
+                 * между тактами гуляет по лупу). Варианты: rcx=map
+                 * (+0x48={meta,mask}), rcx={meta,mask}, rbx/r10.     */
+                uint64_t rcx = (uint64_t)(uintptr_t)mc.xcx;
+                uint64_t g1 = 0;
+                if (dr_safe_read((void*)(uintptr_t)(rcx + 0x48), 8, &g1, NULL) &&
+                    g1 != 0) {
+                    uint64_t a1 = 0, b1 = 0;
+                    if (dr_safe_read((void*)(uintptr_t)g1, 8, &a1, NULL) &&
+                        dr_safe_read((void*)(uintptr_t)(g1 + 8), 8, &b1, NULL))
+                        b24_repair_index(a1, b1);
+                }
+                uint64_t a2 = 0, b2 = 0;
+                if (dr_safe_read((void*)(uintptr_t)rcx, 8, &a2, NULL) &&
+                    dr_safe_read((void*)(uintptr_t)(rcx + 8), 8, &b2, NULL))
+                    b24_repair_index(a2, b2);
+                b24_repair_index((uint64_t)(uintptr_t)mc.xbx,
+                                 (uint64_t)(uintptr_t)mc.r10);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r10,
+                                 (uint64_t)(uintptr_t)mc.xdx);
+                /* repopulate-спин и прочие формы: перебор пар с
+                 * валидацией контента внутри b24_repair_index      */
+                b24_repair_index((uint64_t)(uintptr_t)mc.r12,
+                                 (uint64_t)(uintptr_t)mc.r9);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r13,
+                                 (uint64_t)(uintptr_t)mc.r9);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r14,
+                                 (uint64_t)(uintptr_t)mc.r9);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r13,
+                                 (uint64_t)(uintptr_t)mc.r8);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r14,
+                                 (uint64_t)(uintptr_t)mc.r8);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r12,
+                                 (uint64_t)(uintptr_t)mc.rsi);
+                b24_repair_index((uint64_t)(uintptr_t)mc.r13,
+                                 (uint64_t)(uintptr_t)mc.rsi);
+                static const char* nm[3] = { "r10", "rbx", "rcx" };
+                for (int rd = 0; rd < 3; rd++) {
+                    uint64_t a;
+                    if (rd == 0) a = (uint64_t)(uintptr_t)mc.r10;
+                    else if (rd == 1) a = (uint64_t)(uintptr_t)mc.xbx;
+                    else a = (uint64_t)(uintptr_t)mc.xcx;
+                    if (a == 0) continue;
+                    dr_fprintf(STDERR, "[P.A.S.S.][SPINW]   dump@%s:", nm[rd]);
+                    for (int q = 0; q < 144; q++) {
+                        unsigned char b = 0;
+                        if (dr_safe_read((void*)(uintptr_t)(a + q),
+                                         1, &b, NULL))
+                            dr_fprintf(STDERR, " %02x", b);
+                        else
+                            dr_fprintf(STDERR, " ??");
+                    }
+                    dr_fprintf(STDERR, "\n");
+                }
+            }
+            g_b24_last_pc = (uint64_t)(uintptr_t)mc.pc;
+        }
     }
 
     dr_resume_all_other_threads(dcs, n);
