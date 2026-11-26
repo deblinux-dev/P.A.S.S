@@ -171,7 +171,7 @@ static void probe_post(void *wrapcxt, void *user_data, int idx)
     int nulls;
     if (wrapcxt == NULL || idx < 0 || (unsigned)idx >= PROBE_N)
         return; /* unwind-артефакт drwrap */
-    ret = drwrap_get_retval(wrapcxt);
+    ret = (ptr_int_t)(uintptr_t)drwrap_get_retval(wrapcxt);
     if (ret != 0)
         return;
     nulls = g_probe_nulls[idx];
@@ -252,7 +252,7 @@ static void b2p_post(void *wrapcxt, void *user_data, int idx)
     int nulls;
     if (wrapcxt == NULL || idx < 0 || idx >= B2P_MAX)
         return;
-    ret = drwrap_get_retval(wrapcxt);
+    ret = (ptr_int_t)(uintptr_t)drwrap_get_retval(wrapcxt);
     if (ret != 0)
         return;
     nulls = g_b2p_nulls[idx];
@@ -426,6 +426,7 @@ static void probe_install_for(module_data_t *md)
 void pass_probe_install(void)
 {
     module_data_t *md;
+    extern int pass_drwrap_ensure(void); /* gcc14: не полагаемся на pass.h */
     if (!pass_drwrap_ensure())
         return;
     md = dr_get_main_module();

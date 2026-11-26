@@ -154,7 +154,8 @@ static void b24_round(int round)
 
     for (uint i = 0; i < n; i++) {
         dr_mcontext_t mc;
-        app_pc tag = NULL;
+        void *wtag = NULL;   /* DR 11.91: void** — не app_pc* (gcc14) */
+        app_pc tag;
         int w;
         thread_id_t tid = dr_get_thread_id(dcs[i]);
         memset(&mc, 0, sizeof(mc));
@@ -166,7 +167,8 @@ static void b24_round(int round)
                        (unsigned long long)tid);
             continue;
         }
-        w = (int)dr_where_am_i(dcs[i], mc.pc, &tag);
+        w = (int)dr_where_am_i(dcs[i], mc.pc, &wtag);
+        tag = (app_pc)(uintptr_t)wtag;
         b24_pc(b1, sizeof(b1), (uint64_t)(uintptr_t)mc.pc);
         b24_pc(b2, sizeof(b2), (uint64_t)(uintptr_t)tag);
         b24_pc(b3, sizeof(b3), (uint64_t)(uintptr_t)mc.xcx);
