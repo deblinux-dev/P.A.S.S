@@ -234,6 +234,8 @@ extern int g_no_veh;          /* -noveh: без VEH-логгера (бисекц
 extern int g_no_proxy;        /* -noproxy: без прокси фолта (бисекция)   */
 extern int g_stage_override;  /* -stage N: переопределяет PASS_STAGE     */
 extern int g_sampler_ms;      /* -sampler <мс>: PC-сэмплинг (diag)        */
+extern int g_spinwatch_ms;    /* B-2024: -spinwatch <мс>; -1=авто (с -strace) */
+extern int g_no_spinwatch;    /* B-2024: -nospinwatch (бисекция)          */
 extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */
 extern int g_strace;          /* -strace: трассировка syscall'ов (diag)  */
 extern int g_probe_alloc;     /* -probealloc/-noprobealloc (B-2019); -1=авто */

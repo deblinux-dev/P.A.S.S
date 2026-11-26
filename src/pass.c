@@ -18,6 +18,12 @@ extern void pass_b2022_mifix(const char *spec);
  * сразу после parse_options; -nopagemapfix отключает (бисекция). */
 extern void pass_b2023_pagemap_install(void);
 
+/* B-2024: SPINWATCH (pass_b2024.c) — клиентский поток, раз в интервал
+ * suspend всех потоков + dr_get_mcontext (app-PC уже переведён DR):
+ * ловит user-mode спин после NtTerminateThread (лог B-2023 v0.3.3-diag:
+ * «зависает бесконечно, потребляя процессор»). Авто = с -strace. */
+extern void pass_b2024_spinwatch_start(long interval_ms);
+
 /* ── профиль → human-readable сводка ── */
 static void print_banner(void)
 {
@@ -25,7 +31,7 @@ static void print_banner(void)
         "\n"
         "  ╔══════════════════════════════════════════════╗\n"
         "  ║  P.A.S.S. — Performance Adaptive SIMD        ║\n"
-        "  ║              Substitution  v0.3.3            ║\n"
+        "  ║              Substitution  v0.3.4            ║\n"
         "  ╚══════════════════════════════════════════════╝\n"
         "  target=%s  expose_emulated=%d  inline=%d generic=%d trap=%d\n\n",
         g_cfg.target_name, g_cfg.expose_emulated, g_cfg.enable_inline,
@@ -110,6 +116,11 @@ static void parse_options(int argc, const char *argv[])
         } else if (strcmp(a, "-sampler") == 0 && k + 1 < argc) {
             /* B-2009 diag: PC-сэмплинг (dr_set_itimer), мс */
             g_sampler_ms = atoi(argv[++k]);
+        } else if (strcmp(a, "-spinwatch") == 0 && k + 1 < argc) {
+            /* B-2024 diag: PC-сэмплер спина (Windows), мс */
+            g_spinwatch_ms = atoi(argv[++k]);
+        } else if (strcmp(a, "-nospinwatch") == 0) {
+            g_no_spinwatch = 1;
         } else if (strcmp(a, "-fuzz") == 0) {
             g_do_fuzz = 1;
         }
@@ -120,6 +131,8 @@ int g_no_veh = 0;        /* -noveh    */
 int g_no_proxy = 0;      /* -noproxy  */
 int g_stage_override = -1; /* -stage N */
 int g_sampler_ms = 0;     /* -sampler <мс>: PC-сэмплинг (diag B-2009) */
+int g_spinwatch_ms = -1;  /* B-2024: -spinwatch <мс>; -1 = авто (вкл с -strace) */
+int g_no_spinwatch = 0;   /* B-2024: -nospinwatch (бисекция) */
 int g_do_fuzz = 0;       /* -fuzz: перебор карт рерайтера */
 int g_strace = 0;        /* -strace: syscall-трейсер (diag B-2010) */
 int g_special_only = -1; /* -specialonly N: спец-путь только для одного opc */
@@ -366,7 +379,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2023 (v0.3.3-diag)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2024 (v0.3.4-diag)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);
@@ -461,6 +474,18 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
         int on = (g_probe_alloc < 0) ? (g_strace ? 1 : 0) : g_probe_alloc;
         if (on)
             pass_probe_install();
+    }
+#endif
+
+#ifdef WINDOWS
+    /* B-2024: SPINWATCH — см. pass_b2024.c. Нулевое поведенческое
+     * вмешательство: одно-переменный эксперимент поверх B-2023.1. */
+    {
+        int on = (g_spinwatch_ms >= 0) ? (g_spinwatch_ms > 0)
+                                       : (g_strace ? 1 : 0);
+        if (on && !g_no_spinwatch)
+            pass_b2024_spinwatch_start(
+                (g_spinwatch_ms > 0) ? g_spinwatch_ms : 1000);
     }
 #endif
 
