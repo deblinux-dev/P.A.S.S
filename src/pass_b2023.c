@@ -149,6 +149,90 @@ static int b23_verify_bun(uintptr_t base, int* idx_out)
     return 0;
 }
 
+/* ── B-2034: АВТОДЕТЕКТ pagemap-профиля (любая сборка bun с тем же
+ * лейаутом mimalloc 3.5.x — поддержка максимального количества версий
+ * без перепинновки каждого билда).
+ *
+ * Алгоритм (сверен на bun 1.4.5/1.4.4 — в обоих находит ровно те же
+ * RVA, что и ручной пинн):
+ *   1. В .data ищем сигнатуру статической карты:
+ *      [count=1, capacity=0x38, 0, 0, memid=0x010100000002, 0]
+ *      (memid-qword — сильный дифференциатор ложных срабатываний).
+ *   2. По всему образу ищем qword == ImageBase + rva_static.
+ *      Уникальность ОБЯЗАТЕЛЬНА (в bun 1.4.5/1.4.4 ровно один указатель).
+ *   3. Требования к образу: 64-бит, SizeOfImage >= 16 МиБ и наличие
+ *      секции .data (отсекаем не-bun приложения).
+ *
+ * Возвращает 1 и заполняет *g_out/*s_out; 0 = автодетект не сработал.
+ */
+static int b23_autodetect(uintptr_t base,
+                          unsigned long long* g_out,
+                          unsigned long long* s_out)
+{
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+    const IMAGE_NT_HEADERS* nt;
+    const IMAGE_SECTION_HEADER* sec;
+    unsigned i, nsec;
+    unsigned long long static_va = 0, static_rva = 0, target_va, p;
+    unsigned char* data_start;
+    size_t data_size, off;
+    const unsigned long long SIG[6] = {
+        1ull, 0x38ull, 0ull, 0ull, 0x010100000002ull, 0ull
+    };
+
+    if (dos == NULL || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (const IMAGE_NT_HEADERS*)(base + (uintptr_t)dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    if (nt->OptionalHeader.SizeOfImage < 0x1000000ull) return 0; /* <16 МиБ */
+
+    nsec = nt->FileHeader.NumberOfSections;
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (i = 0; i < nsec; i++) {
+        const char* nm = (const char*)sec[i].Name;
+        if (nm[0] == '.' && nm[1] == 'd' && nm[2] == 'a' && nm[3] == 't' &&
+            nm[4] == 'a' && nm[5] == '\0') {
+            data_start = (unsigned char*)base + sec[i].VirtualAddress;
+            data_size  = sec[i].Misc.VirtualSize;
+            break;
+        }
+    }
+    if (i == nsec || data_size < 64) return 0;
+    if (data_size > 0x4000000ull) data_size = 0x4000000ull; /* до 64 МиБ */
+
+    /* 1) сигнатура статической карты (8-выравненный поиск) */
+    for (off = 0; off + 48 <= data_size; off += 8) {
+        unsigned long long* q = (unsigned long long*)(data_start + off);
+        if (q[0] == SIG[0] && q[1] == SIG[1] && q[2] == SIG[2] &&
+            q[3] == SIG[3] && q[4] == SIG[4] && q[5] == SIG[5]) {
+            if (static_rva != 0) return 0;   /* неуникально — отказ */
+            static_rva = sec[i].VirtualAddress + off;
+        }
+    }
+    if (static_rva == 0) return 0;
+    static_va = base + static_rva;
+
+    /* 2) единственный указатель на статическую карту по всему образу */
+    target_va = static_va;
+    {
+        unsigned long long* q = (unsigned long long*)base;
+        size_t total = (size_t)nt->OptionalHeader.SizeOfImage;
+        int hits = 0;
+        unsigned long long hit_g = 0;
+        for (p = 0; p + 8 <= total; p += 8) {
+            if (q[p / 8] == target_va) {
+                hits++;
+                hit_g = (unsigned long long)((unsigned char*)q + p - (unsigned char*)base);
+                if (hits > 1) return 0;      /* неуникально — отказ */
+            }
+        }
+        if (hits != 1) return 0;
+        *g_out = hit_g;
+    }
+    *s_out = static_rva;
+    return 1;
+}
+
 /* ------------------------------------------------------------
  * PAGEMAP-FIX: установка динамической карты.
  * Вызывается из dr_client_main ПОСЛЕ parse_options, до старта
@@ -165,15 +249,29 @@ void pass_b2023_pagemap_install(void)
 
     int prof = -1;
     const b23_profile* pr;
+    unsigned long long rva_global, rva_static;
+    char label_auto = 0;
     if (base == 0) { b23_out("[P.A.S.S.][PAGEMAP] главный модуль не найден\r\n"); return; }
     if (!b23_verify_bun(base, &prof)) {
-        b23_out("[P.A.S.S.][PAGEMAP] образ не входит в список поддерживаемых "
-                "bun-профилей (SizeOfImage/TimeDateStamp) — фикс не применён\r\n");
-        return;
+        /* B-2034: пинн не подошёл — автодетект по сигнатуре карты
+         * (любая сборка bun с лейаутом mimalloc 3.5.x) */
+        unsigned long long g = 0, s = 0;
+        if (!b23_autodetect(base, &g, &s)) {
+            b23_out("[P.A.S.S.][PAGEMAP] образ не bun с известным лейаутом "
+                    "mimalloc (профили + автодетект не сработали) — фикс не применён\r\n");
+            return;
+        }
+        rva_global = g;
+        rva_static = s;
+        label_auto = 1;
+        pr = NULL;
+    } else {
+        pr = &b23_profiles[prof];
+        rva_global = pr->rva_map_global;
+        rva_static = pr->rva_map_static;
     }
-    pr = &b23_profiles[prof];
 
-    old_map  = *(volatile unsigned long long*)(base + pr->rva_map_global);
+    old_map  = *(volatile unsigned long long*)(base + rva_global);
     st1 = st2 = st3 = 0;
     if (prof == 0) {
         /* диагностика init доступна только для профиля bun 1.4.5 */
@@ -181,8 +279,8 @@ void pass_b2023_pagemap_install(void)
         st2 = *(volatile unsigned long long*)(base + 0x6AC8370ull);
         st3 = *(volatile unsigned long long*)(base + 0x6AC8300ull);
     }
-    stat_cnt = *(volatile unsigned long long*)(base + pr->rva_map_static + 0x00);
-    stat_cap = *(volatile unsigned long long*)(base + pr->rva_map_static + 0x08);
+    stat_cnt = *(volatile unsigned long long*)(base + rva_static + 0x00);
+    stat_cap = *(volatile unsigned long long*)(base + rva_static + 0x08);
     if (old_map != 0) {
         old_cnt = *(volatile unsigned long long*)(old_map + 0x00);
         old_cap = *(volatile unsigned long long*)(old_map + 0x08);
@@ -231,11 +329,20 @@ void pass_b2023_pagemap_install(void)
                 *(volatile unsigned long long*)(map + 0x30 + k * 8) = e;
         }
     }
-    *(volatile unsigned long long*)(base + pr->rva_map_global) =
+    *(volatile unsigned long long*)(base + rva_global) =
         (unsigned long long)(uintptr_t)map;
 
     b23_out("[P.A.S.S.][PAGEMAP] B-2023: динамическая page-map карта установлена (замена недостаточной)\r\n");
-    b23_out("  профиль: "); b23_out(pr->label); b23_out("\r\n");
+    if (label_auto) {
+        char buf[96];
+        int n = _snprintf(buf, sizeof(buf) - 1,
+                          "  профиль: автодетект (MAP_GLOBAL RVA=0x%llx, "
+                          "MAP_STATIC RVA=0x%llx)\r\n", rva_global, rva_static);
+        buf[n >= 0 ? n : 0] = 0;
+        b23_out(buf);
+    } else {
+        b23_out("  профиль: "); b23_out(pr->label); b23_out("\r\n");
+    }
     b23_log_ll("  старая карта: map=", old_map, "");
     b23_log_ll(" count=", old_cnt, "");
     b23_log_ll(" cap=", old_cap, "\r\n");
