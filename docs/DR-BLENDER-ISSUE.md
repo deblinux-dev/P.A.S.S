@@ -73,19 +73,47 @@ to bisect from the outside.
 Happy to run any instrumented build or provide ETW/Process Monitor
 traces on request.
 
+### KEY FACT: the SAME Blender binaries attach fine on Linux
+
+This makes the bug **Windows-only** (Windows early-injection path,
+not the app binary). Control run on Linux x64, same DR cronbuild
+11.91.20763 + a test client (banner = `dr_client_main` reached;
+`generic=N` = emulated-instruction count; host CPU has AVX2, client
+profile core2, so real emulation of SSE4.2/AVX/AVX2 paths is being
+exercised, glibc 2.41):
+
+| Binary (linux-x64 from blender.org) | DR attach | run result |
+|---|---|---|
+| blender-3.6.23 `--version` | OK | prints, exit 0, generic=16476 |
+| blender-4.2.23 `--version` | OK | prints, exit 0, generic=16349 |
+| blender-4.2.23 `-b --python-expr` (full startup) | OK | prints BLENDER-OK + "Blender quit", exit 0, generic=47736 |
+| blender-4.5.17 `--version` (direct) | OK | prints, exit 0, generic=16890 |
+| blender-4.5.17 via `blender-launcher` (shell script) | n/a | DR usage error: Failed to read app ELF headers (expected — script) |
+| blender-5.2.5 `--version` | OK | prints, exit 0, generic=8916 |
+| opencode v1.19.6 linux-x64 (**same bun 1.4.4 engine** as the failing Windows opencode.exe) | OK | `--version` prints, exit 0, generic=2950900, no hang (hangwatch armed, never fired) |
+
+Conclusions:
+1. The Blender 4.2+/opencode ELF layout does NOT block DR in itself.
+2. The failure is in DR's Windows earliest-injection path for these
+   particular binaries (3.6.x still works — something changed in the
+   PE between 3.6 and 4.2).
+
 ### Extra materials
 
 * Full investigation log (section 9 of our report): `[FILL: приложить
   BUN-SPIN-REPORT.md раздел 9 или процитировать]`
-* Works/doesn't-work matrix:
+* Works/doesn't-work matrix (Windows Penryn):
 
-| Blender | DR attaches? |
+| Blender (Windows) | DR attaches? |
 |---|---|
 | 2.79b | yes |
 | 3.6.23 | yes |
 | 4.2.23 | NO (early-init death / 0xC0000142 with follow) |
 | 4.5.17 | suspected NO (launcher: no banner; direct: [FILL]) |
 | 5.2.5 | yes (client loads; separate app-level issue) |
+
+* Linux control (same binaries, same DR): ALL attach (см. выше) —
+  bug is Windows-only.
 
 ---
 
