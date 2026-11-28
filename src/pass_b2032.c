@@ -277,13 +277,16 @@ void pass_excstat_note(unsigned code, app_pc site)
         c->n++;
         /* прогресс-строка: каждое 1000-е исключение кода — живой
          * счётчик при цикле (Blender 5.2.5). Первое 1000-е и далее. */
-        if (c->n % 1000 == 0)
+        if (c->n % 1000 == 0) {
+            char sb[96];
+            b32_pc(sb, sizeof(sb), (uint64_t)(uintptr_t)site);
             dr_fprintf(STDERR,
                        "[P.A.S.S.][EXCSTAT] code 0x%08x (%s): уже %llu"
-                       " исключений — похоже на ЦИКЛ\n",
+                       " исключений — сайт %s — похоже на ЦИКЛ\n",
                        code,
                        exc_code_name(code) != NULL ? exc_code_name(code) : "?",
-                       (unsigned long long)c->n);
+                       (unsigned long long)c->n, sb);
+        }
     }
     for (k = 0; k < EXCSTAT_SITES; k++) {
         if (g_exc_sites[k].code == code && g_exc_sites[k].site == site) {

@@ -495,6 +495,50 @@ static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
 static bool sc_pre(void *drcontext, int sysnum)
 {
     ptr_int_t a0, a1, a2;
+    /* B-2036: диагностика NtSetInformationVirtualMemory (SC 414) —
+     * opencode/bun 1.4.4: вызов class 4 возвращает 0xC00000BB и после
+     * него приложение уходит в спин (NtWaitForDebugEvent-петля).
+     * Дампим все 6 аргументов + VM_INFORMATION[] + стек — ищем
+     * источник параметров и контекст вызова. */
+    if (sysnum == 414 && g_strace) {
+        ptr_int_t p[6];
+        int q;
+        for (q = 0; q < 6; q++)
+            p[q] = dr_syscall_get_param(drcontext, q);
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][SIVM] handle=%p class=%d count=%d "
+                   "info=%p size=%llu flags=%llu\n",
+                   (void *)(uintptr_t)p[0], (int)p[1], (int)p[2],
+                   (void *)(uintptr_t)p[3],
+                   (unsigned long long)p[4], (unsigned long long)p[5]);
+        for (q = 0; q < (int)p[2] && q < 4; q++) {
+            uint64_t e[2];
+            if (p[3] != 0 &&
+                dr_safe_read((void *)(uintptr_t)(p[3] + 16 * q), 16, e, NULL))
+                dr_fprintf(STDERR,
+                           "[P.A.S.S.][SIVM]   info[%d]={base=0x%llx,"
+                           " size=0x%llx}\n",
+                           q, (unsigned long long)e[0],
+                           (unsigned long long)e[1]);
+        }
+        {
+            dr_mcontext_t mc;
+            mc.size = sizeof(mc);
+            mc.flags = DR_MC_CONTROL;
+            if (dr_get_mcontext(drcontext, &mc)) {
+                int k;
+                for (k = 0; k < 8; k++) {
+                    uint64_t v;
+                    if (dr_safe_read((void *)(uintptr_t)(mc.xsp + 8 * k),
+                                     8, &v, NULL))
+                        dr_fprintf(STDERR,
+                                   "[P.A.S.S.][SIVM]   stack[%d]@rsp+%02x"
+                                   " = 0x%llx\n",
+                                   k, 8 * k, (unsigned long long)v);
+                }
+            }
+        }
+    }
     /* B-2032: SCRING — пер-поточное кольцо последних syscall'ов.
      * ДО всех гейтов (фильтр DR 11.91 мёртв — событие приходит на
      * каждый syscall): кольцо само гейтится g_scring_on (активно

@@ -352,6 +352,24 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
             if (exclog && av_logged < 32) {
                 av_logged++;
                 log_av = 1;
+                /* B-2035: регистры при первых AV — ищем источник
+                 * испорченного указателя (Blender 5.2.5: tbbmalloc
+                 * slab-header [slab+0x6c] на несмапированной базе) */
+                if (av_logged <= 6 && exc->mcontext != NULL) {
+                    dr_mcontext_t *mc = exc->mcontext;
+                    dr_fprintf(STDERR,
+                               "[EXC-R] av#%d rax=" PIFX " rbx=" PIFX
+                               " rcx=" PIFX " rdx=" PIFX " rsi=" PIFX
+                               " rdi=" PIFX " rsp=" PIFX " rbp=" PIFX
+                               "\n  r8=" PIFX " r9=" PIFX " r10=" PIFX
+                               " r11=" PIFX " r12=" PIFX " r13=" PIFX
+                               " r14=" PIFX " r15=" PIFX "\n",
+                               av_logged,
+                               mc->xax, mc->xbx, mc->xcx, mc->xdx,
+                               mc->xsi, mc->xdi, mc->xsp, mc->xbp,
+                               mc->r8, mc->r9, mc->r10, mc->r11,
+                               mc->r12, mc->r13, mc->r14, mc->r15);
+                }
             }
         }
         if (exc->record != NULL && (exc_is_diag(code) || log_av))
@@ -388,7 +406,15 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
     }
     if (exc->record == NULL ||
         exc->record->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)
-        return false;
+        /* B-2035: ВСЕ прочие коды (AV, C++-EH 0xE06D7363, ...) — ДОСТАВИТЬ
+         * app-обработчику. Прежний `return false` означал «реисполнить
+         * сбойную инструкцию» по контракту DR (dr_events.h: false = re-execute
+         * using raw_mcontext) — это давало ВЕЧНЫЙ цикл для AV, у которых
+         * есть app-обработчик (Blender 5.2.5: tbbmalloc.dll+0x63b1,
+         * 3M+ реисполнений, CPU 100%), и фатальный unhandled для C++ EH
+         * (exit 0xE06D7363 на старте GUI). Нативная семантика: нет
+         * обработчика — процесс умрёт с тем же кодом, как без PASS. */
+        return true;
     if (g_cfg.verbose) {
         dr_fprintf(STDERR, "[P.A.S.S.] trap (Win): illegal instr @ " PIFX "\n",
                    (ptr_uint_t)exc->mcontext->pc);
@@ -418,20 +444,32 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
  *  (3) pre-syscall NtRaiseException — raiser до syscall НЕ доходит;
  *  (4) fake-success NtTerminateProcess — БЕСКОНЕЧНЫЙ ЦИКЛ: fake → ntdll
  *      переразводит через RtlRaiseStatus → шорт-кат → terminate → fake...
- * Замена ФУНКЦИИ — единственный уровень до всей OS-механики: для кодов-
- * глотаторов просто ВЫХОДИМ (эквивалент тихого __except макроса
- * SetThreadName), для остальных честно реплицируем kernel32!RaiseException
- * через ntdll!RtlRaiseException (сама RaiseException заменена — прямой
- * вызов ntdll избегает рекурсии).                                   */
+  * B-2035: ПЕРЕХОД НА drwrap_wrap + skip. Замена функции (drwrap_replace)
+ * вставляла фрейм pass_client.dll в цепочку раскрутки SEH: RaiseException
+ * реплицировался из НАШЕГО фрейма, и C++ EH (0xE06D7363) не находил
+ * app-обработчиков → фатальный unhandled, exit 0xE06D7363 (Blender 5.2.5
+ * GUI: 4/4 прогонов; нативно это исключение ловится). Теперь: pre-hook —
+ * benign-коды (0x406D1388/ODS) пропускаем через drwrap_skip_call
+ * («проглотить в источнике», та же семантика), а все остальные коды
+ * ДОСТАВЛЯЕМ ОРИГИНАЛУ kernel32!RaiseException — нативная механика
+ * доставки SEH/C++ EH сохраняется целиком.
+ * Хронология недостижимых уровней (CI-циклы, B-2015):
+ *  (1) drmgr exception event — «Note: not called for RaiseException»;
+ *  (2) наш VEH (первый в цепочке, CONTINUE_EXECUTION) — на Server 2025
+ *      доставки НЕ существует вовсе;
+ *  (3) pre-syscall NtRaiseException — raiser до syscall НЕ доходит;
+ *  (4) fake-success NtTerminateProcess — БЕСКОНЕЧНЫЙ ЦИКЛ: fake → ntdll
+ *      переразводит через RtlRaiseStatus → шорт-кат → terminate → fake...
+ *  (5) drwrap_replace — глотает benign ОК, но ломает доставку остальных
+ *      кодов (фрейм клиента в unwind-цепочке) — см. B-2035.          */
 #include "drwrap.h"
 
-static VOID (NTAPI *g_pfn_RtlRaiseException)(PEXCEPTION_RECORD);
-
-static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
-                                           SIZE_T nargs, const ULONG_PTR *args)
+static VOID NTAPI pass_RaiseException_pre(void *wrapcxt, void **user_data)
 {
-    unsigned uc = (unsigned)code;
-    {   /* B-2015 diag: замена жива? печатаем КАЖДЫЙ вызов (кап 30) */
+    unsigned uc;
+    (void)user_data;
+    uc = (unsigned)(uintptr_t)drwrap_get_arg(wrapcxt, 0);
+    {   /* diag: хук жив? печатаем КАЖДЫЙ вызов (кап 30) */
         static volatile long repl_seen;
         if (repl_seen < 30) {
             repl_seen++;
@@ -443,24 +481,14 @@ static VOID NTAPI pass_RaiseException_repl(DWORD code, DWORD flags,
         if (g_n_raise_swallowed < 50)
             dr_fprintf(STDERR,
                        "[P.A.S.S.] swallow RaiseException(0x%08x) — "
-                       "thread-name/ODS (drwrap-replace, B-2015)\n", uc);
+                       "thread-name/ODS (drwrap-skip, B-2035)\n", uc);
         g_n_raise_swallowed++;
-        return; /* тихое продолжение: приложение видит обычный возврат */
+        /* тихое продолжение: приложение видит обычный возврат из
+         * RaiseException, исключение не разводится вовсе */
+        drwrap_skip_call(wrapcxt, NULL, 0);
     }
-    /* честная реплика kernel32!RaiseException для остальных кодов */
-    if (g_pfn_RtlRaiseException != NULL) {
-        EXCEPTION_RECORD rec;
-        SIZE_T n = nargs;
-        memset(&rec, 0, sizeof(rec));
-        rec.ExceptionCode = code;   /* DWORD, NTSTATUS-тип не нужен */
-        rec.ExceptionFlags = flags & EXCEPTION_NONCONTINUABLE;
-        if (n > EXCEPTION_MAXIMUM_PARAMETERS)
-            n = EXCEPTION_MAXIMUM_PARAMETERS;
-        rec.NumberParameters = (ULONG)n;
-        for (SIZE_T i = 0; i < n; i++)
-            rec.ExceptionInformation[i] = args[i];
-        g_pfn_RtlRaiseException(&rec);
-    }
+    /* остальные коды — оригинал kernel32!RaiseException исполняется
+     * честно (нативная доставка SEH / C++ EH) */
 }
 
 /* B-2018: единая точка инициализации drwrap — trap.c (RaiseException) и
@@ -481,11 +509,10 @@ int pass_drwrap_ensure(void)
 
 void pass_raise_hook_install(void)
 {
-    module_data_t *k32md, *ntdmd;
+    module_data_t *k32md;
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
     HMODULE kbase = GetModuleHandleA("kernelbase.dll");
     HMODULE ntd = GetModuleHandleA("ntdll.dll");
-    void *rtl;
     void *a1, *a2, *a3;
     extern int g_no_raisehook; /* B-2025: -noraisehook (бисекция краша
                                 * drwrap.dll+0x5534 из лога B-2024) */
@@ -497,8 +524,6 @@ void pass_raise_hook_install(void)
     }
     if (ntd == NULL)
         return;
-    rtl = (void *)GetProcAddress(ntd, "RtlRaiseException");
-    g_pfn_RtlRaiseException = (VOID (NTAPI *)(PEXCEPTION_RECORD))rtl;
     if (!pass_drwrap_ensure())
         return;
     /* B-2015 diag: регистрируем ВСЕ возможные адреса RaiseException:
@@ -512,24 +537,23 @@ void pass_raise_hook_install(void)
         dr_free_module_data(k32md);
     dr_fprintf(STDERR,
                "[P.A.S.S.] RaiseException addrs: k32=" PIFX " kbase=" PIFX
-               " drpa=" PIFX " rtl=" PIFX "\n",
-               (ptr_uint_t)a1, (ptr_uint_t)a2, (ptr_uint_t)a3, (ptr_uint_t)rtl);
+               " drpa=" PIFX "\n",
+               (ptr_uint_t)a1, (ptr_uint_t)a2, (ptr_uint_t)a3);
     {
         int ok = 0;
-        if (a1 != NULL && drwrap_replace(a1, (void *)pass_RaiseException_repl, false))
+        if (a1 != NULL && drwrap_wrap(a1, pass_RaiseException_pre, NULL))
             ok++;
-        if (a2 != NULL && a2 != a1 &&
-            drwrap_replace(a2, (void *)pass_RaiseException_repl, false))
+        if (a2 != NULL && a2 != a1 && drwrap_wrap(a2, pass_RaiseException_pre, NULL))
             ok++;
         if (a3 != NULL && a3 != a1 && a3 != a2 &&
-            drwrap_replace(a3, (void *)pass_RaiseException_repl, false))
+            drwrap_wrap(a3, pass_RaiseException_pre, NULL))
             ok++;
         if (ok > 0)
             dr_fprintf(STDERR,
-                       "[P.A.S.S.] RaiseException hook installed x%d (B-2015: "
-                       "0x406D1388/ODS глотаются в источнике)\n", ok);
+                       "[P.A.S.S.] RaiseException hook installed x%d (B-2035: "
+                       "0x406D1388/ODS skip в источнике; оригинал — для C++ EH)\n", ok);
         else
-            dr_fprintf(STDERR, "[P.A.S.S.] drwrap_replace(RaiseException) FAILED\n");
+            dr_fprintf(STDERR, "[P.A.S.S.] drwrap_wrap(RaiseException) FAILED\n");
     }
 }
 #endif
