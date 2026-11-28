@@ -141,3 +141,83 @@ Conclusions:
 * CET/IBT (`/CETCOMPAT`) в заголовке 4.2+ — DR 11.91 не поддерживает
   shadow stack на Windows; если флаг стоит, ядро может включить CET
   и инъекция DR ломается. ПРОВЕРИТЬ ПЕРВЫМ (dumpbin).
+
+---
+
+## UPDATE 2026-11-28: Windows forensics (new experiments)
+
+All experiments on the same machine (Win10 19042 x64), release DR
+11.91.20763 unless stated. Failing binary: blender-4.2.23
+`blender.exe`, SHA256 `E2B4D2CCBFB7A33B0BB1ABB1B7A08EBCA3B5A745E73960D5A2DECC0B9579B715`.
+Control: blender-3.6.23 (attaches), notepad.exe (attaches).
+
+### 1. DR IS mapped into the failing child, but its code NEVER runs
+
+* Spawned via `drrun -no_wait -c client.dll -- blender.exe -b`,
+  then read the child memory externally (ReadProcessMemory):
+  `dynamorio.dll` IS mapped at its preferred base `0x71000000`
+  (valid `MZ`+PE headers present).
+* Compare DR's `.data` section (RVA 0x17a000, first 2048 bytes) in
+  memory against the file on disk:
+  * blender.exe 4.2.23 child: **memory == file, byte-identical**
+    (0 modified bytes) -> DR's entry / earliest-init code never
+    executed at all.
+  * notepad.exe child (same drrun, works): **74 bytes differ**
+    (DR initialized and ran).
+* So the injector reports success (no `ERROR:` output, no
+  `TerminateProcess`), maps DR, and the main thread still starts
+  **natively** - the thread-start redirection
+  (`inject_gencode_mapped` + `nt_set_context` at
+  `INJECT_LOCATION_ThreadStart`, or the fallback hook write) does
+  not take effect for this binary.
+
+### 2. Environment and per-PID config are identical to the working case
+
+* Child PEB env (read via NtQueryInformationProcess + PEB walk):
+  the failing blender.exe child and the working notepad.exe child
+  both contain only `DYNAMORIO_CONFIGDIR` - no DYNAMORIO_RUNUNDER /
+  AUTOINJECT / OPTIONS / LOGDIR (these are normally only written by
+  an already-injected parent in the follow-children path).
+* drrun does create the per-PID config file
+  (`blender.exe.<pid>.1config64`) for the failing child.
+
+### 3. Hypotheses tested and DISPROVEN
+
+* **/CETCOMPAT & CFG flags**: full IMAGE_LOAD_CONFIG_DIRECTORY64
+  parse of 3.6.23 vs 4.2.23 - GuardFlags=0, GuardCFCheckFunctionPtr=0,
+  EHContTable=0, VolatileMetadataPtr=0, GlobalFlagsClear/Set=0 in
+  BOTH (identical). Not CETCOMPAT.
+* **TLS callbacks**: both 3.6.23 and 4.2.23 have 2 TLS callbacks;
+  patched a copy of blender.exe with the callback pointers zeroed
+  (full-folder copy, app still starts) -> DR still does not attach.
+  Not TLS.
+* **Late injection**: `drrun -late` on blender 4.2.23 also fails
+  silently (no logs, app native).
+* **Image size**: 4.2.23 (84MB image) is SMALLER than the working
+  bun_new.exe (117MB); 3.6.23 (163MB image) works. Not size.
+* **Path with spaces / MOTW / IFEO mitigations**: excluded (3.6.23
+  in the same path works; no Zone.Identifier; no IFEO keys).
+
+### 4. The one case where DR DOES get inside blender.exe 4.2
+
+Running the DR-injected `blender-launcher.exe` (DR intercepts its
+CreateProcess): the injector log shows the full injection sequence
+into the blender.exe child (`injecting dynamorio.dll into child`,
+DR env vars written, `NtResumeThread` returns 0) - and the child
+dies with `0xC0000142` (STATUS_DLL_INIT_FAILED) without producing
+a single DR log line (debug build). So when the injection DOES
+reach DR's earliest-init inside blender.exe 4.2, DR fails there
+hard; in the direct-spawn case the thread appears to never reach
+DR at all.
+
+### Conclusion
+
+DR's Windows early-injection silently no-ops for blender.exe 4.2+ /
+opencode.exe (bun 1.4.4): DR is mapped at its preferred base but the
+thread-start redirection never executes DR's earliest init, with no
+error surfaced by drinjectlib. The same binaries attach fine on Linux.
+Notably blender.exe 3.6.23 (same path, same machine, near-identical PE
+layout: same sections incl. `.tgtsym`, same data directories, all-zero
+GuardFlags) injects fine, so the trigger is a subtle difference in how
+the injector patches the initial thread (or how the kernel/loader
+treats the patched context) for this specific image.
