@@ -27,6 +27,10 @@ extern void pass_b2023_pagemap_install(void);
  * не трогает окно drwrap-интенсивного старта — 5 с по умолчанию).  */
 extern void pass_b2024_spinwatch_start(long interval_ms, long delay_ms);
 
+/* B-2032/B-2033 (pass_b2032.c): SCRING+HANGWATCH+EXCSTAT —
+ * декларации в pass.h; TLS-поле g_tls_idx_scring регистрируется
+ * ниже вместе с g_tls_idx_ring. */
+
 /* ── профиль → human-readable сводка ── */
 static void print_banner(void)
 {
@@ -159,6 +163,20 @@ static void parse_options(int argc, const char *argv[])
             g_b26_hooks = 1;
         } else if (strcmp(a, "-norepair") == 0) {
             g_no_repair = 1;
+        } else if (strcmp(a, "-hangwatch") == 0 && k + 1 < argc) {
+            /* B-2032: порог тишины syscall-активности, мс (детектор
+             * блокировки OpenCode; авто с -strace) */
+            g_hangwatch_ms = atoi(argv[++k]);
+        } else if (strcmp(a, "-nohangwatch") == 0) {
+            /* B-2032: бисекция наблюдателя */
+            g_no_hangwatch = 1;
+        } else if (strcmp(a, "-hangwdelay") == 0 && k + 1 < argc) {
+            /* B-2032: старт-задержка наблюдателя, мс (окно старта
+             * drwrap/VEH не трогаем — как -spinwdelay) */
+            g_hangw_delay_ms = atoi(argv[++k]);
+        } else if (strcmp(a, "-noexcstats") == 0) {
+            /* B-2033: бисекция статистики исключений */
+            g_no_excstats = 1;
         }
     }
 }
@@ -186,6 +204,10 @@ int g_no_ifpspoof = 0;   /* B-2030: -noifpspoof (IFP-спуф) */
 int g_no_probe2 = 0;     /* B-2025: -noprobe2 (барьер-зонды B-2022) */
 int g_no_probe3 = 0;     /* B-2025: -noprobe3 (init-зонды B-2023) */
 int g_spinw_delay_ms = 5000; /* B-2025: задержка 1-го такта SPINW (0 = B-2024) */
+int g_hangwatch_ms = -1;  /* B-2032: -hangwatch <мс>; -1 = авто (вкл с -strace) */
+int g_no_hangwatch = 0;   /* B-2032: -nohangwatch (бисекция)          */
+int g_hangw_delay_ms = 15000; /* B-2032: задержка старта HANGW, мс       */
+int g_no_excstats = 0;    /* B-2033: -noexcstats (бисекция EXCSTAT)  */
 
 /* ════ B-2019: per-thread кольцо последних generic-опов ════
  * (переезд из emu.c: глобальное кольцо перемешивало нити — в логе
@@ -399,12 +421,17 @@ static void pass_exit(void)
                        g_n_raise_swallowed);
     }
 #endif
+    /* B-2033: EXCSTAT — полная статистика исключений (коды + топ-сайты);
+     * пустая не печатается (конфигурации без исключений не шумят) */
+    if (pass_excstat_total() > 0)
+        pass_excstat_dump();
     dr_fprintf(STDERR, "[P.A.S.S.] ─────────────────────────────────────────\n\n");
 }
 
 DR_EXPORT
 void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
+#ifdef WINDOWS
     /* DBG B-2030: маркер старта клиента в файл PASS_IFP_LOG (GUI-проценты
      * вроде blender.exe теряют STDERR — проверяем живость клиента файлом). */
     {
@@ -419,6 +446,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
             }
         }
     }
+#endif
     dr_fprintf(STDERR, "[P.A.S.S.] client base " PIFX "\n",
                (ptr_uint_t)dr_get_client_base(id));
 #ifdef LINUX
@@ -440,7 +468,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     (void)id;
     dr_set_client_name("P.A.S.S.", "https://example.invalid/pass");
-    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2027 (v0.3.6-fix)\n");
+    dr_fprintf(STDERR, "[P.A.S.S.] build stamp B-2032 (v0.3.7-diag)\n");
     /* B-2020: bitrace tzcnt/popcnt/lzcnt + seg-форензика (pass_b2020.c) */
     {
         extern void pass_b2020_enable(void);
@@ -497,6 +525,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     g_tls_idx_raw = drmgr_register_tls_field();
     g_tls_idx_buf = drmgr_register_tls_field();
     g_tls_idx_ring = drmgr_register_tls_field(); /* B-2019: кольцо diag */
+    g_tls_idx_scring = drmgr_register_tls_field(); /* B-2032: кольцо syscall */
     uint align = 16;
     if (!dr_raw_tls_calloc(&g_tls_seg, &g_tls_raw_off,
                            RAW_SIZE / 8, align)) {
@@ -531,6 +560,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     /* B-2010 diag: syscall-трейсер (опция -strace) */
     /* B-2013: безусловно — модуль содержит не только diag-трейсер
      * (-strace), но и постоянный фикс close_range (см. strace.c) */
+#ifdef WINDOWS
     {
         char mbuf[MAX_PATH];
         DWORD mn = GetEnvironmentVariableA("PASS_IFP_LOG", mbuf, sizeof(mbuf));
@@ -542,6 +572,7 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
             }
         }
     }
+#endif
     pass_strace_init();
 
 #ifdef WINDOWS
@@ -568,6 +599,18 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
                 g_spinw_delay_ms);
     }
 #endif
+
+    /* B-2032: HANGWATCH — детектор ЗАБЛОКИРОВАННОГО процесса
+     * (OpenCode: CPU стоит, не спин; SCRING включается вместе с
+     * наблюдателем). Кросс-платформенный; авто = с -strace. */
+    {
+        int on = (g_hangwatch_ms >= 0) ? (g_hangwatch_ms > 0)
+                                      : (g_strace ? 1 : 0);
+        if (on && !g_no_hangwatch)
+            pass_b2032_hangwatch_start(
+                (g_hangwatch_ms > 0) ? g_hangwatch_ms : 8000,
+                g_hangw_delay_ms);
+    }
 
 #ifdef WINDOWS
     /* B-2015: modmap после parse_options (нужен g_cfg.verbose) */

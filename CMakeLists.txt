@@ -33,6 +33,7 @@ add_library(pass_client SHARED
     src/pass_b2023.c
     src/pass_b2024.c
     src/pass_b2026.c
+    src/pass_b2032.c
     src/sampler.c
     src/fuzz.c
     )

@@ -133,6 +133,8 @@ static const char *nt_name(int sysnum)
             return g_nt_names[k].name;
     return NULL;
 }
+/* B-2032: общий доступ к таблице имён из pass_b2032.c (SCRING-дамп) */
+const char *pass_nt_name(int sysnum) { return nt_name(sysnum); }
 /* аллокационное семейство: post-лог NTSTATUS обязателен для диагноза
  * «memory allocation of N bytes failed» (Zig page_allocator = VirtualAlloc) */
 static bool nt_status_interesting(int sysnum)
@@ -493,6 +495,15 @@ static bool nt_raise_swallow(void *drcontext, ptr_int_t excrec)
 static bool sc_pre(void *drcontext, int sysnum)
 {
     ptr_int_t a0, a1, a2;
+    /* B-2032: SCRING — пер-поточное кольцо последних syscall'ов.
+     * ДО всех гейтов (фильтр DR 11.91 мёртв — событие приходит на
+     * каждый syscall): кольцо само гейтится g_scring_on (активно
+     * только при hangwatch / -strace). Для close_range-фикса ниже
+     * это лишний вызов хелпера — цена одной volatile-проверки. */
+    pass_scring_note_pre(drcontext, sysnum,
+                         dr_syscall_get_param(drcontext, 0),
+                         dr_syscall_get_param(drcontext, 1),
+                         dr_syscall_get_param(drcontext, 2));
 #ifdef LINUX
     a0 = dr_syscall_get_param(drcontext, 0);
     a1 = dr_syscall_get_param(drcontext, 1);
@@ -752,9 +763,12 @@ static bool sc_pre(void *drcontext, int sysnum)
 static void sc_post(void *drcontext, int sysnum)
 {
     ptr_int_t res;
+    /* B-2032: SCRING — фикс возврата syscall'ов (до гейта трейса,
+     * см. note_pre): пара pre/post замыкается даже без -strace */
+    res = dr_syscall_get_result(drcontext);
+    pass_scring_note_post(drcontext, sysnum, res);
     if (!g_strace)
         return; /* гейт см. sc_pre: фильтр DR 11.91.20763 мёртв */
-    res = dr_syscall_get_result(drcontext);
 #ifdef LINUX
     if (sysnum == 1 || sysnum == 20 || sysnum == 231 /*exit_group*/ ||
         sysnum == 232 /*exit*/ || sysnum == 60)

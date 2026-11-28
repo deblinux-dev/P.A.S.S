@@ -602,7 +602,7 @@ jobs:
           # явно; gcc 10+ (-fno-common) даёт второй экземпляр — конфликт.
           CFLAGS="-DNDEBUG -DWINDOWS -DX86_64 -std=gnu11 -O2 -g -fcommon -Isrc -Idynamorio/include -Idynamorio/ext/include -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-popcnt -mno-avx -mno-avx2 -mno-fma -mno-bmi -mno-bmi2 -mno-lzcnt -mno-movbe -mno-aes -mno-pclmul"
           gcc $CFLAGS -c src/cpuid_hook.c -o cpuid_hook.o
-          SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/restore_state.c src/trap.c src/segv_dump.c src/strace.c src/fuzz.c src/probe.c src/pass_b2020.c src/pass_b2022.c src/pass_b2023.c src/pass_b2024.c cpuid_hook.o"
+          SRCS="src/pass.c src/features.c src/emu.c src/rewrite.c src/rewrite_vex.c src/rewrite_special.c src/restore_state.c src/trap.c src/segv_dump.c src/strace.c src/fuzz.c src/probe.c src/pass_b2020.c src/pass_b2022.c src/pass_b2023.c src/pass_b2024.c src/pass_b2026.c src/pass_b2032.c cpuid_hook.o"
           # порядок критичен: GNU ld обрабатывает архивы одним проходом,
           # поэтому drmgr_static (ссылается на dr_*) ДОЛЖЕН стоять раньше
           # dr_gcc.a; --start-group закрывает и обратные ссылки.

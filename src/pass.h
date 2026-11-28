@@ -96,6 +96,7 @@ typedef struct {
 extern pass_config_t g_cfg;
 extern int   g_tls_idx_raw;   /* drmgr TLS: база RAW TLS (segment base)  */
 extern int   g_tls_idx_buf;   /* drmgr TLS: per-thread BUF               */
+extern int   g_tls_idx_scring; /* drmgr TLS: B-2032 SCRING-слот потока   */
 extern reg_id_t g_tls_seg;    /* сегмент RAW TLS (gs на Linux x64)       */
 extern uint  g_tls_raw_off;   /* смещение RAW TLS                        */
 
@@ -237,6 +238,10 @@ extern int g_sampler_ms;      /* -sampler <мс>: PC-сэмплинг (diag)    
 extern int g_spinwatch_ms;    /* B-2024: -spinwatch <мс>; -1=авто (с -strace) */
 extern int g_no_spinwatch;    /* B-2024: -nospinwatch (бисекция)          */
 extern int g_spinw_delay_ms;  /* B-2025: -spinwdelay <мс> (задержка 1-го такта) */
+extern int g_hangwatch_ms;    /* B-2032: -hangwatch <мс>; -1=авто (с -strace) */
+extern int g_no_hangwatch;    /* B-2032: -nohangwatch (бисекция)            */
+extern int g_hangw_delay_ms;  /* B-2032: -hangwdelay <мс> (старт-задержка)   */
+extern int g_no_excstats;     /* B-2033: -noexcstats (бисекция EXCSTAT)    */
 extern int g_no_raisehook;    /* B-2025: -noraisehook (RaiseException-replace x3) */
 extern int g_no_ifp;          /* B-2025: -noifp (IFP-зонд x2)             */
 extern int g_no_ifpspoof;     /* B-2030: -noifpspoof (IFP-спуф)           */
@@ -325,6 +330,23 @@ void pass_diag_stack_scan(void *dc); /* B-2018 (Windows): скан стека
 int  try_rewrite_vex(void *dc, instrlist_t *bb, instr_t *i);
 int  try_rewrite_special(void *dc, instrlist_t *bb, instr_t *i);
 int  special_req_ok(int opc);   /* есть ли вообще обработчик */
+
+/* ───────────────── pass_b2032.c (B-2032/B-2033) ─────────────────
+ * SCRING — пер-поточное кольцо последних syscall'ов (запись из
+ * strace.c sc_pre/sc_post, печать на hangwatch-такте);
+ * HANGWATCH — детектор заблокированного процесса (стоп
+ * syscall-активности = блок в syscall'е либо спин без syscall);
+ * EXCSTAT — статистика исключений по кодам/сайтам (запись из
+ * trap.c exception/signal event). */
+void pass_scring_note_pre(void *drcontext, int sysnum,
+                          ptr_int_t a0, ptr_int_t a1, ptr_int_t a2);
+void pass_scring_note_post(void *drcontext, int sysnum, ptr_int_t res);
+void pass_scring_dump(void);
+uint64_t pass_scring_seq(void);
+void pass_excstat_note(unsigned code, app_pc site);
+void pass_excstat_dump(void);
+uint64_t pass_excstat_total(void);
+void pass_b2032_hangwatch_start(long stall_ms, long delay_ms);
 
 /* ────────────────────────── trap.c ────────────────────────── */
 void trap_init(void);

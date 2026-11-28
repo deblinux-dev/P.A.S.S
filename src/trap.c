@@ -213,6 +213,15 @@ static int trap_emulate(void *dc, dr_mcontext_t *mc)
 #ifdef UNIX
 static dr_signal_action_t pass_signal_event(void *dc, dr_siginfo_t *info)
 {
+    /* B-2033: EXCSTAT — Linux-зеркало Windows-ветки (код = номер
+     * сигнала, сайт = raw PC). Диагностика падений: */
+    if (info->sig == SIGSEGV || info->sig == SIGILL || info->sig == SIGABRT ||
+        info->sig == SIGBUS || info->sig == SIGFPE)
+        pass_excstat_note((unsigned)info->sig,
+                          (info->raw_mcontext_valid && info->raw_mcontext != NULL)
+                              ? info->raw_mcontext->pc
+                              : ((info->mcontext != NULL) ? info->mcontext->pc
+                                                          : NULL));
     /* диагностика падений: транслятированный PC приложения + адрес сбоя */
     if ((info->sig == SIGSEGV || info->sig == SIGABRT || info->sig == SIGBUS) &&
         g_cfg.verbose >= 1) {
@@ -319,6 +328,14 @@ static bool pass_exception_event(void *dc, dr_exception_t *exc)
 {
     if (exc == NULL || exc->mcontext == NULL)
         return false;
+    /* B-2033: EXCSTAT — статистика по кодам и сайтам ДО всех гейтов
+     * (Blender 5.2.5: цикл исключений после MESA/ZINK; AV на
+     * guard-страницах JIT — норма, цикл виден по прогресс-строкам
+     * каждого 1000-го исключения + дампу в итогах/hangwatch). */
+    if (exc->record != NULL)
+        pass_excstat_note((unsigned)exc->record->ExceptionCode,
+                          exc->raw_mcontext != NULL ? exc->raw_mcontext->pc
+                                                    : exc->mcontext->pc);
     {
         static volatile int exclog = -1;
         unsigned int code =
