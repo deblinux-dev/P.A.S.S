@@ -74,6 +74,10 @@ static void parse_options(int argc, const char *argv[])
             extern int g_emu_mask_set_;
             g_emu_mask_override = strtoull(argv[++k], NULL, 16);
             g_emu_mask_set_ = 1;
+        } else if (strcmp(a, "-expose_avx") == 0 && k + 1 < argc) {
+            /* opt-in AVX-семейства в витрине CPUID (см. cpuid_hook.c) */
+            extern int g_expose_avx;
+            g_expose_avx = atoi(argv[++k]);
         } else if (strcmp(a, "-nospoof") == 0) {
             extern int g_no_spoof; g_no_spoof = 1;
         } else if (strcmp(a, "-no256") == 0) {
@@ -137,6 +141,9 @@ static void parse_options(int argc, const char *argv[])
         } else if (strcmp(a, "-noifp") == 0) {
             /* B-2025: бисекция IFP-зонда x2 (strace.c) */
             g_no_ifp = 1;
+        } else if (strcmp(a, "-noifpspoof") == 0) {
+            /* B-2030: гейт спуфа IsProcessorFeaturePresent (strace.c) */
+            g_no_ifpspoof = 1;
         } else if (strcmp(a, "-noprobe2") == 0) {
             /* B-2025: бисекция барьер-зондов B-2022 (probe.c) */
             g_no_probe2 = 1;
@@ -175,6 +182,7 @@ int g_probe_alloc = -1;  /* B-2019: -probealloc/-noprobealloc; -1 = авто
 int g_no_pagemapfix = 0; /* B-2023: -nopagemapfix (бисекция pagemap-fix) */
 int g_no_raisehook = 0;  /* B-2025: -noraisehook (RaiseException-replace x3) */
 int g_no_ifp = 0;        /* B-2025: -noifp (IFP-зонд x2) */
+int g_no_ifpspoof = 0;   /* B-2030: -noifpspoof (IFP-спуф) */
 int g_no_probe2 = 0;     /* B-2025: -noprobe2 (барьер-зонды B-2022) */
 int g_no_probe3 = 0;     /* B-2025: -noprobe3 (init-зонды B-2023) */
 int g_spinw_delay_ms = 5000; /* B-2025: задержка 1-го такта SPINW (0 = B-2024) */
@@ -397,6 +405,20 @@ static void pass_exit(void)
 DR_EXPORT
 void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
+    /* DBG B-2030: маркер старта клиента в файл PASS_IFP_LOG (GUI-проценты
+     * вроде blender.exe теряют STDERR — проверяем живость клиента файлом). */
+    {
+        char mbuf[MAX_PATH];
+        DWORD mn = GetEnvironmentVariableA("PASS_IFP_LOG", mbuf, sizeof(mbuf));
+        if (mn > 0 && mn < sizeof(mbuf)) {
+            file_t mf = dr_open_file(mbuf, DR_FILE_WRITE_APPEND);
+            if (mf != INVALID_FILE) {
+                dr_fprintf(mf, "dr_client_main reached (pid=%d)\n",
+                           dr_get_process_id());
+                dr_close_file(mf);
+            }
+        }
+    }
     dr_fprintf(STDERR, "[P.A.S.S.] client base " PIFX "\n",
                (ptr_uint_t)dr_get_client_base(id));
 #ifdef LINUX
@@ -509,6 +531,17 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
     /* B-2010 diag: syscall-трейсер (опция -strace) */
     /* B-2013: безусловно — модуль содержит не только diag-трейсер
      * (-strace), но и постоянный фикс close_range (см. strace.c) */
+    {
+        char mbuf[MAX_PATH];
+        DWORD mn = GetEnvironmentVariableA("PASS_IFP_LOG", mbuf, sizeof(mbuf));
+        if (mn > 0 && mn < sizeof(mbuf)) {
+            file_t mf = dr_open_file(mbuf, DR_FILE_WRITE_APPEND);
+            if (mf != INVALID_FILE) {
+                dr_fprintf(mf, "before pass_strace_init\n");
+                dr_close_file(mf);
+            }
+        }
+    }
     pass_strace_init();
 
 #ifdef WINDOWS

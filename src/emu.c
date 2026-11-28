@@ -1162,6 +1162,99 @@ static void wide_cvtpd2ps(uint8_t *d, const uint8_t *s)
     }
     memcpy(d, r, 16);
 }
+
+/* ── F16C: half-float (binary16) ──
+ * wide_cvtph2ps: n half → n float32 (точно: denormal/Inf/NaN по SDM).
+ * wide_cvtps2ph: n float32 → n half, rm по imm8[1:0] VCVTPS2PH:
+ *   0=RN (nearest-even), 1=RD (down), 2=RU (up), 3=RZ (zero).       */
+static void wide_cvtph2ps(uint8_t *d, const uint8_t *s, int n)
+{
+    uint8_t r[32];
+    for (int i = 0; i < n; i++) {
+        uint32_t h   = ld16(s + i*2);
+        uint32_t sg  = (h >> 15) & 1, ex = (h >> 10) & 0x1f, mn = h & 0x3ff;
+        uint32_t f;
+        if (ex == 0) {
+            if (mn == 0) {
+                f = sg << 31;                                        /* ±0 */
+            } else {
+                int e = 127 - 15 + 1;
+                while (!(mn & 0x400)) { mn <<= 1; e--; }
+                mn &= 0x3ff;
+                f = (sg << 31) | ((uint32_t)e << 23) | (mn << 13);
+            }
+        } else if (ex == 0x1f) {
+            f = (sg << 31) | 0x7f800000 | (mn << 13);                /* Inf/NaN */
+        } else {
+            f = (sg << 31) | ((ex - 15 + 127) << 23) | (mn << 13);
+        }
+        st32(r + i*4, f);
+    }
+    memcpy(d, r, 32);
+}
+
+/* округление мантиссы (нормальная форма): rem — отброшенные биты */
+static uint32_t f16_round_up(uint32_t rem, uint32_t man, int rm, int neg)
+{
+    switch (rm) {
+    case 3:  return 0;                                              /* RZ */
+    case 1:  return (neg && rem) ? 1 : 0;                           /* RD */
+    case 2:  return (!neg && rem) ? 1 : 0;                          /* RU */
+    default: return (rem > 0x1000 || (rem == 0x1000 && (man & 1))) ? 1 : 0;
+    }
+}
+
+static void wide_cvtps2ph(uint8_t *d, const uint8_t *s, int n, int rm)
+{
+    uint8_t r[16];
+    for (int i = 0; i < n; i++) {
+        uint32_t f = ld32(s + i*4);
+        uint32_t sg = (f >> 16) & 0x8000;                            /* bit15 half */
+        uint32_t e  = (f >> 23) & 0xff, m = f & 0x7fffff;
+        uint32_t h;
+        if (e == 0xff) {
+            h = sg | (m ? 0x7e00 : 0x7c00);                          /* Inf/NaN */
+        } else {
+            int32_t e10 = (int32_t)e - 127 + 15;
+            if (e10 >= 31) {
+                h = sg | 0x7c00;                                     /* overflow → ±Inf */
+            } else if (e10 >= 1) {
+                uint32_t man = m >> 13, rem = m & 0x1fff;
+                man += f16_round_up(rem, man, rm, sg != 0);
+                if (man & 0x800) { man = 0; e10++; }                 /* перенос разряда */
+                h = (e10 >= 31) ? (sg | 0x7c00)
+                                : (sg | ((uint32_t)e10 << 10) | man);
+            } else {
+                /* denormal half / ноль */
+                uint32_t mf = 0x800000 | m;
+                int shift = 14 - e10;                                /* >= 14 */
+                if (shift > 43) {
+                    h = sg;                                          /* → ±0 */
+                } else {
+                    uint32_t man = mf >> shift;
+                    uint32_t rem = (shift < 32) ? (mf & ((1u << shift) - 1)) : mf;
+                    int neg = (sg != 0);
+                    int up;
+                    switch (rm) {
+                    case 3:  up = 0; break;
+                    case 1:  up = (neg && rem) ? 1 : 0; break;
+                    case 2:  up = (!neg && rem) ? 1 : 0; break;
+                    default: {
+                        uint32_t half = 1u << (shift - 1);
+                        up = (rem > half || (rem == half && (man & 1))) ? 1 : 0;
+                        break;
+                    }
+                    }
+                    man += up;
+                    if (man > 0x3ff) man = 0x400;                    /* ровно 2^-14 */
+                    h = sg | (man & 0x7ff);
+                }
+            }
+        }
+        st16(r + i*2, (uint16_t)h);
+    }
+    memcpy(d, r, 16);
+}
 /* маскируемые load/store (vpmaskmovd/q): dst, mem(base+index), mask */
 static int pmask_elems(emu_desc_t *d)
 {
@@ -1181,19 +1274,24 @@ static void pmaskmov_op(estate_t *st, emu_desc_t *d)
      * переносится: у gather индекс — в mem-операнде, у maskmov маска —
      * отдельный регистр) — и store-форма вообще не различалась.
      * vmaskmovps/pd — та же механика движения данных (esz 4/8).       */
-    int esz = (d->opc == OP_vpmaskmovq || d->opc == OP_vmaskmovpd) ? 8 : 4;
-    int n = pmask_elems(d);
+    int esz = (d->opc == OP_vpmaskmovq || d->opc == OP_vmaskmovpd) ? 8 :
+              (d->opc == OP_vmaskmovdqu) ? 1 : 4;
+    int n = (esz == 1) ? 16 : pmask_elems(d);
     int is_store = opnd_is_memory_reference(d->dsts[0]);
     opnd_t mem, mask, data;
     if (is_store) {
         /* store-форма — порядок srcs у DR РАЗНЫЙ в двух семействах
          * (irmodel с различимыми регистрами YMM0=188, YMM1=189):
          *  vpmaskmovd/q: srcs=[data, mask]  (s0=r188, s1=r189)
-         *  vmaskmovps/pd: srcs=[mask, data] (s0=r189, s1=r188) */
+         *  vmaskmovps/pd: srcs=[mask, data] (s0=r189, s1=r188)
+         *  vmaskmovdqu:   srcs=[data];      маска — неявный XMM0  */
         mem  = d->dsts[0];
         if (d->opc == OP_vmaskmovps || d->opc == OP_vmaskmovpd) {
             mask = d->srcs[0];
             data = d->srcs[1];
+        } else if (d->opc == OP_vmaskmovdqu) {
+            data = d->srcs[0];
+            mask = opnd_create_reg(DR_REG_XMM0);
         } else {
             data = d->srcs[0];
             mask = d->srcs[1];
@@ -1224,22 +1322,26 @@ static void pmaskmov_op(estate_t *st, emu_desc_t *d)
 
     if (is_store) {
         for (int i = 0; i < n; i++) {
-            uint64_t m = (esz == 4) ? ld32(mv + i*4) : ld64(mv + i*8);
+            uint64_t m = (esz == 1) ? mv[i]
+                       : (esz == 4) ? ld32(mv + i*4) : ld64(mv + i*8);
             if (!(m >> (esz*8 - 1))) continue;
             byte *a = base + (uint64_t)i * esz;
-            uint64_t w = (esz == 4) ? ld32(dvb + i*4) : ld64(dvb + i*8);
+            uint64_t w = (esz == 1) ? dvb[i]
+                       : (esz == 4) ? ld32(dvb + i*4) : ld64(dvb + i*8);
             emu_safe_write(st, a, &w, esz);
         }
     } else {
         uint8_t r[32];
         memset(r, 0, 32);          /* SDM: незамаскированные = 0 */
         for (int i = 0; i < n; i++) {
-            uint64_t m = (esz == 4) ? ld32(mv + i*4) : ld64(mv + i*8);
+            uint64_t m = (esz == 1) ? mv[i]
+                       : (esz == 4) ? ld32(mv + i*4) : ld64(mv + i*8);
             if (!(m >> (esz*8 - 1))) continue;
             byte *a = base + (uint64_t)i * esz;
             uint64_t v = 0;
             emu_safe_read(st, a, &v, esz);
-            if (esz == 4) st32(r + i*4, (uint32_t)v); else st64(r + i*8, v);
+            if (esz == 1) r[i] = (uint8_t)v;
+            else if (esz == 4) st32(r + i*4, (uint32_t)v); else st64(r + i*8, v);
         }
         memcpy(EX(st, di), r, 16);
         if (d->is_ymm) memcpy(EY(st, di), r + 16, 16);
@@ -3218,7 +3320,9 @@ int emu_generic_impl(emu_desc_t *d)
     /* ── 32-байтные cross-lane ── источники могут быть памятью (BUG FIX:
      * vpermq $i, m256, ymm раньше читал тень по мусорному индексу из
      * opnd_get_reg(mem) → SIGSEGV/тихая порча, см. ARCHITECTURE §6.13) */
-    case OP_vpermq: {
+    case OP_vpermq: case OP_vpermpd: {
+        /* VPERMPD: перестановка qwords по imm — движение данных байт-в-байт
+         * совпадает с VPERMQ (double-разрядность не влияет на биты) */
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t s[32];
         get_block32(&st, d->srcs[0], s);            /* reg или память */
@@ -3227,7 +3331,8 @@ int emu_generic_impl(emu_desc_t *d)
         memcpy(EY(&st, di), s + 16, 16);
         break;
     }
-    case OP_vpermd: {
+    case OP_vpermd: case OP_vpermps: {
+        /* VPERMPS ≡ VPERMD: dst.d[i] = s2.d[idx[i] & 7], 256-битные индексы */
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         uint8_t idxs[32], tab[32];
         get_block32(&st, d->srcs[0], idxs);
@@ -3250,10 +3355,12 @@ int emu_generic_impl(emu_desc_t *d)
     case OP_vcvtps2pd: {
         /* src xmm/m128 16Б → dst ymm 32Б */
         if (d->is_ymm) {
-            uint8_t s16[16];
+            uint8_t s16[16], r[32];
             int di = xmm_idx(opnd_get_reg(d->dsts[0]));
             get_block16(&st, d->srcs[0], s16);      /* reg или память */
-            wide_cvtps2pd(EX(&st, di), s16);
+            wide_cvtps2pd(r, s16);
+            memcpy(EX(&st, di), r, 16);
+            memcpy(EY(&st, di), r + 16, 16);        /* EX — слот 16Б! */
             break;
         }
         /* 128-битная форма: cvtps2pd нативна — сюда не попадаем */
@@ -3262,13 +3369,52 @@ int emu_generic_impl(emu_desc_t *d)
     case OP_vcvtpd2ps: {
         int di = xmm_idx(opnd_get_reg(d->dsts[0]));
         if (d->is_ymm) {
-            uint8_t s[32];
+            uint8_t s[32], r[16];
             get_block32(&st, d->srcs[0], s);        /* reg или память */
-            wide_cvtpd2ps(EX(&st, di), s);
+            wide_cvtpd2ps(r, s);
+            memcpy(EX(&st, di), r, 16);
         } else {
-            uint8_t s16[16];
+            uint8_t s16[16], r[16];
             get_block16(&st, d->srcs[0], s16);
-            wide_cvtpd2ps(EX(&st, di), s16);
+            wide_cvtpd2ps(r, s16);
+            memcpy(EX(&st, di), r, 16);
+        }
+        break;
+    }
+
+    /* ── F16C (§B-2029): half-float конверсии ──
+     * vcvtph2ps: srcs[0]=xmm/m (halves) → dsts[0]=xmm/ymm (floats);
+     * vcvtps2ph: DR-модель dsts[0]=xmm/m, srcs[0]=xmm (floats, всегда
+     * регистр), srcs[1]=imm8 (округление; IR-порядок от Intel-синтаксиса). */
+    case OP_vcvtph2ps: {
+        int di = xmm_idx(opnd_get_reg(d->dsts[0]));
+        int n = d->is_ymm ? 8 : 4;
+        uint8_t s[16], r[32];
+        get_block16(&st, d->srcs[0], s);
+        wide_cvtph2ps(r, s, n);
+        memcpy(EX(&st, di), r, 16);
+        if (d->is_ymm) memcpy(EY(&st, di), r + 16, 16);  /* EX — слот 16Б! */
+        else memset(EY(&st, di), 0, 16);                 /* VEX.128 зануление */
+        break;
+    }
+    case OP_vcvtps2ph: {
+        int di = is_vec_reg(d->dsts[0]) ? xmm_idx(opnd_get_reg(d->dsts[0])) : -1;
+        int n = d->is_ymm ? 8 : 4;
+        uint imm = 0;
+        for (int k = d->nsrc - 1; k >= 0; k--)       /* imm — последний src */
+            if (opnd_is_immed_int(d->srcs[k])) { imm = (uint)opnd_get_immed_int(d->srcs[k]); break; }
+        int si = xmm_idx(opnd_get_reg(d->srcs[0]));
+        uint8_t s[32];
+        memcpy(s, EX(&st, si), 16);
+        if (d->is_ymm) memcpy(s + 16, EY(&st, si), 16);
+        uint8_t rbuf[16];
+        wide_cvtps2ph(rbuf, s, n, (int)(imm & 3));
+        if (di >= 0) {
+            memcpy(EX(&st, di), rbuf, 16);
+            if (!d->is_ymm) memset(EY(&st, di), 0, 16);
+        } else {
+            byte *a = mem_addr(&st, d->dsts[0]);
+            emu_safe_write(&st, a, rbuf, 16);
         }
         break;
     }
@@ -3302,6 +3448,7 @@ int emu_generic_impl(emu_desc_t *d)
      * механика движения данных.                                  */
     case OP_vpmaskmovd: case OP_vpmaskmovq:
     case OP_vmaskmovps: case OP_vmaskmovpd:
+    case OP_vmaskmovdqu:
         pmaskmov_op(&st, d);
         break;
     case OP_vpgatherdd: case OP_vpgatherdq: case OP_vpgatherqd:

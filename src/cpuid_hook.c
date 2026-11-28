@@ -54,18 +54,27 @@ static struct {
 } g_cpuid;
 
 /* Эмулируемые фичи (заявлены в CPUID, если expose_emulated).
- * -emu_mask <hex> переопределяет набор (бисекция: бит k = feat_t k). */
+ * -emu_mask <hex> переопределяет набор (бисекция: бит k = feat_t k).
+ * -expose_avx: opt-in AVX-семейства (AVX/AVX2/FMA/F16C/BMI1/2).
+ *   ПО УМОЛЧАНИЮ ВЫКЛ (B-2028): диспетчеры приложений (simdutf/JSC в bun,
+ *   oven-sh/bun#30613) выбирают AVX2-пути по CPUID и попадают в пока
+ *   недоотлаженные ветки эмуляции; без витрины приложение само падает
+ *   на родные nehalem-пути. Включать, когда эмуляция AVX2 доведена. */
 uint64_t g_emu_mask_override = 0;
 int g_emu_mask_set_ = 0;
+int g_expose_avx = 0; /* -expose_avx 0|1 */
 
 static featset_t emulated_set(void)
 {
     if (g_emu_mask_set_)
         return (featset_t)g_emu_mask_override;
-    return FEAT(F_SSE41) | FEAT(F_SSE42) | FEAT(F_POPCNT) | FEAT(F_AES) |
-           FEAT(F_PCLMUL) | FEAT(F_AVX) | FEAT(F_AVX2) | FEAT(F_FMA) |
-           FEAT(F_BMI1) | FEAT(F_BMI2) | FEAT(F_MOVBE) | FEAT(F_LZCNT) |
-           FEAT(F_F16C);
+    featset_t base = FEAT(F_SSE41) | FEAT(F_SSE42) | FEAT(F_POPCNT) |
+                     FEAT(F_AES) | FEAT(F_PCLMUL) | FEAT(F_MOVBE) |
+                     FEAT(F_LZCNT);
+    if (g_expose_avx)
+        base |= FEAT(F_AVX) | FEAT(F_AVX2) | FEAT(F_FMA) | FEAT(F_F16C) |
+                FEAT(F_BMI1) | FEAT(F_BMI2);
+    return base;
 }
 
 /* Итоговая витрина фич: (host ∩ profile) ∪ (эмулируемые ∧ expose) */

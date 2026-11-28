@@ -292,6 +292,131 @@ void pass_ifp_probe_install(void)
         dr_fprintf(STDERR, "[P.A.S.S.] IFP-зонд установлен x%d (B-2018)\n", n);
 }
 
+/* ── B-2030: спуф IsProcessorFeaturePresent (продолжение B-2018) ──
+ * KUSER_SHARED_DATA заполнен ядром по НАСТОЯЩЕМУ CPU: CPUID-спуф туда
+ * не доходит. Доказано живьём (Penryn): под PASS CPUID видит sse42=1,
+ * а IsProcessorFeaturePresent(38)=FALSE — из-за этого лаунчер Blender
+ * 4.2 показывает диалог «требуется процессор с SSE4.2» и уходит в отказ.
+ * Схема: drwrap_wrap (не replace!) — оригинал отвечает нативно, post
+ * ДОБАВЛЯЕТ TRUE для фич, которые PASS эмулирует (exposed_features()).
+ * Только добавляем: нативные ответы для немапированных кодов (NX,
+ * SLAT, RDWRFSGSBASE…) сохраняются. Коды PF: 13=SSE3, 36=SSSE3,
+ * 37=SSE4.1, 38=SSE4.2, 39=AVX, 40=AVX2, 41=AVX512F, 60=BMI2
+ * (winnt.h 10.0.26100).                                       */
+static unsigned g_ifp_spoof_n;
+
+/* DBG: файловый лог вызовов IFP — включается env PASS_IFP_LOG=<путь>
+ * (GUI-проценты вроде blender.exe сбрасывают std-хендлы, STDERR клиента
+ * до редиректа не доходит — доказано живьём). */
+static file_t g_ifp_logf = INVALID_FILE;
+
+static void pass_ifp_log_open(void)
+{
+    char buf[MAX_PATH];
+    DWORD n;
+    if (g_ifp_logf != INVALID_FILE)
+        return;
+    n = GetEnvironmentVariableA("PASS_IFP_LOG", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+        g_ifp_logf = dr_open_file(buf, DR_FILE_WRITE_OVERWRITE);
+        if (g_ifp_logf != INVALID_FILE)
+            dr_fprintf(g_ifp_logf, "IFP-log open (B-2030 dbg)\n");
+    }
+}
+
+/* drwrap_replace (как B-2015 RaiseException): drwrap_wrap на kernel32
+ * НЕ СТРЕЛЯЕТ (проверено живьём: pre-колбэк не вызывается, ответ OS
+ * не меняется), а replace работает — RaiseException x3 доказан.
+ * Честный ответ берём из ntdll!RtlIsProcessorFeaturePresent — оригинал
+ * (kernel32/kernelbase заменены, прямого вызова в них нет → рекурсии
+ * нет).                                                        */
+static BOOLEAN (WINAPI *g_pfn_RtlIFP)(unsigned long);
+
+static BOOLEAN WINAPI pass_IFP_repl(unsigned long code)
+{
+    BOOLEAN res = FALSE;
+    feat_t f;
+    if (g_pfn_RtlIFP != NULL)
+        res = g_pfn_RtlIFP(code);
+    if (res) {
+        if (g_ifp_logf != INVALID_FILE)
+            dr_fprintf(g_ifp_logf, "IFP(%lu) native=1\n", code);
+        return res;
+    }
+    switch (code) {
+    case 13: f = F_SSE3;  break;
+    case 36: f = F_SSSE3; break;
+    case 37: f = F_SSE41; break;
+    case 38: f = F_SSE42; break;
+    case 39: f = F_AVX;   break;
+    case 40: f = F_AVX2;  break;
+    case 60: f = F_BMI2;  break;
+    default:
+        if (g_ifp_logf != INVALID_FILE)
+            dr_fprintf(g_ifp_logf, "IFP(%lu) native=0 unmapped\n", code);
+        return res;  /* немапированный код — нативный ответ */
+    }
+    if (!has(exposed_features(), f)) {
+        if (g_ifp_logf != INVALID_FILE)
+            dr_fprintf(g_ifp_logf, "IFP(%lu) native=0 not-exposed\n", code);
+        return res; /* PASS это не заявляет — консистентно с CPUID-спуфом */
+    }
+    if (g_ifp_logf != INVALID_FILE)
+        dr_fprintf(g_ifp_logf, "IFP(%lu) native=0 spoofed=1\n", code);
+    if (g_ifp_spoof_n < 30) {
+        g_ifp_spoof_n++;
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.][IFP] spoof IFP(%lu) -> TRUE (exposed, B-2030)\n",
+                   code);
+    }
+    return TRUE;
+}
+
+void pass_ifp_spoof_install(void)
+{
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE kbase = GetModuleHandleA("kernelbase.dll");
+    HMODULE ntd = GetModuleHandleA("ntdll.dll");
+    module_data_t *k32md;
+    void *a1, *a2, *a3;
+    int n = 0;
+    pass_ifp_log_open();
+    if (ntd == NULL)
+        return;
+    g_pfn_RtlIFP = (BOOLEAN (WINAPI *)(unsigned long))
+        (void *)GetProcAddress(ntd, "RtlIsProcessorFeaturePresent");
+    if (g_pfn_RtlIFP == NULL) {
+        dr_fprintf(STDERR,
+                   "[P.A.S.S.] IFP-spoof SKIPPED: нет ntdll!RtlIsProcessor"
+                   "FeaturePresent\n");
+        return;
+    }
+    if (!pass_drwrap_ensure())
+        return;
+    a1 = k32 ? (void *)GetProcAddress(k32, "IsProcessorFeaturePresent") : NULL;
+    a2 = kbase ? (void *)GetProcAddress(kbase, "IsProcessorFeaturePresent") : NULL;
+    k32md = dr_lookup_module_by_name("KERNEL32.DLL");
+    a3 = (k32md != NULL) ? (void *)dr_get_proc_address(k32md->handle,
+                                                       "IsProcessorFeaturePresent")
+                         : NULL;
+    if (k32md != NULL)
+        dr_free_module_data(k32md);
+    if (a1 != NULL && drwrap_replace(a1, (void *)pass_IFP_repl, false))
+        n++;
+    if (a2 != NULL && a2 != a1 && drwrap_replace(a2, (void *)pass_IFP_repl, false))
+        n++;
+    if (a3 != NULL && a3 != a1 && a3 != a2 &&
+        drwrap_replace(a3, (void *)pass_IFP_repl, false))
+        n++;
+    dr_fprintf(STDERR,
+               "[P.A.S.S.] IFP-spoof замен x%d (B-2030: PF38 SSE4.2/PF39 AVX/"
+               "PF40 AVX2/PF60 BMI2 добавляются по exposed_features)\n", n);
+    if (g_ifp_logf != INVALID_FILE)
+        dr_fprintf(g_ifp_logf,
+                   "install: k32=%p kbase=%p dr3=%p replaces=%d\n",
+                   a1, a2, a3, n);
+}
+
 /* B-2015: коды, которые нативно глотает raiser (__except-обёртка MSVC
  * SetThreadName-макроса) и которые НЕ должны уводить процесс в смерть.
  * Общий список для всех уровней перехвата. */
@@ -671,6 +796,11 @@ void pass_strace_init(void)
     drmgr_register_pre_syscall_event(sc_pre);
     drmgr_register_post_syscall_event(sc_post);
 #ifdef WINDOWS
+    /* B-2030: спуф IsProcessorFeaturePresent — ПО УМОЛЧАНИЮ (KUSER_SHARED_
+     * DATA не спуфится CPUID-хуком; без этого лаунчер Blender и другие
+     * IFP-проверки видят настоящий CPU). Гейт -noifpspoof. */
+    if (!g_no_ifpspoof)
+        pass_ifp_spoof_install();
     /* B-2018: зонд IsProcessorFeaturePresent — данные для решения о
      * спуфе KUSER_SHARED_DATA (кандидат на «CPU lacks AVX support»
      * у baseline-bun). Под -strace: хуки не должны трогать живой

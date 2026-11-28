@@ -239,6 +239,7 @@ extern int g_no_spinwatch;    /* B-2024: -nospinwatch (бисекция)        
 extern int g_spinw_delay_ms;  /* B-2025: -spinwdelay <мс> (задержка 1-го такта) */
 extern int g_no_raisehook;    /* B-2025: -noraisehook (RaiseException-replace x3) */
 extern int g_no_ifp;          /* B-2025: -noifp (IFP-зонд x2)             */
+extern int g_no_ifpspoof;     /* B-2030: -noifpspoof (IFP-спуф)           */
 extern int g_no_probe2;       /* B-2025: -noprobe2 (барьер-зонды B-2022)  */
 extern int g_no_probe3;       /* B-2025: -noprobe3 (init-зонды B-2023)    */
 extern int g_do_fuzz;         /* -fuzz: перебор карт рерайтера           */

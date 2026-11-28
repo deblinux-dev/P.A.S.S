@@ -79,15 +79,31 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#define BUN_SIZEOF_IMAGE 0x6FEF000ull
-#define BUN_TIMESTAMP    0x6AFEA993ull
+/* ── профили поддерживаемых образов bun (pagemap-фикс) ──
+ * Статическая карта ищется сигнатурой [1, 0x38, 0, 0, 0x10100000002, 0]
+ * в .data; указатель MAP_GLOBAL — единственное qword со значением
+ * ImageBase+RVA_MAP_STATIC в образе (обе находки уникальны, сверено
+ * на bun_new.exe: MAP_GLOBAL 0x69B76C0 -> MAP_STATIC 0x69B7860).
+ * Диагностика procinit/flag/pmstate специфична для профиля 1.4.5. */
+typedef struct {
+    unsigned long long size_of_image;
+    unsigned long long timestamp;
+    unsigned long long rva_map_global;
+    unsigned long long rva_map_static;
+    const char*        label;
+} b23_profile;
 
-/* RVA-константы bun 1.4.5 std (см. шапку) */
-#define RVA_MAP_GLOBAL   0x69B76C0ull  /* указатель _mi_page_map        */
-#define RVA_MAP_STATIC   0x69B7860ull  /* статическая карта в .data     */
-#define RVA_G_PROCINIT   0x6AC8168ull  /* once-lock _mi_process_init    */
-#define RVA_G_FLAG       0x6AC8370ull  /* FLAG процесса (0/TEB/1)       */
-#define RVA_G_PMSTATE    0x6AC8300ull  /* state init page-map           */
+static const b23_profile b23_profiles[] = {
+  /* bun 1.4.5 std (bun_new.exe / bun_baseline.exe) */
+  { 0x06FEF000ull, 0x6AFEA993ull, 0x069B76C0ull, 0x069B7860ull,
+    "bun 1.4.5 std" },
+  /* bun 1.4.4 (встроен в opencode.exe; тот же mimalloc-лейаут,
+   * сигнатура статической карты совпадает побайтно) */
+  { 0x10B7F000ull, 0x6AD9CC4Full, 0x069A06C0ull, 0x069A0860ull,
+    "bun 1.4.4 (opencode)" },
+};
+
+#define B23_PROFILES (sizeof(b23_profiles) / sizeof(b23_profiles[0]))
 
 /* геометрия динамической карты */
 #define PM_CAP           0x210000ull                       /* 2 МиБ   */
@@ -112,17 +128,25 @@ static void b23_log_ll(const char* prefix, unsigned long long v,
     b23_out(buf);
 }
 
-/* ── верификация образа bun 1.4.5 (как в pass_b2022.c) ── */
-static int b23_verify_bun(uintptr_t base)
+/* ── верификация образа bun по профилям; idx_out = индекс профиля ── */
+static int b23_verify_bun(uintptr_t base, int* idx_out)
 {
     const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
     const IMAGE_NT_HEADERS* nt;
+    unsigned i;
     if (dos == NULL || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     nt = (const IMAGE_NT_HEADERS*)(base + (uintptr_t)dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    if (nt->OptionalHeader.SizeOfImage != BUN_SIZEOF_IMAGE) return 0;
-    if (nt->FileHeader.TimeDateStamp != BUN_TIMESTAMP) return 0;
-    return 1;
+    for (i = 0; i < B23_PROFILES; i++) {
+        if (nt->OptionalHeader.SizeOfImage ==
+                b23_profiles[i].size_of_image &&
+            nt->FileHeader.TimeDateStamp ==
+                b23_profiles[i].timestamp) {
+            *idx_out = (int)i;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------
@@ -139,19 +163,26 @@ void pass_b2023_pagemap_install(void)
     unsigned long long* q;
     char quiet = 0;
 
+    int prof = -1;
+    const b23_profile* pr;
     if (base == 0) { b23_out("[P.A.S.S.][PAGEMAP] главный модуль не найден\r\n"); return; }
-    if (!b23_verify_bun(base)) {
-        b23_out("[P.A.S.S.][PAGEMAP] образ не bun 1.4.5 std "
-                "(SizeOfImage/TimeDateStamp) — фикс не применён\r\n");
+    if (!b23_verify_bun(base, &prof)) {
+        b23_out("[P.A.S.S.][PAGEMAP] образ не входит в список поддерживаемых "
+                "bun-профилей (SizeOfImage/TimeDateStamp) — фикс не применён\r\n");
         return;
     }
+    pr = &b23_profiles[prof];
 
-    old_map  = *(volatile unsigned long long*)(base + RVA_MAP_GLOBAL);
-    st1      = *(volatile unsigned long long*)(base + RVA_G_PROCINIT);
-    st2      = *(volatile unsigned long long*)(base + RVA_G_FLAG);
-    st3      = *(volatile unsigned long long*)(base + RVA_G_PMSTATE);
-    stat_cnt = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x00);
-    stat_cap = *(volatile unsigned long long*)(base + RVA_MAP_STATIC + 0x08);
+    old_map  = *(volatile unsigned long long*)(base + pr->rva_map_global);
+    st1 = st2 = st3 = 0;
+    if (prof == 0) {
+        /* диагностика init доступна только для профиля bun 1.4.5 */
+        st1 = *(volatile unsigned long long*)(base + 0x6AC8168ull);
+        st2 = *(volatile unsigned long long*)(base + 0x6AC8370ull);
+        st3 = *(volatile unsigned long long*)(base + 0x6AC8300ull);
+    }
+    stat_cnt = *(volatile unsigned long long*)(base + pr->rva_map_static + 0x00);
+    stat_cap = *(volatile unsigned long long*)(base + pr->rva_map_static + 0x08);
     if (old_map != 0) {
         old_cnt = *(volatile unsigned long long*)(old_map + 0x00);
         old_cap = *(volatile unsigned long long*)(old_map + 0x08);
@@ -200,10 +231,11 @@ void pass_b2023_pagemap_install(void)
                 *(volatile unsigned long long*)(map + 0x30 + k * 8) = e;
         }
     }
-    *(volatile unsigned long long*)(base + RVA_MAP_GLOBAL) =
+    *(volatile unsigned long long*)(base + pr->rva_map_global) =
         (unsigned long long)(uintptr_t)map;
 
     b23_out("[P.A.S.S.][PAGEMAP] B-2023: динамическая page-map карта установлена (замена недостаточной)\r\n");
+    b23_out("  профиль: "); b23_out(pr->label); b23_out("\r\n");
     b23_log_ll("  старая карта: map=", old_map, "");
     b23_log_ll(" count=", old_cnt, "");
     b23_log_ll(" cap=", old_cap, "\r\n");

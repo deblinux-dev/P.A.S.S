@@ -201,7 +201,7 @@ static const int generic_opcs[] = {
     /* AVX1: vmaskmov (load/store — один opc, ветвление в emu по dst),
      * cvt-ширины (256-битные формы читают младшую половину источника —
      * механическое расщепление inline-карты неприменимо), permil */
-    OP_vmaskmovps, OP_vmaskmovpd,
+    OP_vmaskmovps, OP_vmaskmovpd, OP_vmaskmovdqu,
     OP_vcvtdq2pd, OP_vcvtpd2dq, OP_vcvttpd2dq,
     OP_vpermilps, OP_vpermilpd,
     /* полуходы: load-форма = merge с m64 (reg,reg legacy-формы нет),
@@ -223,11 +223,14 @@ static const int generic_opcs[] = {
     OP_aeskeygenassist, OP_pclmulqdq, OP_vpclmulqdq,
     /* AVX2 */
     OP_vpsllvd, OP_vpsrlvd, OP_vpsravd, OP_vpsllvq, OP_vpsrlvq, OP_vpsravq,
-    OP_vpermq, OP_vpermd, OP_vperm2f128, OP_vperm2i128,
+    OP_vpermq, OP_vpermd, OP_vpermps, OP_vpermpd,
+    OP_vperm2f128, OP_vperm2i128,
     OP_vpmaskmovd, OP_vpmaskmovq,
     OP_vpgatherdd, OP_vpgatherdq, OP_vpgatherqd, OP_vpgatherqq,
     OP_vgatherdps, OP_vgatherdpd, OP_vgatherqps, OP_vgatherqpd,
     OP_vcvtps2pd, OP_vcvtpd2ps,
+    /* F16C (§B-2029): half-float конверсии */
+    OP_vcvtph2ps, OP_vcvtps2ph,
     /* GPR */
     OP_crc32, OP_pext, OP_pdep, OP_bzhi, OP_bextr, OP_mulx, OP_adcx,
     OP_adox, OP_popcnt, OP_lzcnt, OP_tzcnt,
